@@ -2,10 +2,13 @@
 members = ["mcp"]
 resolver = "2"
 
-# `search_engine` is VENDORED (not a submodule) at vendor/otzaria_search_engine —
-# it is the exact pub.dev otzaria_search_engine 0.6.7 rust crate, the version the
-# installed app uses (`^0.6.7`) and that BUILT the on-disk Tantivy index (schema_version 2).
-# Matching this version exactly is required: newer engine revisions changed the
-# Tantivy schema, so their crate would refuse to open the user's index. See
-# vendor/otzaria_search_engine/VENDORED.md. 0.6.7 uses stock tantivy-fst 0.5.0, so
-# no `[patch.crates-io]` is needed.
+# `search_engine` is VENDORED at vendor/otzaria_search_engine/rust: the
+# Otzaria/otzaria_search_engine v3.1.0 rust crate, matching the index the current
+# Otzaria app builds (otzaria_index_meta.json: schema_version 5, engine 3.1.0,
+# tantivy 0.26.2). See vendor/otzaria_search_engine/VENDORED.md.
+
+# Engine 3.1.0 (matches the app's index: schema_version 5, tantivy 0.26.2) needs the
+# same patches its own workspace applies, and [patch] only takes effect at the root.
+[patch.crates-io]
+tantivy-fst = { path = "vendor/otzaria_search_engine/rust/vendor/tantivy-fst" }
+tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "85b76fe364f11c452bd2ce941521ece474a02227" }

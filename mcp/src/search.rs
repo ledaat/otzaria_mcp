@@ -16,7 +16,8 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use search_engine::api::search_engine::{
-    check_index_compatibility, ResultsOrder, SearchEngine, SearchResult,
+    check_index_compatibility, configure_line_source, ResultsOrder, SearchEngine, SearchResult,
+    SearchScope,
 };
 
 pub struct Search {
@@ -65,6 +66,7 @@ impl Search {
     pub fn open(
         index_dir: &std::path::Path,
         lexical_db: Option<&std::path::Path>,
+        db: &std::path::Path,
     ) -> Result<Search> {
         let index_str = index_dir
             .to_str()
@@ -83,6 +85,14 @@ impl Search {
         }
 
         let mut engine = SearchEngine::open_read_only(&index_str)?;
+        // Engine 3.x stores most line text in seforim.db rather than in the index
+        // (TextStorage::LibraryDb); snippets are read back from there, read-only.
+        configure_line_source(
+            db.to_str()
+                .context("db path is not valid UTF-8")?
+                .to_string(),
+        )
+        .context("configuring the seforim.db line source")?;
         if let Some(lex) = lexical_db {
             if let Some(lex_str) = lex.to_str() {
                 // Best-effort: only affects fuzzy morphology; false just means "no lexicon".
@@ -119,22 +129,38 @@ impl Search {
         let engine = self.engine.lock().unwrap();
 
         let page = match mode {
-            Mode::Exact => engine.search_and_count_exact(query, facets, limit, offset, order),
+            // match_nikud / match_taamim = false: vowel- and cantillation-insensitive,
+            // the app's default. No result grouping.
+            Mode::Exact => engine
+                .search_and_count_exact(query, facets, limit, offset, order, false, false, None),
             // Advanced default distance 2 with no per-word options — mirrors the app's
             // default advanced mode. custom_spacing / alternative_words / search_options
             // are the app's advanced-dialog knobs; empty = plain morphological search.
             Mode::Advanced => engine.search_and_count_advanced(
                 query,
+                String::new(), // negative query
                 facets,
                 limit,
                 offset,
-                2,
+                2, // distance
+                0, // negative distance
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
                 order,
+                false,
+                false,
+                SearchScope::WordDistance,
+                SearchScope::WordDistance,
+                None,
+                None,
+                None,
             ),
-            Mode::Fuzzy => engine.search_and_count_fuzzy(query, facets, limit, offset, 2, order),
+            Mode::Fuzzy => engine
+                .search_and_count_fuzzy(query, facets, limit, offset, 2, order, false, false, None),
         }
         .map_err(|e| anyhow::anyhow!("tantivy search failed: {e}"))?;
 
@@ -244,7 +270,7 @@ fn clean_snippet(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{parse_official_book_id, Mode, SearchHit, SearchHitSource};
-    use search_engine::api::search_engine::{SearchEngine, SearchResult};
+    use search_engine::api::search_engine::{SearchEngine, SearchResult, TextStatus, TextStorage};
 
     #[test]
     fn parses_book_id_prefixes() {
@@ -272,21 +298,79 @@ mod tests {
             segment: 7,
             is_pdf: false,
             file_path: "uid:1".to_string(),
+            merged_count: 1,
+            merged: Vec::new(),
+            text_status: TextStatus::Ok,
+            continues_to_next_line: false,
         });
         assert_eq!(hit.source, SearchHitSource::User);
         assert_eq!(hit.book_id, None);
         assert_eq!(hit.line_index, None);
     }
 
+    fn listing(dir: &std::path::Path) -> Vec<(String, u64)> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.metadata().unwrap().len(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Build a tiny index with the engine (as the app would), then open it through
+    /// the MCP read-only and search it: hits come back, and nothing in the index
+    /// directory is created, deleted or resized.
     #[test]
-    fn read_only_open_does_not_create_index_metadata() {
+    fn read_only_open_searches_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        drop(SearchEngine::new(path));
-        let metadata = dir.path().join("otzaria_index_meta.json");
-        std::fs::remove_file(&metadata).unwrap();
+        {
+            let mut engine = SearchEngine::new(path);
+            engine
+                .add_text_book(
+                    "ספר בדיקה".to_string(),
+                    "/תנך/בדיקה".to_string(),
+                    "id:42".to_string(),
+                    0,
+                    0,
+                    "<h1>פרק א</h1>\nשלום עולם ומלואו\nדברים אחרים לגמרי".to_string(),
+                    None,
+                    TextStorage::InIndex,
+                    None,
+                )
+                .unwrap();
+            engine.commit().unwrap();
+        }
+        let before = listing(dir.path());
 
-        let _search = super::Search::open(dir.path(), None).unwrap();
-        assert!(!metadata.exists());
+        let search =
+            super::Search::open(dir.path(), None, &dir.path().join("no-such-seforim.db")).unwrap();
+        assert!(search.doc_count() >= 2);
+        for mode in [Mode::Exact, Mode::Advanced, Mode::Fuzzy] {
+            let r = search
+                .search("שלום".to_string(), mode, 10, 0, None, "relevance")
+                .unwrap();
+            assert!(r.total >= 1, "{mode:?}: no hits");
+            let hit = &r.hits[0];
+            assert_eq!(hit.source, SearchHitSource::Official);
+            assert_eq!(hit.book_id, Some(42));
+            assert!(
+                hit.snippet.contains("שלום"),
+                "{mode:?}: snippet {:?}",
+                hit.snippet
+            );
+        }
+        drop(search);
+        assert_eq!(
+            before,
+            listing(dir.path()),
+            "read-only open changed the index dir"
+        );
     }
 }

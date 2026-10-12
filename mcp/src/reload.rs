@@ -88,7 +88,7 @@ impl Library {
 
 fn open_search(paths: &Paths) -> Option<Arc<Search>> {
     match &paths.index {
-        Some(index_dir) => match Search::open(index_dir, paths.lexical_db.as_deref()) {
+        Some(index_dir) => match Search::open(index_dir, paths.lexical_db.as_deref(), &paths.db) {
             Ok(s) => {
                 eprintln!("otzaria-mcp: opened index ({} docs)", s.doc_count());
                 Some(Arc::new(s))
