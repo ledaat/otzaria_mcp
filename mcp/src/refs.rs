@@ -16,6 +16,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::line_text::LineText;
+
 /// Normalize a reference/name for matching. Applied to book names, acronyms,
 /// `line.heRef`, and the user query alike.
 pub fn normalize_ref(s: &str) -> String {
@@ -176,6 +178,7 @@ pub struct RefCandidate {
 /// Resolve a human reference to candidate (book_id, line_index) locations.
 pub fn resolve(
     conn: &Connection,
+    line_text: &LineText,
     index: &RefIndex,
     query: &str,
     limit: i64,
@@ -202,7 +205,7 @@ pub fn resolve(
     }
 
     if book_ids.is_empty() {
-        return fallback_heref_like(conn, query, limit);
+        return fallback_heref_like(conn, line_text, query, limit);
     }
 
     let address = q_tokens[consumed..].join(" ");
@@ -220,13 +223,13 @@ pub fn resolve(
             canonical.push_str(&address);
         }
 
-        if let Some(c) = first_line_matching(conn, index, bid, &title, &canonical)? {
+        if let Some(c) = first_line_matching(conn, line_text, index, bid, &title, &canonical)? {
             out.push(c);
         }
     }
 
     if out.is_empty() {
-        return fallback_heref_like(conn, query, limit);
+        return fallback_heref_like(conn, line_text, query, limit);
     }
 
     // Rank: exact before prefix; base texts before commentaries; then catalogue order.
@@ -250,6 +253,7 @@ pub fn resolve(
 /// prefixed by (prefix) `canonical`. Prefers an exact match if one exists.
 fn first_line_matching(
     conn: &Connection,
+    line_text: &LineText,
     index: &RefIndex,
     book_id: i64,
     title: &str,
@@ -259,9 +263,12 @@ fn first_line_matching(
         return Ok(None);
     };
     let content = conn.query_row(
-        "SELECT content FROM line WHERE bookId = ?1 AND lineIndex = ?2",
+        &format!(
+            "SELECT {} FROM line l WHERE l.bookId = ?1 AND l.lineIndex = ?2",
+            line_text.column("l")
+        ),
         rusqlite::params![book_id, line.line_index],
-        |r| r.get::<_, String>(0),
+        |r| line_text.get(r, 0),
     )?;
     let match_kind = if normalize_ref(&line.he_ref) == canonical {
         "exact"
@@ -279,21 +286,27 @@ fn first_line_matching(
 }
 
 /// Last resort: substring match on raw `line.heRef`.
-fn fallback_heref_like(conn: &Connection, query: &str, limit: i64) -> Result<Vec<RefCandidate>> {
+fn fallback_heref_like(
+    conn: &Connection,
+    line_text: &LineText,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<RefCandidate>> {
     let like = format!("%{}%", query.replace(['%', '_'], ""));
-    let mut stmt = conn.prepare(
-        "SELECT l.bookId, b.title, l.lineIndex, l.heRef, l.content \
+    let mut stmt = conn.prepare(&format!(
+        "SELECT l.bookId, b.title, l.lineIndex, l.heRef, {} \
            FROM line l JOIN book b ON l.bookId = b.id \
           WHERE l.heRef LIKE ?1 \
           ORDER BY b.orderIndex, l.lineIndex LIMIT ?2",
-    )?;
+        line_text.column("l")
+    ))?;
     let rows = stmt.query_map(rusqlite::params![like, limit], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
+            line_text.get(r, 4)?,
         ))
     })?;
     Ok(rows
@@ -326,7 +339,7 @@ fn make_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_ref, starts_with_tokens, RefIndex};
+    use super::{normalize_ref, starts_with_tokens, LineText, RefIndex};
     use rusqlite::Connection;
 
     #[test]
@@ -368,8 +381,8 @@ mod tests {
         .unwrap();
         let index = RefIndex::build(&conn);
 
-        let first = super::resolve(&conn, &index, "בראשית א א", 1).unwrap();
-        let second = super::resolve(&conn, &index, "בראשית א א", 1).unwrap();
+        let first = super::resolve(&conn, &LineText::inline(), &index, "בראשית א א", 1).unwrap();
+        let second = super::resolve(&conn, &LineText::inline(), &index, "בראשית א א", 1).unwrap();
 
         assert_eq!(first[0].line_index, 2);
         assert_eq!(second[0].line_index, 2);

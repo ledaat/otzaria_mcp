@@ -4,8 +4,9 @@
 פענוח הפניות, קישורים ומפרשים — **אופליין לחלוטין וקריאה-בלבד**. בהשראת
 [zayit-mcp](https://github.com/Sivan22/zayit-mcp), אך בנוי מעל שני עולמות הנתונים של אוצריא:
 
-- **`seforim.db`** (SQLite, סכימת v15) — ספרים, שורות, הפניות (heRef), עץ קטגוריות,
-  ראשי-תיבות, קישורים (15 סוגים) ומטא-דאטה.
+- **`seforim.db`** (SQLite) — ספרים, שורות, הפניות (heRef), עץ קטגוריות,
+  ראשי-תיבות, קישורים (15 סוגים) ומטא-דאטה. נקרא גם בסכימה הישנה (טקסט ב-`line.content`)
+  וגם בחדשה (סכימה 32 ואילך: טקסט ב-`line_content`, דחוס ב-zstd עם מילוני `zstd_dict`).
 - **אינדקס Tantivy** (Rust) — חיפוש טקסט מלא עם מורפולוגיה עברית. המנוע המקורי של
   אוצריא (`otzaria_search_engine` 0.6.7) עבר **vendoring** ומשמש ישירות, כך שהחיפוש
   נאמן במדויק לזה שבאפליקציה (regex-phrase, ניקוד/טעמים, facets, PDF) — בלי שכתוב.
@@ -96,7 +97,7 @@ stdin/stdout; לוגים על stderr.
 
 **הגשר:** תוצאת `full_text_search`/`resolve_ref` מחזירה `book_id`+`line_index` — הזינו
 אותם ישירות ל-`get_text` / `get_links` / `get_commentaries` / `get_book_info`. כל תשובה
-כוללת `schema_version` (=15) ו-`data_version` (טביעת-אצבע של ה-snapshot).
+כוללת `schema_version` (מ-`schema_meta`) ו-`data_version` (טביעת-אצבע של ה-snapshot).
 
 ## ארכיטקטורה
 

@@ -24,6 +24,9 @@ rmcp = { version = "2.2.0", features = ["transport-io", "schemars"] }
 # MCP reproduces the app's exact search semantics (Hebrew morphology, regex-phrase,
 # facets) rather than reimplementing them. Read-only use of SearchEngine.
 search_engine = { path = "../vendor/otzaria_search_engine/rust" }
+# Current seforim.db stores line text in `line_content` as zstd frames compressed with the
+# dictionaries in `zstd_dict`. Same version/features as search_engine's, so one zstd build.
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
