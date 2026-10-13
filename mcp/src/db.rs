@@ -1,5 +1,6 @@
-//! Read-only access to Otzaria's `seforim.db` (schema v15). Every query is
-//! read-only; the DB is opened with `SQLITE_OPEN_READ_ONLY` (WAL-aware) by
+//! Read-only access to Otzaria's `seforim.db`. Line text is read through
+//! [`LineText`], which handles both `line.content` and the split, zstd-compressed
+//! `line_content` layout. Every query is read-only; the DB is opened with `SQLITE_OPEN_READ_ONLY` (WAL-aware) by
 //! default, or `immutable=1` only in explicit `--snapshot` mode.
 
 use anyhow::{Context, Result};
@@ -7,11 +8,14 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::sync::{Mutex, OnceLock};
 
+use crate::line_text::LineText;
 use crate::paths::Paths;
 use crate::refs::{self, RefCandidate, RefIndex};
 
 pub struct Db {
     conn: Mutex<Connection>,
+    /// Where line text lives in this database, and how to decode it.
+    line_text: LineText,
     /// Lazily-built normalized book-name index for resolve_ref (find_ref cache).
     ref_index: OnceLock<RefIndex>,
 }
@@ -32,8 +36,11 @@ impl Db {
         conn.execute_batch("PRAGMA query_only=ON;")
             .context("setting query_only pragma")?;
 
+        let line_text = LineText::detect(&conn).context("reading the line-text layout")?;
+
         Ok(Db {
             conn: Mutex::new(conn),
+            line_text,
             ref_index: OnceLock::new(),
         })
     }
@@ -43,7 +50,7 @@ impl Db {
     pub fn resolve_ref(&self, query: &str, limit: i64) -> Result<Vec<RefCandidate>> {
         let conn = self.conn.lock().unwrap();
         let index = self.ref_index.get_or_init(|| RefIndex::build(&conn));
-        refs::resolve(&conn, index, query, limit)
+        refs::resolve(&conn, &self.line_text, index, query, limit)
     }
 
     /// `schema_meta.db_version` (schema v15 uses `schema_meta`; the legacy dev DB
@@ -113,16 +120,18 @@ impl Db {
             return Ok(None);
         };
 
-        let mut stmt = conn.prepare(
-            "SELECT lineIndex, heRef, content
-               FROM line
-              WHERE bookId = ?1 AND lineIndex >= ?2
-              ORDER BY lineIndex
+        let lt = &self.line_text;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT l.lineIndex, l.heRef, {}
+               FROM line l
+              WHERE l.bookId = ?1 AND l.lineIndex >= ?2
+              ORDER BY l.lineIndex
               LIMIT ?3",
-        )?;
+            lt.column("l")
+        ))?;
         let lines = stmt
             .query_map(rusqlite::params![book_id, line_index, limit], |r| {
-                let raw: String = r.get(2)?;
+                let raw = lt.get(r, 2)?;
                 Ok(TextLine {
                     line_index: r.get(0)?,
                     he_ref: r.get(1)?,
@@ -171,6 +180,7 @@ impl Db {
         if want_out {
             rows.extend(query_links(
                 &conn,
+                &self.line_text,
                 book_id,
                 line_index,
                 connection_type,
@@ -183,6 +193,7 @@ impl Db {
             if remaining > 0 {
                 rows.extend(query_links(
                     &conn,
+                    &self.line_text,
                     book_id,
                     line_index,
                     connection_type,
@@ -298,8 +309,9 @@ impl Db {
     ) -> Result<Commentaries> {
         let conn = self.conn.lock().unwrap();
 
-        let mut sql = String::from(
-            "SELECT ct.name, tb.id, tb.title, tl.lineIndex, tl.heRef, tl.content, sl.lineIndex \
+        let lt = &self.line_text;
+        let mut sql = format!(
+            "SELECT ct.name, tb.id, tb.title, tl.lineIndex, tl.heRef, {}, sl.lineIndex \
                FROM link lk \
                JOIN connection_type ct ON lk.connectionTypeId = ct.id \
                JOIN line sl ON lk.sourceLineId = sl.id \
@@ -309,6 +321,7 @@ impl Db {
               WHERE lk.sourceBookId = ?1 AND sl.lineIndex <= ?3 \
                 AND COALESCE(lr.endLineIndex, sl.lineIndex) >= ?2 \
                 AND ct.name IN ('COMMENTARY','SUPER_COMMENTARY','TARGUM','MIDRASH','PARSHANUT','DIBUR_HAMATCHIL')",
+            lt.column("tl")
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> =
             vec![Box::new(book_id), Box::new(start_line), Box::new(end_line)];
@@ -329,7 +342,7 @@ impl Db {
             .query_map(
                 rusqlite::params_from_iter(params.iter().map(|b| b.as_ref())),
                 |r| {
-                    let content: String = r.get(5)?;
+                    let content = lt.get(r, 5)?;
                     Ok(CommentaryItem {
                         connection_type: r.get(0)?,
                         commentator_book_id: r.get(1)?,
@@ -709,6 +722,7 @@ pub struct CategoryView {
 /// One direction of a link query (outgoing = the book is the source side).
 fn query_links(
     conn: &Connection,
+    line_text: &LineText,
     book_id: i64,
     line_index: Option<i64>,
     connection_type: Option<&str>,
@@ -721,8 +735,8 @@ fn query_links(
         ("lk.targetBookId", "tl.lineIndex", 1)
     };
     let mut sql = format!(
-        "SELECT ct.name, sb.id, sb.title, sl.lineIndex, sl.heRef, sl.content, \
-                tb.id, tb.title, tl.lineIndex, tl.heRef, tl.content \
+        "SELECT ct.name, sb.id, sb.title, sl.lineIndex, sl.heRef, {src_text}, \
+                tb.id, tb.title, tl.lineIndex, tl.heRef, {tgt_text} \
            FROM link lk \
            JOIN connection_type ct ON lk.connectionTypeId = ct.id \
            JOIN book sb ON lk.sourceBookId = sb.id \
@@ -730,7 +744,9 @@ fn query_links(
            JOIN book tb ON lk.targetBookId = tb.id \
            JOIN line tl ON lk.targetLineId = tl.id \
            LEFT JOIN link_range lr ON lr.linkId = lk.id AND lr.side = {range_side} \
-          WHERE {book_col} = ?"
+          WHERE {book_col} = ?",
+        src_text = line_text.column("sl"),
+        tgt_text = line_text.column("tl"),
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(book_id)];
     if let Some(li) = line_index {
@@ -753,8 +769,8 @@ fn query_links(
         .query_map(
             rusqlite::params_from_iter(params.iter().map(|b| b.as_ref())),
             |r| {
-                let src_content: String = r.get(5)?;
-                let tgt_content: String = r.get(10)?;
+                let src_content = line_text.get(r, 5)?;
+                let tgt_content = line_text.get(r, 10)?;
                 Ok(LinkRow {
                     connection_type: r.get(0)?,
                     direction,
@@ -831,7 +847,7 @@ pub fn strip_html_tags(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_html_tags, Db};
+    use super::{strip_html_tags, Db, LineText};
     use rusqlite::Connection;
     use std::sync::{Mutex, OnceLock};
 
@@ -865,6 +881,7 @@ mod tests {
         .unwrap();
         Db {
             conn: Mutex::new(conn),
+            line_text: LineText::inline(),
             ref_index: OnceLock::new(),
         }
     }
