@@ -334,7 +334,12 @@ impl Db {
                 }
             }
         }
-        sql.push_str(" ORDER BY lk.targetBookOrderIndex, tl.lineIndex LIMIT ?");
+        // Links that reach beyond the requested lines (a whole perek, an introduction) go
+        // after the ones on these lines, narrowest first.
+        sql.push_str(
+            " ORDER BY MAX(COALESCE(lr.endLineIndex, sl.lineIndex) - sl.lineIndex - (?3 - ?2), 0), \
+               lk.targetBookOrderIndex, tl.lineIndex LIMIT ?",
+        );
         params.push(Box::new(limit));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -760,7 +765,16 @@ fn query_links(
         sql.push_str(" AND ct.name = ?");
         params.push(Box::new(ct.to_string()));
     }
-    sql.push_str(" ORDER BY lk.targetBookOrderIndex, tl.lineIndex LIMIT ?");
+    if line_index.is_some() {
+        // Links on this very line before links over a range that merely contains it (a
+        // whole perek, an introduction), narrowest range first.
+        sql.push_str(&format!(
+            " ORDER BY COALESCE(lr.endLineIndex, {line_col}) - {line_col}, \
+               lk.targetBookOrderIndex, tl.lineIndex LIMIT ?"
+        ));
+    } else {
+        sql.push_str(" ORDER BY lk.targetBookOrderIndex, tl.lineIndex LIMIT ?");
+    }
     params.push(Box::new(limit));
 
     let direction = if outgoing { "outgoing" } else { "incoming" };
@@ -905,6 +919,30 @@ mod tests {
 
         let commentaries = db.get_commentaries(1, 3, 3, None, 10).unwrap();
         assert_eq!(commentaries.items.len(), 1);
+        assert_eq!(commentaries.items[0].on_line_index, 2);
+    }
+
+    #[test]
+    fn links_on_the_line_come_before_links_over_a_range() {
+        let db = fixture_db();
+        // A second commentary link, on line 3 only, later in the default order than the
+        // link whose range covers lines 2-4.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("INSERT INTO link VALUES (101, 1, 2, 11, 21, 101, 2, 1, 0);")
+            .unwrap();
+
+        let outgoing = db.get_links(1, Some(3), None, "outgoing", 10).unwrap();
+        assert_eq!(outgoing.len(), 2);
+        assert_eq!(outgoing[0].source_line_index, 3);
+        let first = db.get_links(1, Some(3), None, "outgoing", 1).unwrap();
+        assert_eq!(first[0].source_line_index, 3);
+
+        let commentaries = db.get_commentaries(1, 3, 3, None, 1).unwrap();
+        assert_eq!(commentaries.items[0].on_line_index, 3);
+        // Over the whole range 2-4 neither link reaches beyond it: default order again.
+        let commentaries = db.get_commentaries(1, 2, 4, None, 10).unwrap();
         assert_eq!(commentaries.items[0].on_line_index, 2);
     }
 

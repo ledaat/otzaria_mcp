@@ -260,7 +260,9 @@ impl OtzariaServer {
                        types (COMMENTARY, SUPER_COMMENTARY, TARGUM, SOURCE, REFERENCE, MIDRASH, QUOTATION, \
                        PARSHANUT, DIBUR_HAMATCHIL, MESORAT_HASHAS, EIN_MISHPAT, MISHNAH_IN_TALMUD, RELATED, \
                        OTHER, LINKER). direction: 'outgoing' (default), 'incoming' (e.g. commentaries on this \
-                       book), or 'both'. Each link gives source and target book_id + line_index + heRef + snippet.",
+                       book), or 'both'. Each link gives source and target book_id + line_index + heRef + snippet. \
+                       With line_index, links on that line come before links over a range containing it (a whole \
+                       perek, an introduction).",
         annotations(read_only_hint = true)
     )]
     pub async fn get_links(
@@ -292,8 +294,10 @@ impl OtzariaServer {
         description = "Resolve a human Hebrew reference to canonical (book_id, line_index) locations. \
                        Handles book titles, abbreviations/nicknames (book_acronym), Tanakh (\"בראשית א א\"), \
                        Mishnah/Talmud incl. daf notation (\"ברכות ב:\"), and works across books sharing a name \
-                       (returns the one whose reference actually matches). Feed a candidate's book_id + \
-                       line_index into get_text / get_links.",
+                       (returns the one whose reference actually matches). Citation markers are understood \
+                       (\"ירושלמי שביעית פ\"ב ה\"א\", \"מג\"א או\"ח סי' שח ס\"ק ב\", \"שבת מג ע\"ב\"), and a trailing \
+                       ד\"ה <words> picks that dibbur hamatchil's line (match_kind \"dibbur\"). Feed a candidate's \
+                       book_id + line_index into get_text / get_links.",
         annotations(read_only_hint = true)
     )]
     pub async fn resolve_ref(
@@ -315,7 +319,8 @@ impl OtzariaServer {
         name = "get_commentaries",
         description = "Commentaries and targumim on a book's line (or a line range): returns the actual \
                        commentary text with its commentator book_id + line_index + heRef, plus the book's \
-                       ordered default-commentator list. Optionally restrict to specific commentator book ids.",
+                       ordered default-commentator list. Optionally restrict to specific commentator book ids. \
+                       Comments on the requested lines come before ones whose range reaches beyond them.",
         annotations(read_only_hint = true)
     )]
     pub async fn get_commentaries(
