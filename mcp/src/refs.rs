@@ -64,6 +64,31 @@ fn starts_with_tokens(hay: &str, needle: &str) -> bool {
         || (!needle.is_empty() && hay.starts_with(needle) && hay[needle.len()..].starts_with(' '))
 }
 
+/// Find the raw address after the matched leading book name. `normalize_ref` can
+/// expand punctuation into tokens (notably daf marks), so slicing the normalized
+/// query loses syntax that `refkey` needs to interpret, such as a range dash or a
+/// chapter:verse colon. Match at raw whitespace and separator punctuation boundaries
+/// to retain the address.
+fn raw_address_after_book<'a>(query: &'a str, normalized_book: &str) -> Option<&'a str> {
+    for (end, c) in query.char_indices() {
+        let separator_end = if c.is_whitespace()
+            || matches!(
+                c,
+                ',' | ';' | '(' | ')' | '[' | ']' | '|' | '\u{05BE}' | '-' | '–' | '—'
+            ) {
+            end + c.len_utf8()
+        } else {
+            continue;
+        };
+        let prefix = query[..separator_end].trim_end();
+        let expanded = refkey::expand_query_amud_marks(prefix);
+        if normalize_ref(&expanded) == normalized_book {
+            return Some(query[separator_end..].trim_start());
+        }
+    }
+    None
+}
+
 pub struct RefIndex {
     /// normalized name → book ids (a name like "ברכות" can map to several books).
     name_to_books: BTreeMap<String, Vec<i64>>,
@@ -293,7 +318,13 @@ pub fn resolve(
     // Base texts first, then catalogue order: the strongest candidates are tried first.
     book_ids.sort_by_key(|id| (!index.is_base(*id), index.order(*id), *id));
 
-    let address = q_tokens[consumed..].join(" ");
+    let normalized_book = q_tokens[..consumed].join(" ");
+    // The address as typed (range dashes, chapter:verse colons kept for refkey), with
+    // the dibbur hamatchil already split off.
+    let raw_address = raw_address_after_book(&ref_part, &normalized_book)
+        .map(str::to_string)
+        .unwrap_or_else(|| q_tokens[consumed..].join(" "));
+    let address = normalize_ref(&refkey::expand_query_amud_marks(&raw_address));
     // The address with citation markers cleaned up, tried only when the typed one fails.
     let cleaned = raw_rest(&raw, consumed)
         .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
@@ -309,18 +340,20 @@ pub fn resolve(
             .map(str::to_string)
             .collect();
         let without_title = drop_leading(&cleaned, |t| own_words.iter().any(|w| w == t));
-        let mut variants: Vec<&str> = vec![address.as_str()];
+        // (address to match heRefs with, text the canonical key is built from): the typed
+        // address keys off its raw form, so ranges and contextual ע"א/ע"ב survive.
+        let mut variants: Vec<(&str, &str)> = vec![(address.as_str(), raw_address.as_str())];
         for v in [cleaned.as_str(), without_title.as_str()] {
             // A cleanup that leaves nothing would just point at the book's start.
-            if !variants.contains(&v) && (!v.is_empty() || address.is_empty()) {
-                variants.push(v);
+            if !variants.iter().any(|(a, _)| *a == v) && (!v.is_empty() || address.is_empty()) {
+                variants.push((v, v));
             }
         }
 
         let mut found: Found = None;
         let mut used = address.as_str();
-        for v in variants {
-            let key = refkey::build_ref_key(v);
+        for (v, key_source) in variants {
+            let key = refkey::build_ref_key(key_source);
             // heRefs rarely spell locator words ("פרק", "עמוד" from ע"א …): retry the
             // heRef match with the canonical key's tokens when they differ.
             let key_address = key.clone().filter(|k| k != v);
@@ -340,7 +373,7 @@ pub fn resolve(
             }
         }
         if found.is_none() && !address.is_empty() {
-            found = match by_toc(conn, caps, bid, &address)? {
+            found = match by_toc(conn, caps, bid, &raw_address)? {
                 Some(c) => Some(c),
                 None => by_dibur(conn, caps, bid, &address)?,
             };
@@ -691,9 +724,9 @@ mod tests {
              CREATE TABLE line_dh (bookId INTEGER NOT NULL, dhText TEXT NOT NULL, lineIndex INTEGER NOT NULL, dhDisplay TEXT NOT NULL);
              CREATE TABLE tocText (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
              CREATE TABLE tocEntry (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL, parentId INTEGER, textId INTEGER NOT NULL, level INTEGER NOT NULL, lineId INTEGER, hasChildren INTEGER NOT NULL DEFAULT 0);
-             INSERT INTO book VALUES (1, 'בראשית', 'בראשית', 1, 1), (103, 'ברכות', 'ברכות', 1, 1), (9, 'רש\"י על ברכות', 'רש\"י על ברכות', 0, 5);
-             INSERT INTO book_acronym VALUES (1, 'ספר בראשית');
-             INSERT INTO line VALUES (1, 1, 2, 'בראשית א, א'), (2, 103, 2, 'ברכות, ב., א'), (3, 103, 17, 'ברכות, ב:, א'), (4, 9, 5, 'רש\"י על ברכות, ב., א');
+             INSERT INTO book VALUES (1, 'בראשית', 'בראשית', 1, 1), (103, 'ברכות', 'ברכות', 1, 1), (9, 'רש\"י על ברכות', 'רש\"י על ברכות', 0, 5), (28, 'תהילים', 'תהילים', 1, 2);
+             INSERT INTO book_acronym VALUES (1, 'ספר בראשית'), (1, 'ספר־בראשית'), (28, 'תהלים');
+             INSERT INTO line VALUES (1, 1, 2, 'בראשית א, א'), (2, 103, 2, 'ברכות, ב., א'), (3, 103, 17, 'ברכות, ב:, א'), (4, 9, 5, 'רש\"י על ברכות, ב., א'), (5, 28, 1160, 'תהילים, עא, א'), (6, 28, 1185, 'תהילים, עב, א');
              INSERT INTO tocText VALUES (1, 'פרק ראשון');
              INSERT INTO tocEntry VALUES (1, 103, NULL, 1, 1, 2, 0);
              INSERT INTO line_dh VALUES (9, 'מאימתי קורין', 5, 'מאימתי קורין');",
@@ -703,6 +736,25 @@ mod tests {
         conn.execute(
             "INSERT INTO line_ref VALUES (103, ?1, 2)",
             [crate::refkey::ref_key_hash("ב א א")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO line_ref VALUES (1, ?1, 2)",
+            [crate::refkey::ref_key_hash("א א")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO line_ref VALUES (103, ?1, 2)",
+            [crate::refkey::ref_key_hash("~ ב א")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO line_ref VALUES (28, ?1, 1160), (28, ?2, 1185), (28, ?3, 1160)",
+            rusqlite::params![
+                crate::refkey::ref_key_hash("עא א"),
+                crate::refkey::ref_key_hash("עב א"),
+                crate::refkey::ref_key_hash("~ עא"),
+            ],
         )
         .unwrap();
         conn
@@ -748,6 +800,65 @@ mod tests {
             (c[0].book_id, c[0].line_index, c[0].match_kind),
             (9, 5, "dibur_hamatchil")
         );
+    }
+
+    #[test]
+    fn pipeline_preserves_raw_ranges_and_chapter_verse_colons() {
+        let conn = fixture();
+        let index = RefIndex::build(&conn);
+
+        for query in [
+            "בראשית א א-ג",
+            "בְּרֵאשִׁית א:א",
+            "בראשית,א,א-ג",
+            "בראשית,א:א",
+            "סֵפֶר־בְּרֵאשִׁית,א א-ג",
+        ] {
+            let found = super::resolve(&conn, &caps(), &index, query, 1).unwrap();
+            assert_eq!(
+                (found[0].book_id, found[0].line_index, found[0].match_kind),
+                (1, 2, "exact"),
+                "query: {query}"
+            );
+        }
+
+        for (query, line_index) in [
+            ("תהילים ע\"א א", 1160),
+            ("תהלים ע\"א א", 1160),
+            ("תהילים ע\"ב א", 1185),
+            ("תהילים פרק ע\"א פסוק א", 1160),
+            ("תהילים ע\"א-ע\"ב", 1160),
+        ] {
+            let found = super::resolve(&conn, &caps(), &index, query, 1).unwrap();
+            assert_eq!(
+                (found[0].book_id, found[0].line_index),
+                (28, line_index),
+                "query: {query}"
+            );
+        }
+
+        for query in ["ברכות ב.-ג.", "ברכות,ב.-ג."] {
+            let found = super::resolve(&conn, &caps(), &index, query, 1).unwrap();
+            assert_eq!(
+                (found[0].book_id, found[0].line_index, found[0].match_kind),
+                (103, 2, "partial"),
+                "query: {query}"
+            );
+        }
+
+        // The original raw form still canonicalizes ע"א/ע"ב after daf expansion.
+        conn.execute(
+            "INSERT INTO line_ref VALUES (103, ?1, 17)",
+            [crate::refkey::ref_key_hash("~ ב ב")],
+        )
+        .unwrap();
+        for (query, line_index) in [("ברכות ב ע\"א", 2), ("ברכות ב ע\"ב", 17)] {
+            let found = super::resolve(&conn, &caps(), &index, query, 1).unwrap();
+            assert_eq!(
+                (found[0].line_index, found[0].match_kind),
+                (line_index, "partial")
+            );
+        }
     }
 
     #[test]
