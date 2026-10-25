@@ -114,7 +114,7 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
 | `get_text` | שורות ספר לפי `line_index` (0-based), פענוח הטקסט הדחוס, `total_lines`, `next_line_index`, `strip_html`, ו-`version` לקריאת מהדורה אחרת |
 | `get_book_toc` | תוכן עניינים (שטוח, pre-order) עם `line_index`; `parent_id` לדפדוף עצל; `alt_structure_key` למבנה חלופי (פרשות, דפים…) |
 | `browse_categories` | עץ הקטגוריות — לפי id או נתיב כותרות (`תנ"ך/תורה`), עם תיאורים, מסלול, ספירת ספרים רקורסיבית וספרים ישירים |
-| `resolve_ref` | **find-ref**: הפניה עברית → `(book_id, line_index)` כמו באפליקציה — שם/כינוי ספר, מפתח ההפניה הקנוני מול `line_ref` (כולל `פרק/פסוק/סימן`, `ב.`/`ב:`/`ב ע"א`, מפתחות חלקיים), תחילית פרק/דף, כותרות TOC ופרשות, ודיבור המתחיל |
+| `resolve_ref` | **find-ref**: הפניה עברית → `(book_id, line_index)` כמו באפליקציה — שם/כינוי ספר, מפתח ההפניה הקנוני מול `line_ref` (כולל `פרק/פסוק/סימן`, `ב.`/`ב:`/`ב ע"א`, מפתחות חלקיים), תחילית פרק/דף, כותרות TOC ופרשות (חיפוש עץ כמו באפליקציה; בספר רב-חלקי — מועמד לכל חלק, או לחלק שנקרא בשם: `ב"ח יו"ד קא`), ודיבור המתחיל |
 | `full_text_search` | חיפוש טקסט מלא במנוע של האפליקציה: מצבים `advanced`/`exact`/`fuzzy`; מרווח מילים / מרחק עריכה; אפשרויות מילה (קידומות, סיומות, דקדוקיות, כתיב מלא/חסר, חלק ממילה, שגיאות כתיב, ארמית, התעלמות מגרשיים, ראשי תיבות, תרגום ארמי); `exclude_query`; `scope`; `word_match`; ניקוד/טעמים; סינון לפי קטגוריות/ספרים/תקופות/מחברים/ספרי יסוד; סדר `catalogue`/`relevance`/`generation`; דפדוף (`offset` עד 10000); `grouping`. תוצאות רשמיות מחזירות `book_id`+`line_index`, `text_status`, `continues_to_next_line` |
 | `search_facet_counts` | איפה הביטוי מופיע: ספירת תוצאות לפי תת-קטגוריה, תקופה, מחבר או ספר |
 | `get_links` | קישורים לספר/שורה/טווח במודל של האפליקציה: יוצאים/נכנסים (מקור וירטואלי `SOURCE`), כל 24 סוגי הקישור (כולל `LINKER`; סוג שמתבקש במפורש מוחזר גם מהצד המצוטט), קישורי-טווח, צדדים מוסתרים, עוגני-מילים, סינון לפי סוג וספר, דפדוף |
@@ -190,15 +190,16 @@ cargo clippy -p otzaria-mcp --all-targets --no-deps -- -D warnings
 Cargo.toml                      # workspace + [patch.crates-io] של המנוע
 vendor/otzaria_search_engine/   # מנוע Tantivy מוונדר (pub.dev 3.1.0) + open_read_only
 mcp/src/
-  main.rs      # CLI + serve stdio
-  paths.rs     # גילוי נתיבים
-  db.rs        # שכבת SQLite: ספרים, טקסט, מהדורות, TOC, קטגוריות, מטא
-  links.rs     # קישורים, מפרשים, רשימת מפרשים לפי תקופה, עוגנים
-  text.rs      # פענוח zstd, ניקוי HTML, תווים גלויים (קואורדינטות העוגנים)
-  refkey.rs    # מפתח ההפניה הקנוני (פורט של ref_key.dart) + FNV ל-line_ref
-  refs.rs      # find-ref (resolve_ref)
-  search.rs    # עטיפת מנוע החיפוש
-  reload.rs    # Library/Snapshot + עדכון-חם
-  server.rs    # הגדרות כלי rmcp
+  main.rs       # CLI + serve stdio
+  paths.rs      # גילוי נתיבים
+  db.rs         # שכבת SQLite: ספרים, טקסט, מהדורות, TOC, קטגוריות, מטא
+  links.rs      # קישורים, מפרשים, רשימת מפרשים לפי תקופה, עוגנים
+  text.rs       # פענוח zstd, ניקוי HTML, תווים גלויים (קואורדינטות העוגנים)
+  refkey.rs     # מפתח ההפניה הקנוני (פורט של ref_key.dart) + FNV ל-line_ref
+  refs.rs       # find-ref (resolve_ref)
+  toc_search.rs # find-ref: חיפוש TOC כמו באפליקציה
+  search.rs     # עטיפת מנוע החיפוש
+  reload.rs     # Library/Snapshot + עדכון-חם
+  server.rs     # הגדרות כלי rmcp
 mcp/tests/real_data.rs
 ```
