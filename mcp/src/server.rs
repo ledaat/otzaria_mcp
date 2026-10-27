@@ -12,8 +12,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db::{Db, Era};
+use crate::refs::{rank_candidates, RefCandidate, ResolveOptions};
 use crate::reload::{Library, Snapshot};
 use crate::search::{self, Mode, SearchRequest, WordOptions};
+use crate::secondary::Source;
 
 #[derive(Clone)]
 pub struct OtzariaServer {
@@ -261,6 +263,12 @@ pub struct ResolveRefParams {
     /// Max candidate locations to return (default 10, capped at 50).
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Where to look, as the app's find-ref does with personal books on: any of
+    /// "library" (default), "user" (personal books), "attached" (every attached database)
+    /// or "attached:<slug>", or ["all"]. A personal or attached book's id is not a library
+    /// id — check `source` before passing a candidate to get_text / get_links.
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -745,7 +753,13 @@ impl OtzariaServer {
                        \"טור יו\"ד קא\"); and a commentary's dibbur hamatchil. Citation forms are also understood \
                        (\"ירושלמי שביעית פ\\\"ב ה\\\"א\", \"מג\\\"א או\\\"ח סי' שח ס\\\"ק ב\"), and a trailing \
                        ד\\\"ה <words> returns that dibbur's line inside the location (match_kind \"dibur_in_ref\"). \
-                       Feed a candidate into get_text / get_links.",
+                       When no book name leads the reference, the app's book detection is used (title \
+                       prefix / contains, acronyms, misspellings: \"המאירי סנהדרין ל:\"). Candidates come \
+                       best first with `rank` (equal rank = equally good; several places at rank 0 = \
+                       ambiguous), `reference` (the app's wording), `link` (otzaria:// deep link) and \
+                       `source`. Pass `sources` to include personal books and attached databases, as \
+                       the app's find-ref does; only `source: \"library\"` candidates can be fed into \
+                       get_text / get_links.",
         annotations(read_only_hint = true)
     )]
     pub async fn resolve_ref(
@@ -756,7 +770,49 @@ impl OtzariaServer {
         let snap = self.lib.current();
         let limit = p.limit.unwrap_or(10).clamp(1, 50) as i64;
         let db = snap.db.clone();
-        let candidates = run_blocking(move || db.resolve_ref(&reference, limit)).await?;
+        let filters: Vec<String> = p
+            .sources
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["library".to_string()]);
+        let all = filters.iter().any(|f| f.trim() == "all");
+        let wants = move |src: &Source| all || filters.iter().any(|f| src.matches_filter(f));
+        let secondary = self.lib.secondary();
+        let candidates = run_blocking(move || {
+            let mut out: Vec<(usize, RefCandidate)> = Vec::new();
+            if wants(&Source::Library) {
+                out.extend(
+                    db.resolve_ref(&reference, limit)?
+                        .into_iter()
+                        .map(|c| (0, c)),
+                );
+            }
+            let opts = ResolveOptions {
+                heref_fallback: false,
+                app_detection: true,
+            };
+            for sec in &secondary.dbs {
+                if !wants(&sec.spec.source) {
+                    continue;
+                }
+                let Some(sdb) = sec.db() else { continue };
+                // one broken database must not sink the lookup
+                match sdb.resolve_ref_with(&reference, limit, opts) {
+                    Ok(cands) => out.extend(cands.into_iter().map(|mut c| {
+                        c.set_source(&sec.spec.source);
+                        (0, c)
+                    })),
+                    Err(e) => eprintln!(
+                        "otzaria-mcp: resolve_ref in {} failed: {e:#}",
+                        sec.spec.path.display()
+                    ),
+                }
+            }
+            // One ranking across sources (see refs::rank_candidates).
+            let mut out = rank_candidates(&reference, out.into_iter().map(|(_, c)| c).collect());
+            out.truncate(limit as usize);
+            Ok::<_, anyhow::Error>(out)
+        })
+        .await?;
         self.respond(
             &snap,
             json!({ "count": candidates.len(), "candidates": candidates }),

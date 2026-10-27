@@ -210,6 +210,32 @@ impl Db {
         Db::from_connection(conn)
     }
 
+    /// A secondary database (personal books, an attached library): read-only, and
+    /// `immutable=1` when asked (the app opens WAL databases in read-only folders so).
+    pub fn open_secondary(path: &std::path::Path, immutable: bool) -> Result<Db> {
+        match Self::open_secondary_as(path, immutable) {
+            // A WAL database whose -shm cannot be created (a read-only folder, a sync
+            // client's lock): read the last checkpointed state instead.
+            Err(e) if !immutable => Self::open_secondary_as(path, true).map_err(|_| e),
+            r => r,
+        }
+    }
+
+    fn open_secondary_as(path: &std::path::Path, immutable: bool) -> Result<Db> {
+        let conn = if immutable {
+            Connection::open_with_flags(
+                format!("file:{}?immutable=1", path.display()),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        }
+        .with_context(|| format!("opening {}", path.display()))?;
+        // the app may be writing; wait for its lock rather than failing a lookup
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Db::from_connection(conn)
+    }
+
     /// Wrap an already-open connection (also used by tests with in-memory fixtures).
     pub fn from_connection(conn: Connection) -> Result<Db> {
         conn.execute_batch("PRAGMA query_only=ON;")
@@ -476,19 +502,34 @@ impl Db {
     // ── resolve_ref ──────────────────────────────────────────────────────────
     /// Resolve a human reference string to candidate (book_id, line_index) locations.
     pub fn resolve_ref(&self, query: &str, limit: i64) -> Result<Vec<RefCandidate>> {
+        self.resolve_ref_with(query, limit, refs::ResolveOptions::default())
+    }
+
+    /// [`Db::resolve_ref`] with the search's widening chosen (secondary databases skip
+    /// the full-scan heRef fallback).
+    pub fn resolve_ref_with(
+        &self,
+        query: &str,
+        limit: i64,
+        opts: refs::ResolveOptions,
+    ) -> Result<Vec<RefCandidate>> {
         let index = self.ref_index.get_or_init(|| {
             let inner = self.lock();
             RefIndex::build(&inner.conn)
         });
         let mut inner = self.lock();
-        let mut cands = refs::resolve(&inner.conn, &self.caps, index, query, limit)?;
+        let mut cands = refs::resolve_with(&inner.conn, &self.caps, index, query, limit, opts)?;
         // Fill snippets with the decoded text of each candidate line.
         for c in cands.iter_mut() {
+            c.set_source(&crate::secondary::Source::Library);
             if c.snippet.is_empty() {
-                let lines =
-                    self.lines_in_range(&mut inner, c.book_id, c.line_index, c.line_index)?;
-                if let Some((_, _, _, html)) = lines.first() {
-                    c.snippet = text::snippet(html, 160);
+                // a secondary database may hold no text (personal books live in files)
+                if let Ok(lines) =
+                    self.lines_in_range(&mut inner, c.book_id, c.line_index, c.line_index)
+                {
+                    if let Some((_, _, _, html)) = lines.first() {
+                        c.snippet = text::snippet(html, 160);
+                    }
                 }
             }
         }

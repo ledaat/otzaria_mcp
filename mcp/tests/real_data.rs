@@ -33,6 +33,7 @@ fn paths(db: PathBuf, index: Option<PathBuf>) -> Paths {
         lexical_db: None,
         dictionaries_dir: None,
         snapshot: false,
+        secondary: Default::default(),
     }
 }
 

@@ -17,6 +17,7 @@ use anyhow::Result;
 use crate::db::Db;
 use crate::paths::Paths;
 use crate::search::Search;
+use crate::secondary::SecondarySet;
 
 /// A consistent DB + index pair, tagged with the fingerprint it was built from.
 pub struct Snapshot {
@@ -31,15 +32,25 @@ pub struct Snapshot {
 pub struct Library {
     paths: Paths,
     inner: RwLock<Arc<Snapshot>>,
+    /// Personal books and attached databases (see `secondary`), followed separately:
+    /// a change there never reopens the library.
+    secondary: RwLock<Arc<SecondarySet>>,
 }
 
 impl Library {
     pub fn open(paths: Paths) -> Result<Arc<Library>> {
         let snapshot = Self::build(&paths)?;
+        let secondary = SecondarySet::build(&paths.secondary);
         Ok(Arc::new(Library {
             paths,
             inner: RwLock::new(Arc::new(snapshot)),
+            secondary: RwLock::new(Arc::new(secondary)),
         }))
+    }
+
+    /// The secondary databases of the moment (cheap Arc clone).
+    pub fn secondary(&self) -> Arc<SecondarySet> {
+        Arc::clone(&self.secondary.read().unwrap())
     }
 
     /// Cheap (Arc clone) handle to the current snapshot.
@@ -68,6 +79,7 @@ impl Library {
         const DEBOUNCE: Duration = Duration::from_secs(2);
         loop {
             tokio::time::sleep(POLL).await;
+            self.refresh_secondary();
             let current_fp = self.current().fingerprint.clone();
             let fp = fingerprint(&self.paths);
             if fp == current_fp {
@@ -89,6 +101,22 @@ impl Library {
                 }
             }
         }
+    }
+}
+
+impl Library {
+    /// Swap in a new secondary set when its databases or the app's list of them changed.
+    fn refresh_secondary(&self) {
+        let fp = self.paths.secondary.fingerprint();
+        if fp == self.secondary().fingerprint {
+            return;
+        }
+        let set = SecondarySet::build(&self.paths.secondary);
+        eprintln!(
+            "otzaria-mcp: personal / attached databases changed → {} source(s)",
+            set.dbs.len()
+        );
+        *self.secondary.write().unwrap() = Arc::new(set);
     }
 }
 
@@ -146,5 +174,12 @@ pub fn hash_paths(files: &[PathBuf]) -> String {
             }
         }
     }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Hash a list of strings (a fingerprint of a list that has no file of its own).
+pub fn hash_strings(items: &[String]) -> String {
+    let mut hasher = DefaultHasher::new();
+    items.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
