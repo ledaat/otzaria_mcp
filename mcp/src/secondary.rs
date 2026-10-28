@@ -484,4 +484,16 @@ mod resolve_tests {
         assert_eq!((c[0].book_id, c[0].match_kind), (8, "book"), "{c:?}");
         assert_eq!(c[0].rank, 0);
     }
+
+    #[test]
+    fn search_books_reads_a_secondary_schema() {
+        let db = attached_fixture();
+        let hits = db.search_books("הספיקות", None, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].book_id, hits[0].match_rank), (8, 3)); // title contains
+        let mut h = db.search_books("הר״ן", None, 5).unwrap().remove(0);
+        h.set_source(&super::Source::Attached("x".into()));
+        assert_eq!(h.link, "otzaria://open/book/7?source=db:x&index=0");
+        assert_eq!(h.book_uid, "db:x:7");
+    }
 }

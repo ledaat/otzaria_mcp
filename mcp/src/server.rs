@@ -34,6 +34,12 @@ pub struct SearchBooksParams {
     /// Max results to return (default 20, capped at 100).
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Where to look: any of "library", "user" (personal books), "attached" (every
+    /// attached database) or "attached:<slug>"; default ["all"]. A category_id applies to
+    /// the library only. Personal and attached books carry their `source`; their ids are
+    /// not library ids.
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -469,10 +475,13 @@ impl OtzariaServer {
 
     #[tool(
         name = "search_books",
-        description = "Search the Otzaria library for books by Hebrew title, acronym/alias or short \
-                       description (best matches first: exact title, exact alias, title prefix, …). Returns \
-                       book id, title, heRef, category, author(s), era, line count and a short description. \
-                       Optionally restrict to a category. Use book_id with get_text / get_book_info.",
+        description = "Search the Otzaria library — and the user's personal books and attached \
+                       databases — for books by Hebrew title, acronym/alias or short description (best matches \
+                       first: exact title, exact alias, title prefix, …). Returns book id, `source` \
+                       (library / user / attached), title, heRef, category, author(s), era, line count, a short \
+                       description and an otzaria:// `link` (personal books also their `file_path`). Optionally \
+                       restrict to a category (library only) or to some `sources`. Use a library book's \
+                       book_id with get_text / get_book_info.",
         annotations(read_only_hint = true)
     )]
     pub async fn search_books(
@@ -484,7 +493,46 @@ impl OtzariaServer {
         let limit = p.limit.unwrap_or(20).clamp(1, 100) as i64;
         let db = snap.db.clone();
         let cat = p.category_id;
-        let books = run_blocking(move || db.search_books(&query, cat, limit)).await?;
+        let filters: Vec<String> = p
+            .sources
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["all".to_string()]);
+        let all = filters.iter().any(|f| f.trim() == "all");
+        let wants = move |src: &Source| all || filters.iter().any(|f| src.matches_filter(f));
+        let secondary = self.lib.secondary();
+        let books = run_blocking(move || {
+            let mut out = Vec::new();
+            if wants(&Source::Library) {
+                out.extend(db.search_books(&query, cat, limit)?);
+            }
+            if cat.is_none() {
+                for sec in &secondary.dbs {
+                    if !wants(&sec.spec.source) {
+                        continue;
+                    }
+                    let Some(sdb) = sec.db() else { continue };
+                    match sdb.search_books(&query, None, limit) {
+                        Ok(hits) => out.extend(hits.into_iter().map(|mut b| {
+                            b.set_source(&sec.spec.source);
+                            b
+                        })),
+                        Err(e) => eprintln!(
+                            "otzaria-mcp: search_books in {} failed: {e:#}",
+                            sec.spec.path.display()
+                        ),
+                    }
+                }
+            }
+            // each source comes ordered; across them, by match rank, then library,
+            // personal, attached
+            let mut out: Vec<(usize, _)> = out.into_iter().enumerate().collect();
+            out.sort_by_key(|(i, b): &(usize, crate::db::BookHit)| {
+                (b.match_rank, b.source.rank(), *i)
+            });
+            out.truncate(limit as usize);
+            Ok::<_, anyhow::Error>(out.into_iter().map(|(_, b)| b).collect::<Vec<_>>())
+        })
+        .await?;
         self.respond(&snap, json!({ "count": books.len(), "books": books }))
     }
 
