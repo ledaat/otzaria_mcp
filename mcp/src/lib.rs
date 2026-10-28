@@ -17,3 +17,6 @@ pub mod toc_search;
 
 #[cfg(test)]
 mod fixture_tests;
+
+#[cfg(test)]
+mod schema7_tests;
