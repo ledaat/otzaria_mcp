@@ -365,6 +365,7 @@ impl Search {
                 req.match_nikud,
                 req.match_taamim,
                 grouping,
+                None, // cancel_request_id: one request at a time, none cancelled
             ),
             Mode::Fuzzy => engine.search_and_count_fuzzy(
                 req.query.clone(),
@@ -376,6 +377,7 @@ impl Search {
                 req.match_nikud,
                 req.match_taamim,
                 grouping,
+                None,
             ),
             Mode::Advanced => {
                 let a = Advanced::from(req)?;
@@ -401,6 +403,7 @@ impl Search {
                     grouping,
                     a.word_match.0,
                     a.word_match.1,
+                    None,
                     None,
                 )
             }

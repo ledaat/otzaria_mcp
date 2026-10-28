@@ -27,6 +27,29 @@ pub use crate::text::strip_html_tags;
 pub type LineRow = (i64, i64, Option<String>, String);
 type StoredLineRow = (i64, i64, Option<String>, Value);
 
+/// `line_note` rows by `line.id`, bodies still as stored: (charPos, hasMarker, body).
+type RawNotes = HashMap<i64, Vec<(i64, bool, Value)>>;
+
+/// Decode stored note bodies (TEXT, or zstd frames like `line_content`); as in the
+/// engine, a body that cannot be decoded is left out.
+fn decode_notes(codec: &mut LineCodec, raw: RawNotes) -> HashMap<i64, Vec<BookNote>> {
+    raw.into_iter()
+        .map(|(id, notes)| {
+            let notes = notes
+                .into_iter()
+                .filter_map(|(char_pos, has_marker, body)| {
+                    codec.text(&body).ok().map(|body| BookNote {
+                        char_pos,
+                        has_marker,
+                        body,
+                    })
+                })
+                .collect();
+            (id, notes)
+        })
+        .collect()
+}
+
 /// The connection plus the codec for its compressed rows (one per connection).
 pub struct Inner {
     pub conn: Connection,
@@ -38,8 +61,12 @@ pub struct Inner {
 pub struct Caps {
     /// `line_content` table (schema 6): text is not in `line.content`.
     pub split_content: bool,
-    /// Complete schema-7 `line_note` layout; its bodies are uncompressed TEXT.
+    /// Complete schema-7 `line_note` layout. Bodies are TEXT, or zstd frames of the
+    /// `zstd_dict` dictionaries like `line_content` (library releases from 5.0.1 on).
     pub line_notes: bool,
+    /// `line_note.hasMarker` (INTEGER 0/1, the released schema 7) rather than the
+    /// early `marker` TEXT.
+    pub note_marker_flag: bool,
     /// Rows are zstd frames (a `zstd_dict` table exists).
     pub compressed: bool,
     pub line_ref: bool,
@@ -88,9 +115,11 @@ impl Caps {
         let note_cols = columns("line_note")?;
         Ok(Caps {
             split_content: t("line_content"),
-            line_notes: ["lineId", "noteIndex", "charPos", "marker", "body"]
+            line_notes: ["lineId", "noteIndex", "charPos", "body"]
                 .iter()
-                .all(|name| note_cols.contains(*name)),
+                .all(|name| note_cols.contains(*name))
+                && (note_cols.contains("hasMarker") || note_cols.contains("marker")),
+            note_marker_flag: note_cols.contains("hasMarker"),
             compressed: t("zstd_dict"),
             line_ref: t("line_ref"),
             line_dh: t("line_dh"),
@@ -284,8 +313,8 @@ impl Db {
     /// Load only notes belonging to the requested base rows, in bounded SQL batches.
     /// As in the engine, malformed noteIndex/body rows are skipped; a missing
     /// charPos falls back to the associated marker or end of line.
-    fn notes_by_line_id(&self, inner: &Inner, ids: &[i64]) -> Result<HashMap<i64, Vec<BookNote>>> {
-        let mut notes: HashMap<i64, Vec<BookNote>> = HashMap::new();
+    fn notes_by_line_id(&self, inner: &Inner, ids: &[i64]) -> Result<RawNotes> {
+        let mut notes: RawNotes = HashMap::new();
         if !self.caps.line_notes {
             return Ok(notes);
         }
@@ -294,25 +323,48 @@ impl Db {
         ids.dedup();
         for chunk in ids.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let mut stmt = inner.conn.prepare(&format!(
-                "SELECT lineId, noteIndex, charPos, marker, body FROM line_note \
-                 WHERE lineId IN ({placeholders}) ORDER BY lineId, noteIndex"
-            ))?;
-            let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
-            while let Some(row) = rows.next()? {
-                let (ValueRef::Integer(id), ValueRef::Integer(_), ValueRef::Text(body)) =
-                    (row.get_ref(0)?, row.get_ref(1)?, row.get_ref(4)?)
-                else {
-                    continue;
-                };
-                notes.entry(id).or_default().push(BookNote {
-                    char_pos: match row.get_ref(2)? {
+            let marker = if self.caps.note_marker_flag {
+                "hasMarker"
+            } else {
+                "marker"
+            };
+            let raw: Vec<(i64, i64, bool, Value)> = {
+                let mut stmt = inner.conn.prepare(&format!(
+                    "SELECT lineId, noteIndex, charPos, {marker}, body FROM line_note \
+                     WHERE lineId IN ({placeholders}) ORDER BY lineId, noteIndex"
+                ))?;
+                let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
+                let mut raw = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let (ValueRef::Integer(id), ValueRef::Integer(_)) =
+                        (row.get_ref(0)?, row.get_ref(1)?)
+                    else {
+                        continue;
+                    };
+                    let body = match row.get_ref(4)? {
+                        ValueRef::Text(t) => Value::Text(String::from_utf8_lossy(t).into_owned()),
+                        ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+                        _ => continue,
+                    };
+                    let char_pos = match row.get_ref(2)? {
                         ValueRef::Integer(pos) => pos,
                         _ => -1,
-                    },
-                    has_marker: matches!(row.get_ref(3)?, ValueRef::Text(_)),
-                    body: String::from_utf8_lossy(body).into_owned(),
-                });
+                    };
+                    // hasMarker 0/1; the early layout's marker text (an empty one counts)
+                    let has_marker = match row.get_ref(3)? {
+                        ValueRef::Integer(n) => n != 0,
+                        ValueRef::Text(_) => true,
+                        _ => false,
+                    };
+                    raw.push((id, char_pos, has_marker, body));
+                }
+                raw
+            };
+            for (id, char_pos, has_marker, body) in raw {
+                notes
+                    .entry(id)
+                    .or_default()
+                    .push((char_pos, has_marker, body));
             }
         }
         Ok(notes)
@@ -353,6 +405,7 @@ impl Db {
             };
             let notes = self.notes_by_line_id(inner, chunk)?;
             snapshot.map(|snapshot| snapshot.commit()).transpose()?;
+            let notes = decode_notes(&mut inner.codec, notes);
             for (id, v) in rows {
                 let html = inner.codec.text_lossy(&v);
                 let restored = notes
@@ -459,6 +512,7 @@ impl Db {
         let ids: Vec<_> = rows.iter().map(|row| row.1).collect();
         let notes = self.notes_by_line_id(inner, &ids)?;
         snapshot.map(|snapshot| snapshot.commit()).transpose()?;
+        let notes = decode_notes(&mut inner.codec, notes);
         Ok(rows
             .into_iter()
             .map(|(li, id, he_ref, value)| {
@@ -930,6 +984,7 @@ impl Db {
         let base_ids: Vec<_> = raw.iter().filter(|row| row.4).map(|row| row.0).collect();
         let notes = self.notes_by_line_id(&inner, &base_ids)?;
         snapshot.map(|snapshot| snapshot.commit()).transpose()?;
+        let notes = decode_notes(&mut inner.codec, notes);
         let lines: Vec<TextLine> = raw
             .into_iter()
             .map(|(id, li, he_ref, v, from_base)| {

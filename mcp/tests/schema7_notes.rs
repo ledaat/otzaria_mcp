@@ -35,16 +35,18 @@ fn get_text_retains_schema7_footnote_body_found_by_search() {
         r#"CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT, totalLines INTEGER);
          CREATE TABLE line (id INTEGER PRIMARY KEY, bookId INTEGER, lineIndex INTEGER, heRef TEXT);
          CREATE TABLE line_content (id INTEGER PRIMARY KEY, content TEXT);
-         CREATE TABLE line_note (lineId INTEGER, noteIndex INTEGER, charPos INTEGER, marker TEXT, body TEXT);
+         CREATE TABLE line_note (lineId INTEGER, noteIndex INTEGER, charPos INTEGER, hasMarker INTEGER, body TEXT);
          INSERT INTO book VALUES (1, 'ספר', 1);
          INSERT INTO line VALUES (1, 1, 0, 'ספר א');
          INSERT INTO line_content VALUES (1, 'שלום<sup class="footnote-marker">א</sup> עולם');
-         INSERT INTO line_note VALUES (1, 0, 5, 'א', 'הערה מילתבדיקה הסבר');"#,
+         INSERT INTO line_note VALUES (1, 0, 5, 1, 'הערה מילתבדיקה הסבר');"#,
     ).unwrap();
     let index_path = tmp.path().join("index");
     std::fs::create_dir(&index_path).unwrap();
     configure_line_source(db_path.to_string_lossy().into_owned()).unwrap();
     let mut writer = SearchEngine::new(index_path.to_str().unwrap());
+    // engine 5+: the writer is opened explicitly before indexing
+    writer.open_index_writer().unwrap();
     writer
         .add_library_books(vec![input()], &IndexingCancellationToken::new())
         .unwrap();

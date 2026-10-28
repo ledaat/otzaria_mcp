@@ -1,5 +1,175 @@
 # Changelog
 
+## 6.0.0 – 2026-10-26
+
+> Breaking for every existing index: schema 10 changes the terms that `text`
+> and `textVocalized` index, so an index built by 5.0.x (schema 7), or by the
+> earlier PR #66 revisions `67f3193` (schema 8) and `4bb3589` (schema 9),
+> is `rebuild_required`.
+> `LINE_TEXT_VERSION` is 4, so vector sets with line-text version 1, 2 or 3 are
+> `artifactIncompatible` on `text.line_text_version` and must be
+> built and published again, and the chunk-key column of an existing index
+> counts as absent until it is rebuilt.
+
+### Breaking
+
+- **Index schema 10**: the fields of schema 7, with other terms. `text` splits
+  words at `<sup>` and `<sub>`, and `textVocalized` keeps each run of marks in
+  canonical order, without CGJ. A hanging Hebrew letter remains inside its
+  word even across transparent formatting and zero-width controls. Schemas 7
+  through 9 cannot prove this text recipe, so all are rebuilt, including builds
+  pinned to an earlier SHA of this unreleased PR.
+
+### Added
+
+- **`cancelRequestId`** (optional) on the lexical search calls, so a search
+  can be cancelled by its id between the phases of the query, with the search
+  caches left consistent.
+- **`searchSnapshot()`** returns an opaque id of the content, order,
+  dictionaries and text sources a search sees now, to tell whether a cached
+  result is still valid.
+- **`releaseMemory()`** drops the search and text caches that can be rebuilt,
+  for memory pressure.
+
+### Changed
+
+- **Explicit economy mode** (`setEconomyIndexing`): one preparation worker and
+  CPU thread, small spilling buffers and a 50MB writer; `false` restores normal
+  preparation. A mobile writer's 50MB default no longer implies it.
+- **Indexing preparation is bounded.** A book up to 32 MiB and 65,536 lines is
+  prepared by the original parallel whole-book pass; a larger one streams.
+  Four workers reserve at most 384 MiB of buffers together, and an oversized
+  book uses small document spools.
+- **Faster approximate highlighting**: the spellings of a term found once are
+  not searched again (10–45 ms saved), the spellings of all the words come in
+  one pass over each segment's dictionary, and the buffer of a word is reused
+  across a line.
+- Document diagnostics are batched by 64 KiB slabs, and the per-row global
+  source lock is gone.
+
+### Fixed
+
+- **`<sup>` and `<sub>` separate words.** Indexing, search, highlighting and
+  the regex line view read `word<sup>1</sup>word` as two words, as they do
+  other breaking tags, instead of gluing them into one term. The exception is
+  a hanging letter: a tag holding exactly one Hebrew letter (with its marks,
+  or a presentation form of one) between two letters of a word, such as the
+  raised letters of the Tanakh, stays inside the word. A tag whose attributes
+  mark it `footnote-marker` always separates. Transparent formatting around
+  or inside a hanging-letter tag does not interrupt the word. Bidi/zero-width
+  controls, CGJ and varika are ignored in this context too, including when
+  interleaved with formatting. Attached marks require a preceding base letter;
+  a stray mark cannot turn a footnote into part of the following word. Block
+  tags, whitespace and footnote markers still separate words.
+  `LINE_TEXT_VERSION` is 4 because the indexed line text changes.
+- **Vocalized search ignores the order of marks.** A query and a line that
+  type the same nikud and cantillation in different orders match: the
+  tokenizer and the vocalized query pattern both put each run of marks in
+  canonical combining class order. Both drop the combining grapheme joiner
+  (U+034F) first, so `ירושלַ͏ִם`, with a CGJ between the patah and the hiriq as
+  the library spells it, is found by a query typed without it, in either order.
+- **A line regex no longer drops lines with quoted or glued words.** The
+  fixed words that select candidate lines are split the way the index splits
+  them (`''` is `"`, and a run of quotes splits a word), and a word bounded on
+  both sides also finds a term that a quote, gershayim or a numeral that is
+  not `\w` (such as `²`) glues it to. `/ז''ל .* אמר/` and `/תוס' .* שבת/`
+  found no line or too few before. A word glued to another by a character the
+  index drops, such as `יב[ע]ר`, is still not found.
+- **An existing index without its sidecar is not assumed to use schema 10's
+  text recipe.** Matching field definitions alone cannot distinguish schema
+  older terms from schema 10's. The compatibility check now requires rebuilding
+  when committed segments exist or the segment inventory is unknown; opening
+  such an index does not silently write a version 10 sidecar. A new, empty index
+  still initializes normally. Callers must run the compatibility check before
+  opening an existing index.
+- A literal quoted input is kept when the spellings of a batch are expanded.
+- Empty grouped highlights are skipped, and every streamed note is validated.
+- The allocation for the first highlight mapping is bounded for markup-heavy
+  text.
+
+### Performance
+
+- **Line-regex fixed words share dictionary scans.** Up to 16 uncached fixed
+  fragments share each traversal, with the same per-fragment term and postings
+  budgets, cache identities and segment order. A fully cached required clause
+  known to be empty stops before a dictionary scan; an empty clause found by
+  the scan returns an empty query. A single uncached fragment keeps its previous
+  collector. Warm-cache calls can cost slightly more; this is a preparation
+  improvement for multi-fragment cache misses, not a blanket search speedup.
+
+## 5.0.1 – 2026-10-20
+
+### Fixed
+
+- **Compressed margin notes are indexed.** From the library release that keeps
+  `line_note.body` as a zstd frame of the dictionary in `zstd_dict` (like
+  `line_content`), a body is decoded like a line. 5.0.0 skipped every body that
+  was not TEXT, so such a library was indexed without its notes and with no
+  error. A body that cannot be decoded now fails its book.
+- **Note markers are read as a flag.** Schema 7 stores `line_note.hasMarker`
+  (INTEGER 0 or 1) instead of the marker text, and the probe requires it. Any
+  other value fails the book.
+
+## 5.0.0 – 2026-10-19
+
+> Breaking for every existing index: schema 7 gives books stable numbers and
+> takes the catalogue order out of the document ids, so an index built by 4.x
+> (schema 6) is `rebuild_required`. The Dart API of indexing changes too:
+> `addDocument`/`updateDocument` take an `ordinal` instead of an `id`, and the
+> catalogue and generation orders move to `setBookOrder`. The package is now
+> built by a build hook instead of cargokit, which needs Flutter 3.38.1.
+
+### Breaking
+
+- **Index schema 7**: a document's id is `(bookNumber << 32) + ordinal + 1`,
+  the number assigned by the engine on a book's first write. The catalogue and
+  generation order are no longer in the ids or the documents, so a change of
+  either does not reindex a book, and `compute_book_fingerprint` no longer
+  covers them.
+- **Indexing calls**: `addDocument` and `updateDocument` take `ordinal`
+  (the 0-based line in its book) instead of `id`, and no `sectionId`;
+  `DocumentInput.id`, `sectionId` and `generationOrder` are replaced by `ordinal` and
+  `sectionOrdinal`. `addDocumentsBatch`, `addTextBook` and the library indexing
+  calls take `title`, `topics` and `extraFacets` instead of `catalogueOrder`
+  and `generationOrder`, and an optional `sourceHash`.
+- **The native library is built by a build hook** (`hook/build.dart`), not
+  cargokit: no platform plugin code, Swift Package Manager supported,
+  `flutter: ">=3.38.1"`, and the hook downloads the signed binary or compiles
+  it with cargo. `build_from_source` and `skip_build` are its user defines.
+
+### Added
+
+- **`setBookOrder(entries)`** replaces the order mapping of the books
+  (`BookOrderEntry`: `filePath`, `catalogueOrder`, `generationOrder`), applied
+  to the next catalogue or generation search with no reindexing;
+  `bookOrderRevision()` returns its revision and `warmBookOrder()` prepares it
+  before the first search.
+- **`getBookStamps()`** returns, for every book, its number, live documents and
+  `contentHash`, `textHash`, `metadataHash` and `sourceHash` (`BookStamps`), so
+  a check after a library update needs no book text. `computeBookMetadataFingerprint`
+  gives the `metadataHash` of a book.
+- **`setVocalizedSnippets(enabled)`**: a search on the mark-free text shows the
+  line with its nikud and cantillation (highlights unchanged). Off by default.
+- **Smart search**: a short line that shares a neighbour's vector resolves to
+  it, and `SemanticRankingOptions.aliasPenalty` (default 0.04) is taken off
+  the cosine of such a line.
+- **Vector sets in segment format 3** (`rot192-i8i4`): installed in whichever
+  store the build reads, with the validation gates of the codec (recall@50 of
+  0.98 for `rot192-i8i4`). Format 2 sets are still accepted. (#55)
+- The shared note renderer of schema 7 is exposed to database clients.
+
+### Changed
+
+- **The sidecar is pinned at `86f4548`.**
+- Margin notes (`line_note`) of library books are indexed back in their lines,
+  as the app shows them; empty marker notes after leading formatting tags are
+  kept.
+
+### Fixed
+
+- Repeated alias results are kept and the reverse alias lookup is cached.
+- A copied short line's alias resolves before the shared text's records.
+
 ## 4.1.0 – 2026-10-17
 
 > Nothing here breaks an index built by 4.0.0: the schema is unchanged, and

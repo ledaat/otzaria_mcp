@@ -2,6 +2,18 @@
 
 ## fork (ledaat/otzaria_mcp) — על גבי 0.2.0
 
+### 0.3.1 — מנוע 6.0.0, סכמה 7 של הספרייה כפי ששוחררה, ספרים אישיים ב-`search_books`
+- **מיזוג upstream** (Otzaria/otzaria_mcp #3: מספרי ספרים יציבים, הערות `line_note`), ומעליו
+  **vendoring מחדש של המנוע 6.0.0** (`v6.0.0`, סכמת אינדקס 10) — הגרסה שהאפליקציה מצמידה;
+  אינדקס שהאפליקציה בנתה בסכמה 10 נדחה ע"י 4.1.0 (`engine_too_old`). שני התיקונים המקומיים
+  (`open_read_only`, `refresh_line_source`) הוחלו מחדש; לקריאות החיפוש נוסף `cancel_request_id`.
+- **הערות סכמה 7 כפי ששוחררה**: `line_note.hasMarker` (INTEGER 0/1) במקום `marker`, וגוף
+  הערה שהוא מסגרת zstd של מילוני `zstd_dict` (כמו `line_content`) מפוענח; המבנה המוקדם
+  (`marker` TEXT, גוף TEXT) עדיין נקרא.
+- **`search_books` גם בספרים אישיים ובמסדים מצורפים** (`sources`, ברירת מחדל `["all"]`; סינון
+  `category_id` — בספרייה בלבד). כל תוצאה נושאת `source`, `book_uid`, `link`, `match_rank`,
+  ולספר אישי גם `file_path`. השאילתה מסתגלת לעמודות ולטבלאות שיש במסד.
+
 ### 0.3.0 — `resolve_ref` כתחליף לאיתור המקורות של האפליקציה (`library.resolveRef`)
 - **ספרים אישיים ומסדים מצורפים**: פרמטר `sources` (`"library"` ברירת מחדל, `"user"`,
   `"attached"`, `"attached:<slug>"`, `"all"`). `user_books.db` נמצא ב-`<app data>/databases`,

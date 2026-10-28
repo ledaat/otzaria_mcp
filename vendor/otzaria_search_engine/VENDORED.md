@@ -1,17 +1,16 @@
 # Vendored: otzaria_search_engine (rust crate `search_engine`)
 
 This directory holds a **vendored copy** of the Rust crate from the
-`otzaria_search_engine` Flutter package: version **4.1.0 plus merged stable-book-id
-support**, commit `30e8f1682428d5cc252b3e610f2c9cc06c04b81f` on the official
-`https://github.com/Otzaria/otzaria_search_engine` `refactor` branch. This includes
-PRs #52, #56 and #57; no new version or release tag has been published yet.
+`otzaria_search_engine` Flutter package: version **6.0.0**, tag `v6.0.0` (commit
+`5ea4900`) of `https://github.com/Otzaria/otzaria_search_engine` — the version the app
+pins (`otzaria_search_engine: ^6.0.0`, pubspec.lock 6.0.0, app commit `2617a69`).
 
 ## Why vendored, and why this exact version
 - The crate is not published to crates.io; it ships inside the pub.dev package.
 - The engine must match the app that builds the Tantivy index. This version writes
-  **index schema version 7** and reads only schema 7 (`MIN_READABLE_SCHEMA_VERSION`):
-  an index built by an older app (schema 5/6) is refused by `check_index_compatibility`
-  until the app rebuilds it. Official books normally read line text back from
+  **index schema version 10** and reads only schema 10 (`MIN_READABLE_SCHEMA_VERSION`):
+  an index built by an older app is refused by `check_index_compatibility` until the
+  app rebuilds it. Official books normally read line text back from
   `seforim.db` through the engine's *library line source*. Books with restored
   `line_note` bodies keep that reconstructed text in the index so search results
   include the same text that was indexed.
@@ -28,14 +27,14 @@ PRs #52, #56 and #57; no new version or release tag has been published yet.
 - Vendoring exact bytes keeps the MCP self-contained and reproducible.
 
 ## Source
-Copied from `git archive 30e8f1682428d5cc252b3e610f2c9cc06c04b81f rust LICENSE CHANGELOG.md`
+Copied from `git archive v6.0.0 rust LICENSE CHANGELOG.md`
 (`rust/Cargo.toml`, `src/`, `resources/`, `vendor/tantivy-fst/`, plus `LICENSE` and
 `CHANGELOG.md`). Omitted: the Flutter plugin scaffolding, the crate's `tests/`,
 `examples/` and `Cargo.lock` (not needed to build the lib). To verify, from a clone of the
 engine that has the commit:
 
 ```sh
-mkdir /tmp/engine && git archive 30e8f1682428d5cc252b3e610f2c9cc06c04b81f rust | tar -x -C /tmp/engine
+mkdir /tmp/engine && git archive v6.0.0 rust | tar -x -C /tmp/engine
 diff -r /tmp/engine/rust <mcp>/vendor/otzaria_search_engine/rust
 ```
 
@@ -44,7 +43,7 @@ Apart from the omitted files, the differences are the patches below.
 The crate pulls two git dependencies at pinned revisions (fetched by cargo):
 `Otzaria/tantivy@8b88320` (via the workspace `[patch.crates-io]`, which must repeat the
 crate's own patch because dependency patches are ignored) and
-`Otzaria/otzaria-semantic-search@3aeb94e` (default features off — only the chunk-key
+`Otzaria/otzaria-semantic-search@86f4548` (default features off — only the chunk-key
 recipe and formats; no ONNX backend is compiled, since the MCP does not enable the
 crate's `semantic*` features). Cargo warns that the crate's own `[patch]` and
 `[profile.release]` are ignored as a non-root package; that is expected.

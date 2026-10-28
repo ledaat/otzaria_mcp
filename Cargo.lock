@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "otzaria-mcp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "rmcp",
@@ -1514,7 +1514,7 @@ dependencies = [
 [[package]]
 name = "otzaria-semantic-search"
 version = "0.1.0"
-source = "git+https://github.com/Otzaria/otzaria-semantic-search?rev=3aeb94ef83d80d89f3d54dad3cc34ba5ccee4200#3aeb94ef83d80d89f3d54dad3cc34ba5ccee4200"
+source = "git+https://github.com/Otzaria/otzaria-semantic-search?rev=86f45489d2ef0dcc139681e682bb84dc1e04dd81#86f45489d2ef0dcc139681e682bb84dc1e04dd81"
 dependencies = [
  "crc32fast",
  "libloading",
@@ -1887,7 +1887,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "search_engine"
-version = "4.1.0"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -1910,6 +1910,7 @@ dependencies = [
  "tantivy",
  "tantivy-fst",
  "tempfile",
+ "unicode-normalization-alignments",
  "unicode-segmentation",
  "zstd",
 ]

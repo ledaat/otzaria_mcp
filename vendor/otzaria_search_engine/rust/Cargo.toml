@@ -1,6 +1,6 @@
 [package]
 name = "search_engine"
-version = "4.1.0"
+version = "6.0.0"
 edition = "2021"
 
 [lib]
@@ -133,13 +133,16 @@ sha2 = "0.10"
 # the inference crates come only with `onnx-backend`, which `semantic-onnx` turns
 # on and the sidecar declares for desktop targets only. The `semantic*` features
 # gate the code that talks to it.
-otzaria-semantic-search = { git = "https://github.com/Otzaria/otzaria-semantic-search", rev = "3aeb94ef83d80d89f3d54dad3cc34ba5ccee4200", default-features = false }
+otzaria-semantic-search = { git = "https://github.com/Otzaria/otzaria-semantic-search", rev = "86f45489d2ef0dcc139681e682bb84dc1e04dd81", default-features = false }
 
 [dev-dependencies]
 # תבניות ההדגשה המשולבות כוללות lookahead (הפרדת תגי inline מתגי שבירה),
 # ש-RegExp של Dart תומך בו ו-`regex` לא — בבדיקות מהדרים אותן עם backtracking
 # כמו בצד ה-Dart.
 fancy-regex = "0.14"
+# Checks the hardcoded combining-class table against Unicode; already in the
+# lockfile through `tokenizers`.
+unicode-normalization-alignments = "0.1.12"
 
 # Vendored copy of tantivy-fst 0.5.0 whose only local change raises the
 # regex-DFA STATE_LIMIT from 1 000 to 8 192 (see vendor/tantivy-fst/README.md).

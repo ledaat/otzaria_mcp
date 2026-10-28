@@ -44,7 +44,7 @@ use crate::book_order::{book_number_of, OrderKind, OrderTables};
 use crate::doc_store::DocumentLoader;
 use crate::gap_phrase::Proximity;
 use crate::hebrew_query::{
-    fold_presentation_form, is_invisible_char, is_word_mark, BREAKING_TAG_NAMES,
+    fold_presentation_form, is_invisible_char, is_word_mark, tag_breaks_word,
 };
 use crate::highlight_matcher::{Match, PreparedHighlightMatcher, Range};
 use crate::line_source::{self, FrameDecoder, RawRow, Source};
@@ -114,11 +114,12 @@ pub(crate) struct TermPart {
     verify: Option<Regex>,
 }
 
-/// A fixed word every match of a line pattern contains.
+/// A fixed word every match of a line pattern contains, as the tokenizer makes it a term.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Fragment {
     pub(crate) text: String,
-    /// The fragment is a whole token: one term, rather than terms containing it.
+    /// Bounded on both sides in the pattern: a whole term, or one glued to others by
+    /// [`GLUE`]; otherwise only contained in a term.
     pub(crate) whole: bool,
 }
 
@@ -248,16 +249,6 @@ fn fold_pattern(raw: &str) -> String {
         }
     }
     out
-}
-
-/// [`crate::hebrew_query::is_breaking_tag`] on the text between `<` and `>`, without collecting it.
-fn is_breaking_tag_name(body: &str) -> bool {
-    let body = body.strip_prefix('/').unwrap_or(body);
-    let len = body.bytes().take_while(u8::is_ascii_alphanumeric).count();
-    (1..=10).contains(&len)
-        && BREAKING_TAG_NAMES
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(&body[..len]))
 }
 
 /// What `cleanLineForSearch` deletes: the whole nikud/cantillation block (sof pasuq too),
@@ -598,7 +589,6 @@ fn verifies(verify: &Regex, term: &str) -> bool {
 }
 
 impl UserTermAutomaton {
-    #[cfg(test)]
     pub(crate) fn matches(&self, term: &str) -> bool {
         use tantivy_fst::Automaton;
         let mut state = self.start();
@@ -636,7 +626,7 @@ pub(crate) fn index_identity(searcher: &Searcher) -> u64 {
     crate::page_cache::snapshot_of(searcher)
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct PartTermsKey {
     index: u64,
     field: Field,
@@ -644,6 +634,25 @@ struct PartTermsKey {
     exact: String,
     max_terms: u32,
     postings_budget: u64,
+}
+
+impl PartTermsKey {
+    fn new(
+        searcher: &Searcher,
+        field: Field,
+        part: &TermPart,
+        max_terms: u32,
+        postings_budget: u64,
+    ) -> Self {
+        Self {
+            index: index_identity(searcher),
+            field,
+            relaxed: part.relaxed.clone(),
+            exact: part.pattern.clone(),
+            max_terms,
+            postings_budget,
+        }
+    }
 }
 
 /// A part's terms, their postings and whether they were truncated.
@@ -666,14 +675,7 @@ pub(crate) fn collect_part_terms(
     if cancel.load(Ordering::Relaxed) {
         anyhow::bail!(CANCELLED);
     }
-    let key = PartTermsKey {
-        index: index_identity(searcher),
-        field,
-        relaxed: part.relaxed.clone(),
-        exact: part.pattern.clone(),
-        max_terms,
-        postings_budget,
-    };
+    let key = PartTermsKey::new(searcher, field, part, max_terms, postings_budget);
     if let Some((terms, postings, truncated)) = TERM_CACHE.lock().unwrap().get(&key) {
         return Ok(PartTerms {
             terms: terms.clone(),
@@ -748,6 +750,183 @@ pub(crate) fn collect_part_terms(
         postings,
         truncated,
     })
+}
+
+/// Uncached fixed words share each dictionary walk; their budgets and cache entries stay separate.
+const LINE_TERM_BATCH_PARTS: usize = 16;
+const LINE_TERM_BATCH_LITERAL_BYTES: usize = 512;
+
+fn line_literal_prefilter(literals: &[&str]) -> Option<Arc<TermDfa>> {
+    if literals.is_empty()
+        || literals.len() > LINE_TERM_BATCH_PARTS
+        || literals.iter().map(|literal| literal.len()).sum::<usize>()
+            > LINE_TERM_BATCH_LITERAL_BYTES
+    {
+        return None;
+    }
+    let alternatives: Vec<_> = literals
+        .iter()
+        .map(|literal| regex::escape(literal))
+        .collect();
+    term_automaton::compile_pattern(&format!("(?s:.*(?:{}).*)", alternatives.join("|"))).ok()
+}
+
+fn collect_line_terms(
+    searcher: &Searcher,
+    field: Field,
+    parts: &[TermPart],
+    literals: &[&str],
+    max_terms: u32,
+    postings_budget: u64,
+    cancel: &AtomicBool,
+) -> anyhow::Result<Vec<PartTerms>> {
+    debug_assert_eq!(parts.len(), literals.len());
+    if cancel.load(Ordering::Relaxed) {
+        anyhow::bail!(CANCELLED);
+    }
+    let keys: Vec<_> = parts
+        .iter()
+        .map(|p| PartTermsKey::new(searcher, field, p, max_terms, postings_budget))
+        .collect();
+    let mut collected: Vec<Option<PartTerms>> = keys
+        .iter()
+        .map(|key| {
+            TERM_CACHE
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|(terms, postings, truncated)| PartTerms {
+                    terms: terms.clone(),
+                    postings: *postings,
+                    truncated: *truncated,
+                })
+        })
+        .collect();
+    let missing: Vec<_> = collected
+        .iter()
+        .enumerate()
+        .filter_map(|(i, value)| value.is_none().then_some(i))
+        .collect();
+    if missing.len() == 1 {
+        let i = missing[0];
+        collected[i] = Some(collect_part_terms(
+            searcher,
+            field,
+            &parts[i],
+            max_terms,
+            postings_budget,
+            cancel,
+        )?);
+    } else {
+        // Bound the simultaneous per-segment term buffers, as the cache bounds retained parts.
+        for missing in missing.chunks(LINE_TERM_BATCH_PARTS) {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!(CANCELLED);
+            }
+            // Literal containment is a cheap superset; the original automata classify each hit.
+            let literals: Vec<_> = missing.iter().map(|&i| literals[i]).collect();
+            let Some(dfa) = line_literal_prefilter(&literals) else {
+                for &i in missing {
+                    collected[i] = Some(collect_part_terms(
+                        searcher,
+                        field,
+                        &parts[i],
+                        max_terms,
+                        postings_budget,
+                        cancel,
+                    )?);
+                }
+                continue;
+            };
+            use rayon::prelude::*;
+            let segments = searcher
+                .segment_readers()
+                .par_iter()
+                .map(|reader| -> anyhow::Result<_> {
+                    let inverted = reader.inverted_index(field)?;
+                    let mut found = vec![Vec::new(); missing.len()];
+                    let mut stopped = vec![false; missing.len()];
+                    let mut scanned = vec![0u64; missing.len()];
+                    let mut postings = vec![0u64; missing.len()];
+                    if cancel.load(Ordering::Relaxed) {
+                        anyhow::bail!(CANCELLED);
+                    }
+                    let mut stream = inverted
+                        .terms()
+                        .search(QuoteTransparent::from_arc(dfa.clone()))
+                        .into_stream()?;
+                    let mut visited = 0usize;
+                    while stream.advance() {
+                        visited += 1;
+                        if visited.is_multiple_of(4096) && cancel.load(Ordering::Relaxed) {
+                            anyhow::bail!(CANCELLED);
+                        }
+                        let Ok(term) = std::str::from_utf8(stream.key()) else {
+                            continue;
+                        };
+                        for local in 0..missing.len() {
+                            let part = &parts[missing[local]];
+                            if stopped[local] || !part.automaton.matches(term) {
+                                continue;
+                            }
+                            scanned[local] += 1;
+                            if scanned[local] > MAX_SCANNED_KEYS_PER_SEGMENT {
+                                stopped[local] = true;
+                                continue;
+                            }
+                            if part.verify.as_ref().is_some_and(|v| !verifies(v, term)) {
+                                continue;
+                            }
+                            let freq = u64::from(stream.value().doc_freq);
+                            found[local].push((term.to_string(), freq));
+                            postings[local] += freq;
+                            stopped[local] = found[local].len() >= max_terms as usize
+                                || postings[local] >= postings_budget;
+                        }
+                        if stopped.iter().all(|&done| done) {
+                            break;
+                        }
+                    }
+                    Ok((found, stopped))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!(CANCELLED);
+            }
+            for (local, &i) in missing.iter().enumerate() {
+                let mut set = HashSet::new();
+                let mut postings = 0;
+                let mut truncated = false;
+                'segments: for (found, stopped) in &segments {
+                    for (term, freq) in &found[local] {
+                        if set.len() >= max_terms as usize || postings >= postings_budget {
+                            truncated = true;
+                            break 'segments;
+                        }
+                        postings += freq;
+                        set.insert(term.clone());
+                    }
+                    truncated |= stopped[local];
+                }
+                let mut terms: Vec<_> = set.into_iter().collect();
+                terms.sort_unstable();
+                let terms = Arc::new(terms);
+                TERM_CACHE
+                    .lock()
+                    .unwrap()
+                    .put(keys[i].clone(), (terms.clone(), postings, truncated));
+                collected[i] = Some(PartTerms {
+                    terms,
+                    postings,
+                    truncated,
+                });
+            }
+        }
+    }
+    Ok(collected
+        .into_iter()
+        .map(|value| value.expect("all uncached parts collected"))
+        .collect())
 }
 
 /// The error text of a cancelled search.
@@ -850,17 +1029,12 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || is_word_mark(c)
 }
 
-fn is_term_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '"' || c == '\''
-}
-
-/// The fixed words of a line pattern's top level, as AND-ed clauses. A run of literal
-/// characters between two non-term characters (or a pattern edge) is a whole term; one
-/// touching a wildcard is only contained in a term. A top-level group whose every branch
-/// is a fixed word contributes their OR.
+/// The fixed words of a line pattern's top level, as AND-ed clauses: each term of a run of
+/// literal characters, whole when the run lies between two characters that end a term (or
+/// a pattern edge), and the OR of a top-level group whose every branch is a fixed word.
 fn required_clauses(elements: &[Hir]) -> Vec<Vec<Fragment>> {
     fn flush(run: &mut String, left: bool, right: bool, clauses: &mut Vec<Vec<Fragment>>) {
-        if let Some(fragment) = fragment(run, left, right) {
+        for fragment in fragments(run, left, right) {
             if !clauses.iter().any(|c| c.len() == 1 && c[0] == fragment) {
                 clauses.push(vec![fragment]);
             }
@@ -869,66 +1043,98 @@ fn required_clauses(elements: &[Hir]) -> Vec<Vec<Fragment>> {
     }
     let mut clauses: Vec<Vec<Fragment>> = Vec::new();
     let mut run = String::new();
-    let mut left_bounded = true;
+    // A pattern edge bounds a run only where `line_plan` implies a word boundary.
+    let edge = |c: Option<char>| c.is_some_and(is_word_char);
+    let mut left_bounded = edge(
+        elements
+            .first()
+            .and_then(literal_text)
+            .and_then(|t| t.chars().next()),
+    );
     for element in elements {
-        if let Some(text) = literal_text(element) {
-            let c = text.chars().next().unwrap_or(' ');
-            if is_term_char(c) {
-                run.extend(c.to_lowercase());
-            } else if crate::hebrew_tokenizer::is_transparent(c) {
-                // The tokenizer drops it inside a term (`יב[ע]ר` is `יבער`), so no edge here.
-                flush(&mut run, left_bounded, false, &mut clauses);
-                left_bounded = false;
-            } else {
-                flush(&mut run, left_bounded, true, &mut clauses);
-                left_bounded = true;
+        let bounding = match literal_text(element) {
+            Some(text) => {
+                let c = text.chars().next().unwrap_or(' ');
+                if crate::hebrew_tokenizer::continues_token(c) {
+                    run.extend(c.to_lowercase());
+                    continue;
+                }
+                true
             }
-            continue;
-        }
-        if is_separator(element) {
-            flush(&mut run, left_bounded, true, &mut clauses);
-            left_bounded = true;
-            continue;
-        }
-        flush(&mut run, left_bounded, false, &mut clauses);
-        left_bounded = false;
-        if let Some(any) = alternatives(element) {
-            clauses.push(any);
+            None => is_separator(element),
+        };
+        flush(&mut run, left_bounded, bounding, &mut clauses);
+        left_bounded = bounding;
+        if !bounding {
+            if let Some(any) = alternatives(element) {
+                clauses.push(any);
+            }
         }
     }
-    flush(&mut run, left_bounded, true, &mut clauses);
+    let right_bounded = edge(run.chars().next_back());
+    flush(&mut run, left_bounded, right_bounded, &mut clauses);
     clauses
 }
 
-/// The literal branches of a group required at least once, each only contained in a term.
+/// The literal branches of a group required at least once: the longest term of each.
 fn alternatives(hir: &Hir) -> Option<Vec<Fragment>> {
     match hir.kind() {
         HirKind::Repetition(rep) if rep.min >= 1 => alternatives(&rep.sub),
         HirKind::Capture(capture) => alternatives(&capture.sub),
-        HirKind::Alternation(subs) => {
-            let mut out = Vec::new();
-            for sub in subs {
-                let text = literal_text(sub)?;
-                let longest = text
-                    .split(|c: char| !is_term_char(c))
-                    .max_by_key(|piece| piece.chars().count())?;
-                out.push(fragment(&longest.to_lowercase(), false, false)?);
-            }
-            Some(out)
-        }
+        HirKind::Alternation(subs) => subs
+            .iter()
+            .map(|sub| {
+                fragments(&literal_text(sub)?.to_lowercase(), false, false)
+                    .into_iter()
+                    .max_by_key(|f| f.text.chars().count())
+            })
+            .collect(),
         _ => None,
     }
 }
 
-fn fragment(run: &str, left: bool, right: bool) -> Option<Fragment> {
-    let trimmed_left = run.trim_start_matches(['"', '\'']);
-    let trimmed = trimmed_left.trim_end_matches(['"', '\'']);
-    let whole = left && right && trimmed.len() == run.len();
-    (trimmed.chars().count() >= 2).then(|| Fragment {
-        text: trimmed.to_string(),
-        whole,
-    })
+/// The terms the index makes of `run`, without edge quotes; `left`/`right` say the run is
+/// bounded there. The tokenizer folds `''` to `"`, and a run like `""` splits it.
+fn fragments(run: &str, left: bool, right: bool) -> Vec<Fragment> {
+    use tantivy::tokenizer::{TokenStream, Tokenizer};
+    let mut tokenizer = crate::hebrew_tokenizer::HebrewTokenizer::default();
+    let mut stream = tokenizer.token_stream(run);
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().text.clone());
+    }
+    let last = tokens.len().saturating_sub(1);
+    tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(i, token)| {
+            let text = token.trim_matches(['"', '\'']);
+            // A longer term is not indexed (`RemoveLongFilter`): no term could contain it.
+            let indexed = text.len() < crate::api::search_engine::MAX_TOKEN_BYTES;
+            (text.chars().count() >= 2 && indexed).then(|| Fragment {
+                text: text.to_string(),
+                whole: (left || i > 0) && (right || i < last),
+            })
+        })
+        .collect()
 }
+
+/// What can glue a word to another in a term while the line pattern still sees a word
+/// boundary between them: a quote, or a character the tokenizer keeps in a word but `\w`
+/// does not match (a numeral like `²`).
+static GLUE: Lazy<ClassUnicode> = Lazy::new(|| {
+    let mut glue = ClassUnicode::new(
+        ('\0'..=char::MAX)
+            .filter(|&c| crate::hebrew_tokenizer::is_word_char(c))
+            .map(|c| ClassUnicodeRange::new(c, c)),
+    );
+    glue.difference(&WORD_CLASS);
+    glue.union(&ClassUnicode::new([
+        ClassUnicodeRange::new('"', '"'),
+        ClassUnicodeRange::new('\'', '\''),
+    ]));
+    glue
+});
 
 impl LinePlan {
     pub(crate) fn is_match(&self, view: &str) -> bool {
@@ -990,7 +1196,7 @@ impl LineView {
                 let rest = &source[byte..];
                 if let Some(close) = rest.find('>') {
                     let end16 = utf16 + units(&rest[..=close]);
-                    if is_breaking_tag_name(&rest[1..close]) {
+                    if tag_breaks_word(source, byte, byte + close) {
                         pending = Some(pending.map_or((utf16, end16), |(s, _)| (s, end16)));
                     }
                     byte += close + 1;
@@ -1214,6 +1420,11 @@ impl LineCacheKey {
     }
 }
 
+pub(crate) fn release_memory() {
+    TERM_CACHE.lock().unwrap().clear();
+    LINE_SCANS.lock().unwrap().clear();
+}
+
 /// A line search as far as it got. A later call of the same search (another page, a count,
 /// or after a cancel) resumes it, and a concurrent one waits for it instead of reading the
 /// scope again.
@@ -1319,15 +1530,16 @@ pub(crate) fn run_line_search(
             let mut reporter = Reporter::new(ctx, plan, page, emit);
             reporter.offer(&outcome.hits)?;
         }
+        let cancelled = ctx.cancel.load(Ordering::Relaxed);
         emit(final_update(
             outcome.count(),
             &outcome.book_counts,
             outcome.truncated,
-            false,
+            cancelled,
             0,
             0,
         ));
-        return Ok(Some(outcome));
+        return Ok((!cancelled).then_some(outcome));
     }
 
     let finished = {
@@ -1364,15 +1576,16 @@ pub(crate) fn run_line_search(
     } else {
         scan.outcome = Some(outcome.clone());
     }
+    let cancelled = ctx.cancel.load(Ordering::Relaxed);
     emit(final_update(
         outcome.count(),
         &outcome.book_counts,
         outcome.truncated,
-        false,
+        cancelled,
         done,
         total,
     ));
-    Ok(Some(outcome))
+    Ok((!cancelled).then_some(outcome))
 }
 
 /// One search's scan, run by one call at a time; the others wait on `freed`.
@@ -1627,10 +1840,13 @@ impl<'a, 'e> Reporter<'a, 'e> {
         };
         self.seen += hits.len();
         for chunk in wanted.chunks(self.page.chunk_size.max(1) as usize) {
-            if !self.listening {
+            if !self.listening || self.ctx.cancel.load(Ordering::Relaxed) {
                 break;
             }
             let hydrated = hydrate(self.ctx, self.plan, chunk, self.page)?;
+            if self.ctx.cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let (results, match_ranges) = hydrated
                 .into_iter()
                 .map(|(result, ranges)| (result, UserRegexLineMatches { ranges }))
@@ -1653,7 +1869,7 @@ impl<'a, 'e> Reporter<'a, 'e> {
     }
 
     fn progress(&mut self, done: u32, total: u32) {
-        if self.listening {
+        if self.listening && !self.ctx.cancel.load(Ordering::Relaxed) {
             self.listening = (self.emit)(UserRegexStreamUpdate {
                 kind: UserRegexKind::CrossSpace,
                 results: Vec::new(),
@@ -1745,50 +1961,87 @@ fn candidate_query(
     plan: &LinePlan,
 ) -> anyhow::Result<Option<Box<dyn Query>>> {
     let text_field = ctx.schema.get_field("text")?;
+    let parts = plan
+        .clauses
+        .iter()
+        .flatten()
+        .map(|fragment| {
+            // A word glued by a character the index drops (`יב[ע]ר` is `יבער`) is not found.
+            if fragment.whole {
+                glued_part(&fragment.text)
+            } else {
+                contains_part(&fragment.text)
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if ctx.cancel.load(Ordering::Relaxed) {
+        anyhow::bail!(CANCELLED);
+    }
+    let mut first = 0;
+    for clause in &plan.clauses {
+        let end = first + clause.len();
+        let keys: Vec<_> = parts[first..end]
+            .iter()
+            .map(|part| {
+                PartTermsKey::new(
+                    ctx.searcher,
+                    text_field,
+                    part,
+                    CLAUSE_MAX_TERMS,
+                    CLAUSE_POSTINGS_CAP,
+                )
+            })
+            .collect();
+        let known_empty = {
+            let cache = TERM_CACHE.lock().unwrap();
+            keys.iter().all(|key| {
+                cache
+                    .peek(key)
+                    .is_some_and(|(terms, _, truncated)| terms.is_empty() && !truncated)
+            })
+        };
+        if known_empty {
+            return Ok(Some(Box::new(tantivy::query::EmptyQuery)));
+        }
+        first = end;
+    }
+    let mut found = collect_line_terms(
+        ctx.searcher,
+        text_field,
+        &parts,
+        &plan
+            .clauses
+            .iter()
+            .flatten()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>(),
+        CLAUSE_MAX_TERMS,
+        CLAUSE_POSTINGS_CAP,
+        ctx.cancel,
+    )?
+    .into_iter();
     let mut clauses: Vec<(u64, Box<dyn Query>)> = Vec::new();
     for clause in &plan.clauses {
         let mut terms: HashSet<String> = HashSet::new();
         let mut postings = 0u64;
         let mut selective = true;
-        for fragment in clause {
-            if fragment.whole {
-                let term = Term::from_field_text(text_field, &fragment.text);
-                postings += ctx
-                    .searcher
-                    .segment_readers()
-                    .iter()
-                    .map(|r| {
-                        r.inverted_index(text_field)
-                            .ok()
-                            .and_then(|i| i.doc_freq(&term).ok())
-                            .unwrap_or(0) as u64
-                    })
-                    .sum::<u64>();
-                terms.insert(fragment.text.clone());
-            } else {
-                let part = contains_part(&fragment.text)?;
-                let found = collect_part_terms(
-                    ctx.searcher,
-                    text_field,
-                    &part,
-                    CLAUSE_MAX_TERMS,
-                    CLAUSE_POSTINGS_CAP,
-                    ctx.cancel,
-                )?;
-                if found.truncated {
-                    selective = false;
-                    break;
-                }
-                postings += found.postings;
-                terms.extend(found.terms.iter().cloned());
+        for _ in clause {
+            let found = found.next().expect("one term collection per fragment");
+            if found.truncated {
+                selective = false;
+                continue;
             }
+            postings += found.postings;
+            terms.extend(found.terms.iter().cloned());
             if postings > CLAUSE_POSTINGS_CAP {
                 selective = false;
-                break;
             }
         }
         if !selective {
             continue;
+        }
+        if terms.is_empty() {
+            return Ok(Some(Box::new(tantivy::query::EmptyQuery)));
         }
         let query: Box<dyn Query> = Box::new(TermSetQuery::new(
             terms.iter().map(|t| Term::from_field_text(text_field, t)),
@@ -1807,21 +2060,46 @@ fn candidate_query(
     Ok(Some(Box::new(BooleanQuery::new(must))))
 }
 
-/// `.*fragment.*` as a term part.
-fn contains_part(fragment: &str) -> anyhow::Result<TermPart> {
-    let any = Hir::repetition(Repetition {
+fn any_text() -> Hir {
+    Hir::repetition(Repetition {
         min: 0,
         max: None,
         greedy: true,
         sub: Box::new(Hir::class(Class::Unicode(ClassUnicode::new([
             ClassUnicodeRange::new('\0', char::MAX),
         ])))),
-    });
-    let hir = Hir::concat(vec![
-        any.clone(),
+    })
+}
+
+/// `.*fragment.*` as a term part.
+fn contains_part(fragment: &str) -> anyhow::Result<TermPart> {
+    literal_part(Hir::concat(vec![
+        any_text(),
         Hir::literal(fragment.as_bytes().to_vec()),
-        any,
-    ]);
+        any_text(),
+    ]))
+}
+
+/// `(?:.*[glue])?fragment(?:[glue].*)?` as a term part: the term `fragment`, or one that
+/// [`GLUE`] joins it to.
+fn glued_part(fragment: &str) -> anyhow::Result<TermPart> {
+    let glue = || Hir::class(Class::Unicode(GLUE.clone()));
+    let optional = |subs| {
+        Hir::repetition(Repetition {
+            min: 0,
+            max: Some(1),
+            greedy: true,
+            sub: Box::new(Hir::concat(subs)),
+        })
+    };
+    literal_part(Hir::concat(vec![
+        optional(vec![any_text(), glue()]),
+        Hir::literal(fragment.as_bytes().to_vec()),
+        optional(vec![glue(), any_text()]),
+    ]))
+}
+
+fn literal_part(hir: Hir) -> anyhow::Result<TermPart> {
     let automaton = compile_user_term_automaton(&hir).map_err(|e| anyhow::anyhow!(e))?;
     Ok(TermPart {
         pattern: hir.to_string(),
@@ -1940,12 +2218,87 @@ impl BookScan {
     }
 }
 
+const FETCH_AHEAD_BYTES: usize = 32 << 20;
+
+struct ReadAheadBudget {
+    used: Mutex<usize>,
+    changed: std::sync::Condvar,
+    limit: usize,
+}
+
+impl Default for ReadAheadBudget {
+    fn default() -> Self {
+        Self::new(FETCH_AHEAD_BYTES)
+    }
+}
+
+impl ReadAheadBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            used: Mutex::new(0),
+            changed: std::sync::Condvar::new(),
+            limit,
+        }
+    }
+
+    fn admit(&self, bytes: usize, cancel: &AtomicBool) -> Option<ReadAheadPermit<'_>> {
+        let mut used = self.used.lock().unwrap();
+        while *used > 0 && used.saturating_add(bytes) > self.limit {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            used = self
+                .changed
+                .wait_timeout(used, std::time::Duration::from_millis(10))
+                .unwrap()
+                .0;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        *used += bytes;
+        Some(ReadAheadPermit {
+            budget: self,
+            bytes,
+        })
+    }
+}
+
+struct ReadAheadPermit<'a> {
+    budget: &'a ReadAheadBudget,
+    bytes: usize,
+}
+
+impl Drop for ReadAheadPermit<'_> {
+    fn drop(&mut self) {
+        *self.budget.used.lock().unwrap() -= self.bytes;
+        self.budget.changed.notify_all();
+    }
+}
+
 /// What a reading thread hands a book's scan.
 enum Fetched {
     /// The index stores the book's text.
     Stored,
     /// The rows to match, undecoded, by ordinal; `Err` when the database could not be read.
     Library(Result<Option<BookRows>, ()>),
+}
+
+impl Fetched {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Library(Ok(Some((rows, _)))) => {
+                rows.capacity() * std::mem::size_of::<(u64, RawRow)>()
+                    + rows
+                        .iter()
+                        .map(|(_, row)| match row {
+                            RawRow::Text(bytes) | RawRow::Frame(bytes) => bytes.capacity(),
+                        })
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// Rows of a book by ordinal, with the decoder of their frames.
@@ -1961,6 +2314,8 @@ fn fetch_rows(
     store: &mut line_source::LineStore,
     book: &ScopeBook,
     book_id: i64,
+    stop: &dyn Fn() -> bool,
+    known_row_count: Option<u64>,
 ) -> anyhow::Result<Option<BookRows>> {
     match &book.candidates {
         Some(candidates) => {
@@ -1972,18 +2327,23 @@ fn fetch_rows(
             ordinals.dedup();
             // A row read alone is a random read (~0.3 ms on a cold file); reading the whole
             // book runs sequentially (~1.5 µs a row). Only sparse candidates read alone.
-            let book_rows = store.book_row_count(book_id)?;
+            let book_rows = match known_row_count {
+                Some(rows) => rows,
+                None => store.book_row_count(book_id)?,
+            };
             if (ordinals.len() as u64).saturating_mul(SPARSE_ROW_FACTOR) >= book_rows {
                 let wanted: HashSet<u64> = ordinals.into_iter().collect();
-                return Ok(store.fetch_book_raw(book_id)?.map(|(rows, decoder)| {
-                    let rows = (0u64..)
-                        .zip(rows)
-                        .filter(|(ordinal, _)| wanted.contains(ordinal))
-                        .collect();
-                    (rows, decoder)
-                }));
+                return Ok(store
+                    .fetch_book_raw_checked(book_id, stop)?
+                    .map(|(rows, decoder)| {
+                        let rows = (0u64..)
+                            .zip(rows)
+                            .filter(|(ordinal, _)| wanted.contains(ordinal))
+                            .collect();
+                        (rows, decoder)
+                    }));
             }
-            let (rows, decoder) = store.fetch_rows_raw(book_id, &ordinals)?;
+            let (rows, decoder) = store.fetch_rows_raw_checked(book_id, &ordinals, stop)?;
             let rows = ordinals
                 .into_iter()
                 .zip(rows)
@@ -1992,7 +2352,7 @@ fn fetch_rows(
             Ok(Some((rows, decoder)))
         }
         None => Ok(store
-            .fetch_book_raw(book_id)?
+            .fetch_book_raw_checked(book_id, stop)?
             .map(|(rows, decoder)| ((0u64..).zip(rows).collect(), decoder))),
     }
 }
@@ -2015,24 +2375,54 @@ fn scan_batch(
         .filter_map(|source| Some((source, line_source::begin_scan(source).ok()?)))
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<(usize, Fetched)>(FETCH_AHEAD);
+    let budget = ReadAheadBudget::default();
+    let large_books = ReadAheadBudget::new(1);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(FETCH_AHEAD);
     std::thread::scope(|scope| {
         for _ in 0..SCAN_READERS {
             let sender = sender.clone();
-            let (sessions, next) = (&sessions, &next);
+            let (sessions, next, budget, large_books) = (&sessions, &next, &budget, &large_books);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= books.len() || ctx.cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 let book = &books[i];
+                let row_count = if book.candidates.is_some() {
+                    source_of(book).and_then(|(source, id)| {
+                        sessions.iter().find(|(kept, _)| *kept == source).and_then(
+                            |(_, session)| session.read(|store| store.book_row_count(id)).ok(),
+                        )
+                    })
+                } else {
+                    Some(book.docs)
+                };
+                let large_permit = if book.library && row_count.is_none_or(|rows| rows >= 4_096) {
+                    let Some(permit) = large_books.admit(1, ctx.cancel) else {
+                        break;
+                    };
+                    Some(permit)
+                } else {
+                    None
+                };
                 let fetched = match source_of(book) {
                     Some((source, book_id)) => {
                         let session = sessions.iter().find(|(s, _)| *s == source).map(|(_, s)| s);
                         let started = std::time::Instant::now();
                         let rows = match session {
                             Some(session) => session
-                                .read(|store| fetch_rows(store, book, book_id))
+                                .read(|store| {
+                                    fetch_rows(
+                                        store,
+                                        book,
+                                        book_id,
+                                        &|| {
+                                            ctx.cancel.load(Ordering::Relaxed)
+                                                || !session.is_current()
+                                        },
+                                        row_count,
+                                    )
+                                })
                                 .map_err(|_| ()),
                             None => Err(()),
                         };
@@ -2042,7 +2432,10 @@ fn scan_batch(
                     }
                     None => Fetched::Stored,
                 };
-                if sender.send((i, fetched)).is_err() {
+                let Some(permit) = budget.admit(fetched.bytes(), ctx.cancel) else {
+                    break;
+                };
+                if sender.send((i, fetched, permit, large_permit)).is_err() {
                     break;
                 }
             });
@@ -2051,7 +2444,12 @@ fn scan_batch(
         let mut scanned = receiver
             .into_iter()
             .par_bridge()
-            .map(|(i, fetched)| scan_fetched(ctx, plan, &books[i], fetched).map(|s| (i, s)))
+            .map(|(i, fetched, permit, large_permit)| {
+                let scan = scan_fetched(ctx, plan, &books[i], fetched).map(|scan| (i, scan));
+                drop(permit);
+                drop(large_permit);
+                scan
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
         // A book no reader got to (cancelled) counts as unread.
         let mut out: Vec<BookScan> = books.iter().map(|_| BookScan::empty(true)).collect();
@@ -2543,3 +2941,69 @@ impl Scorer for ListScorer {
 #[cfg(test)]
 #[path = "user_regex_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod read_ahead_tests {
+    use super::*;
+
+    #[test]
+    fn read_ahead_bytes_block_until_the_previous_book_is_scanned() {
+        let budget = ReadAheadBudget::default();
+        let cancel = AtomicBool::new(false);
+        let first = budget.admit(FETCH_AHEAD_BYTES + 1, &cancel).unwrap();
+        std::thread::scope(|scope| {
+            let (ready, receiver) = std::sync::mpsc::channel();
+            let (admitted, got) = std::sync::mpsc::channel();
+            let (budget, cancel) = (&budget, &cancel);
+            scope.spawn(move || {
+                ready.send(()).unwrap();
+                let permit = budget.admit(1, cancel).unwrap();
+                admitted.send(()).unwrap();
+                drop(permit);
+            });
+            receiver.recv().unwrap();
+            assert!(got
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err());
+            drop(first);
+            got.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        });
+        assert_eq!(*budget.used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn cancellation_releases_a_reader_waiting_for_the_byte_budget() {
+        let budget = ReadAheadBudget::default();
+        let cancel = AtomicBool::new(false);
+        let _first = budget.admit(FETCH_AHEAD_BYTES, &cancel).unwrap();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| budget.admit(1, &cancel).is_none());
+            cancel.store(true, Ordering::Relaxed);
+            assert!(waiting.join().unwrap());
+        });
+    }
+    #[test]
+    fn two_large_books_do_not_start_fetching_together_and_waiting_can_cancel() {
+        let gate = ReadAheadBudget::new(1);
+        let cancel = AtomicBool::new(false);
+        let first = gate.admit(1, &cancel).unwrap();
+        std::thread::scope(|scope| {
+            let (fetching, received) = std::sync::mpsc::channel();
+            let (gate, cancel) = (&gate, &cancel);
+            let second = scope.spawn(move || {
+                let permit = gate.admit(1, cancel);
+                if permit.is_some() {
+                    fetching.send(()).unwrap();
+                }
+                permit.is_none()
+            });
+            assert!(received
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err());
+            cancel.store(true, Ordering::Relaxed);
+            assert!(second.join().unwrap());
+        });
+        drop(first);
+        assert_eq!(*gate.used.lock().unwrap(), 0);
+    }
+}
