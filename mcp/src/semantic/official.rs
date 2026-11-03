@@ -33,10 +33,14 @@ pub struct SetDeclaration {
 
 pub fn read_set(vectors_dir: &Path) -> Result<SetDeclaration> {
     let cur: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(vectors_dir.join("CURRENT")).with_context(|| format!("no vector set in {}", vectors_dir.display()))?,
+        &std::fs::read(vectors_dir.join("CURRENT"))
+            .with_context(|| format!("no vector set in {}", vectors_dir.display()))?,
     )?;
-    let set_rel = cur["set"].as_str().ok_or_else(|| anyhow!("CURRENT names no set"))?;
-    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(vectors_dir.join(set_rel))?)?;
+    let set_rel = cur["set"]
+        .as_str()
+        .ok_or_else(|| anyhow!("CURRENT names no set"))?;
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(vectors_dir.join(set_rel))?)?;
     let model: ModelIdentity = serde_json::from_value(doc["identity"]["model"].clone())
         .context("the set's model identity is unreadable")?;
     let text: TextIdentity = serde_json::from_value(doc["identity"]["text"].clone())
@@ -47,7 +51,10 @@ pub fn read_set(vectors_dir: &Path) -> Result<SetDeclaration> {
         model,
         text,
         library_version: doc["library_version"].as_u64().unwrap_or(0) as u32,
-        release_tag: doc["library_release_tag"].as_str().unwrap_or("").to_string(),
+        release_tag: doc["library_release_tag"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -56,25 +63,42 @@ pub fn read_set(vectors_dir: &Path) -> Result<SetDeclaration> {
 pub fn find_model_dir(books_dir: &Path, family: &str) -> Result<PathBuf> {
     let mut found = Vec::new();
     if let Ok(rd) = std::fs::read_dir(books_dir) {
-        let mut dirs: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        let mut dirs: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
         dirs.sort();
         for d in dirs {
-            let Ok(bytes) = std::fs::read(d.join("model.json")) else { continue };
-            let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes).to_vec();
+            let Ok(bytes) = std::fs::read(d.join("model.json")) else {
+                continue;
+            };
+            let bytes = bytes
+                .strip_prefix(b"\xef\xbb\xbf")
+                .unwrap_or(&bytes)
+                .to_vec();
             let fam = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
                 .and_then(|v| v["family_id"].as_str().map(String::from));
             if fam.as_deref() == Some(family) {
                 return Ok(d);
             }
-            found.push(format!("{}: {}", d.file_name().unwrap_or_default().to_string_lossy(), fam.unwrap_or_default()));
+            found.push(format!(
+                "{}: {}",
+                d.file_name().unwrap_or_default().to_string_lossy(),
+                fam.unwrap_or_default()
+            ));
         }
     }
     bail!(
         "no model folder in {} for the vector set's model {family:?}{}. Open Otzaria once so it \
          downloads the model, or pass --model-dir.",
         books_dir.display(),
-        if found.is_empty() { String::new() } else { format!(" (found {})", found.join("; ")) }
+        if found.is_empty() {
+            String::new()
+        } else {
+            format!(" (found {})", found.join("; "))
+        }
     )
 }
 
@@ -91,7 +115,13 @@ fn query_graph(model_dir: &Path) -> Result<(PathBuf, &'static str)> {
         .filter(|p| p.extension().is_some_and(|x| x == "onnx"))
         .collect();
     graphs.sort();
-    if let Some(g) = graphs.iter().find(|g| g.file_name().unwrap().to_string_lossy().to_lowercase().contains("int8")) {
+    if let Some(g) = graphs.iter().find(|g| {
+        g.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("int8")
+    }) {
         return Ok((g.clone(), "int8"));
     }
     match graphs.first() {
@@ -131,11 +161,24 @@ impl Official {
             vectors_dir: cfg.vectors_dir.clone(),
             text: declared.text.clone(),
             model,
-            deployment: EmbeddingDeployment { onnx_runtime: cfg.onnx_runtime.clone() },
+            deployment: EmbeddingDeployment {
+                onnx_runtime: cfg.onnx_runtime.clone(),
+            },
             scan_threads: cfg.scan_threads.and_then(std::num::NonZeroUsize::new),
         })
-        .map_err(|e| anyhow!("cannot open Otzaria's vectors at {}: {e}", cfg.vectors_dir.display()))?;
-        Ok(Official { index, vectors_dir: cfg.vectors_dir.clone(), declared, model_dir, query_graph: graph })
+        .map_err(|e| {
+            anyhow!(
+                "cannot open Otzaria's vectors at {}: {e}",
+                cfg.vectors_dir.display()
+            )
+        })?;
+        Ok(Official {
+            index,
+            vectors_dir: cfg.vectors_dir.clone(),
+            declared,
+            model_dir,
+            query_graph: graph,
+        })
     }
 
     /// The model family the open index embeds with.
@@ -153,19 +196,31 @@ impl Official {
 
     /// The query's vector, by the set's recipe (role prefix, normalization, query cap).
     pub fn embed_query(&self, q: &str) -> Result<Vec<f32>> {
-        self.index.embed_query(q).map_err(|e| anyhow!("cannot embed the query: {e}"))
+        self.index
+            .embed_query(q)
+            .map_err(|e| anyhow!("cannot embed the query: {e}"))
     }
 
     /// The text's vector as a stored passage (QA491: the FP32 document graph).
     pub fn embed_passage(&self, t: &str) -> Result<Vec<f32>> {
         let cancel = CancellationToken::new();
-        let mut v = self.index.embed_passages(&[t], &cancel).map_err(|e| anyhow!("cannot embed the passage: {e}"))?;
+        let mut v = self
+            .index
+            .embed_passages(&[t], &cancel)
+            .map_err(|e| anyhow!("cannot embed the passage: {e}"))?;
         v.pop().ok_or_else(|| anyhow!("no vector"))
     }
 
-    pub fn scan(&self, vector: &[f32], k: usize, books: Option<&BookSet>) -> Result<Vec<VectorHit>> {
+    pub fn scan(
+        &self,
+        vector: &[f32],
+        k: usize,
+        books: Option<&BookSet>,
+    ) -> Result<Vec<VectorHit>> {
         let cancel = CancellationToken::new();
-        self.index.search_hits(vector, k, books, &cancel).map_err(|e| anyhow!("the vector scan failed: {e}"))
+        self.index
+            .search_hits(vector, k, books, &cancel)
+            .map_err(|e| anyhow!("the vector scan failed: {e}"))
     }
 
     /// Pick up a new generation. `Ok(true)` when the set changed.

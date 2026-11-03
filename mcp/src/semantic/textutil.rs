@@ -22,8 +22,9 @@ static BR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<br\s*/?>").un
 static WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 /// personal_index.NIKUD_RE: nikud and teamim, keeping maqaf (05BE), paseq (05C0),
 /// sof pasuq (05C3) and nun hafukha (05C6).
-static NIKUD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new("[\u{0591}-\u{05BD}\u{05BF}\u{05C1}\u{05C2}\u{05C4}\u{05C5}\u{05C7}]").unwrap());
+static NIKUD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new("[\u{0591}-\u{05BD}\u{05BF}\u{05C1}\u{05C2}\u{05C4}\u{05C5}\u{05C7}]").unwrap()
+});
 /// The server's MARKS_RE: every Hebrew mark and point.
 static MARKS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new("[\u{0591}-\u{05C7}]").unwrap());
 static HEADING_RE: LazyLock<FRegex> =
@@ -161,7 +162,9 @@ impl SourceKey {
         match t {
             "" | "o" => Some(SourceKey::Official),
             "u" => Some(SourceKey::User),
-            _ => t.strip_prefix("d:").map(|slug| SourceKey::Attached(slug.to_string())),
+            _ => t
+                .strip_prefix("d:")
+                .map(|slug| SourceKey::Attached(slug.to_string())),
         }
     }
 
@@ -169,7 +172,9 @@ impl SourceKey {
     pub fn url(&self, book_id: i64, line_index: i64) -> String {
         match self {
             SourceKey::Official => otzaria_url(book_id, line_index),
-            SourceKey::User => format!("otzaria://open/book/{book_id}?source=user&index={line_index}"),
+            SourceKey::User => {
+                format!("otzaria://open/book/{book_id}?source=user&index={line_index}")
+            }
             SourceKey::Attached(slug) => {
                 format!("otzaria://open/book/{book_id}?source=db:{slug}&index={line_index}")
             }
@@ -270,13 +275,19 @@ pub fn echo_words(text: &str) -> Vec<String> {
         .chars()
         .filter(|&c| {
             !(('\u{0591}'..='\u{05BD}').contains(&c)
-                || matches!(c, '\u{05BF}' | '\u{05C1}' | '\u{05C2}' | '\u{05C4}' | '\u{05C5}' | '\u{05C7}'))
+                || matches!(
+                    c,
+                    '\u{05BF}' | '\u{05C1}' | '\u{05C2}' | '\u{05C4}' | '\u{05C5}' | '\u{05C7}'
+                ))
         })
         .collect();
     // ECHO_JOIN_RE: a quote mark between two Hebrew letters
     let mut joined = String::with_capacity(dropped.len());
     for (i, &c) in dropped.iter().enumerate() {
-        let quote = matches!(c, '"' | '\'' | '\u{05F3}' | '\u{05F4}' | '\u{2019}' | '\u{201D}');
+        let quote = matches!(
+            c,
+            '"' | '\'' | '\u{05F3}' | '\u{05F4}' | '\u{2019}' | '\u{201D}'
+        );
         if quote
             && i > 0
             && i + 1 < dropped.len()
@@ -319,9 +330,16 @@ impl EchoReference {
             if words.len() < k {
                 return Default::default();
             }
-            (0..=words.len() - k).map(|i| words[i..i + k].to_vec()).collect()
+            (0..=words.len() - k)
+                .map(|i| words[i..i + k].to_vec())
+                .collect()
         };
-        EchoReference { n, grams2: grams(2), gramsn: grams(n), empty: words.is_empty() }
+        EchoReference {
+            n,
+            grams2: grams(2),
+            gramsn: grams(n),
+            empty: words.is_empty(),
+        }
     }
 
     pub fn measure(&self, text: &str) -> Option<EchoStats> {
@@ -333,8 +351,14 @@ impl EchoReference {
             return None;
         }
         let k = if words.len() >= self.n { self.n } else { 2 };
-        let set = if k == self.n { &self.gramsn } else { &self.grams2 };
-        let hits: Vec<bool> = (0..=words.len() - k).map(|i| set.contains(&words[i..i + k].to_vec())).collect();
+        let set = if k == self.n {
+            &self.gramsn
+        } else {
+            &self.grams2
+        };
+        let hits: Vec<bool> = (0..=words.len() - k)
+            .map(|i| set.contains(&words[i..i + k].to_vec()))
+            .collect();
         let (mut best, mut cur) = (0usize, 0usize);
         for &h in &hits {
             cur = if h { cur + 1 } else { 0 };
@@ -355,13 +379,18 @@ pub fn round_to(x: f64, nd: i32) -> f64 {
     let p = 10f64.powi(nd);
     let y = x * p;
     let r = y.round();
-    let r = if (y - y.trunc()).abs() == 0.5 && (r as i64) % 2 != 0 { r - y.signum() } else { r };
+    let r = if (y - y.trunc()).abs() == 0.5 && (r as i64) % 2 != 0 {
+        r - y.signum()
+    } else {
+        r
+    };
     r / p
 }
 
 // ── a note cut into query windows ───────────────────────────────────────────
 
-static FM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)\A---\s*\n.*?\n---\s*(\n|\z)").unwrap());
+static FM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)\A---\s*\n.*?\n---\s*(\n|\z)").unwrap());
 static CODE_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)```.*?```").unwrap());
 static CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`\n]*`").unwrap());
 static COMMENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)%%.*?%%").unwrap());
@@ -369,12 +398,15 @@ static HTML_COMMENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--
 static EMBED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"!\[\[[^\]]*\]\]").unwrap());
 static WIKILINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[\[([^\]|#^]*)(?:[#^][^\]|]*)?(?:\|([^\]]*))?\]\]").unwrap());
-static MDLINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"!?\[([^\]]*)\]\([^)]*\)").unwrap());
-static URLTEXT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://\S+|otzaria://\S+").unwrap());
+static MDLINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"!?\[([^\]]*)\]\([^)]*\)").unwrap());
+static URLTEXT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://\S+|otzaria://\S+").unwrap());
 static FOOTNOTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[\^[^\]]*\]").unwrap());
 static TAGWORD_RE: LazyLock<FRegex> =
     LazyLock::new(|| FRegex::new(r"(?<![\w&/])#[\w\-/\u{0590}-\u{05FF}]+").unwrap());
-static CALLOUT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*>\s*\[![^\]]*\][+-]?").unwrap());
+static CALLOUT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*>\s*\[![^\]]*\][+-]?").unwrap());
 static BLOCK_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+(\[.\]\s+)?|\d+[.)]\s+)").unwrap()
 });
@@ -401,7 +433,13 @@ pub fn clean_markdown(text: &str) -> String {
             if !alias.is_empty() {
                 alias.to_string()
             } else {
-                c.get(1).map(|m| m.as_str()).unwrap_or("").rsplit('/').next().unwrap_or("").to_string()
+                c.get(1)
+                    .map(|m| m.as_str())
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
             }
         })
         .into_owned();
@@ -464,7 +502,10 @@ fn split_sentences(p: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut i = 0;
     while i < c.len() {
-        if c[i].is_whitespace() && i > 0 && matches!(c[i - 1], '.' | ':' | ';' | '?' | '!' | '\u{05C3}') {
+        if c[i].is_whitespace()
+            && i > 0
+            && matches!(c[i - 1], '.' | ':' | ';' | '?' | '!' | '\u{05C3}')
+        {
             let mut j = i;
             while j < c.len() && c[j].is_whitespace() {
                 j += 1;
@@ -544,14 +585,19 @@ pub fn note_windows(
         windows.insert(0, title.trim().to_string());
     }
     let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<String> = windows.into_iter().filter(|w| seen.insert(w.clone())).collect();
+    let mut out: Vec<String> = windows
+        .into_iter()
+        .filter(|w| seen.insert(w.clone()))
+        .collect();
     if out.len() > max_windows {
         let n = out.len();
         let mut keep: Vec<usize> = if max_windows <= 1 {
             vec![0]
         } else {
             (0..max_windows)
-                .map(|i| round_half_even(i as f64 * (n - 1) as f64 / (max_windows - 1) as f64) as usize)
+                .map(|i| {
+                    round_half_even(i as f64 * (n - 1) as f64 / (max_windows - 1) as f64) as usize
+                })
                 .collect()
         };
         keep.sort_unstable();

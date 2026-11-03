@@ -36,7 +36,11 @@ pub fn era_label(rank: u8) -> Option<&'static str> {
 }
 
 fn strip_gershayim(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '"' | '\'' | '\u{05F3}' | '\u{05F4}')).collect::<String>().trim().to_string()
+    s.chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '\u{05F3}' | '\u{05F4}'))
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// `era_rank`: a `generation.name` to its order.
@@ -97,14 +101,20 @@ fn dep_rank(dep: Option<&str>) -> u8 {
 
 pub fn has_table(conn: &Connection, name: &str) -> Result<bool> {
     Ok(conn
-        .query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name], |_| Ok(()))
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |_| Ok(()),
+        )
         .optional()?
         .is_some())
 }
 
 fn columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<HashSet<_>>>()?;
+    let cols = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
     Ok(cols)
 }
 
@@ -171,7 +181,14 @@ impl Catalog {
         {
             let mut stmt = conn.prepare("SELECT id, title, heRef, categoryId FROM book")?;
             let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, Book { title: r.get(1)?, he_ref: r.get(2)?, category: r.get(3)? }))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    Book {
+                        title: r.get(1)?,
+                        he_ref: r.get(2)?,
+                        category: r.get(3)?,
+                    },
+                ))
             })?;
             for row in rows {
                 let (id, b) = row?;
@@ -182,10 +199,20 @@ impl Catalog {
         let mut cats = HashMap::new();
         let mut corder = HashMap::new();
         {
-            let sel = if ccols.contains("orderIndex") { "orderIndex" } else { "999" };
-            let mut stmt = conn.prepare(&format!("SELECT id, parentId, title, {sel} FROM category"))?;
+            let sel = if ccols.contains("orderIndex") {
+                "orderIndex"
+            } else {
+                "999"
+            };
+            let mut stmt =
+                conn.prepare(&format!("SELECT id, parentId, title, {sel} FROM category"))?;
             let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
             })?;
             for row in rows {
                 let (id, parent, title, order) = row?;
@@ -203,7 +230,13 @@ impl Catalog {
             }
         }
         let bcols = columns(&conn, "book")?;
-        let col = |c: &str| if bcols.contains(c) { c.to_string() } else { "NULL".to_string() };
+        let col = |c: &str| {
+            if bcols.contains(c) {
+                c.to_string()
+            } else {
+                "NULL".to_string()
+            }
+        };
         let eras = book_eras(&conn)?;
         let mut ranks = HashMap::new();
         {
@@ -226,17 +259,26 @@ impl Catalog {
             for row in rows {
                 let (bid, cid, is_base, dep, order) = row?;
                 let ids = id_path(&cats, cid);
-                let mut catalogue: Vec<(i64, i64)> = ids.iter().map(|c| (*corder.get(c).unwrap_or(&999), *c)).collect();
+                let mut catalogue: Vec<(i64, i64)> = ids
+                    .iter()
+                    .map(|c| (*corder.get(c).unwrap_or(&999), *c))
+                    .collect();
                 catalogue.push((order.unwrap_or(999), bid));
                 let era = *eras.get(&bid).unwrap_or(&ERA_UNKNOWN);
                 let layer = if era == 1 {
-                    let titles: Vec<String> = ids.iter().filter_map(|c| cats.get(c).map(|x| x.1.clone())).collect();
+                    let titles: Vec<String> = ids
+                        .iter()
+                        .filter_map(|c| cats.get(c).map(|x| x.1.clone()))
+                        .collect();
                     chazal_layer(&titles)
                 } else {
                     0
                 };
                 let not_base = if is_base.unwrap_or(0) != 0 { 0 } else { 1 };
-                ranks.insert(bid, (era, 0, layer, not_base, dep_rank(dep.as_deref()), catalogue));
+                ranks.insert(
+                    bid,
+                    (era, 0, layer, not_base, dep_rank(dep.as_deref()), catalogue),
+                );
             }
         }
         // the line query, by what this schema has
@@ -249,7 +291,11 @@ impl Catalog {
             (false, true) => "lt.tocEntryId",
             (false, false) => "NULL",
         };
-        let content = if has_content_table { "c.content" } else { "l.content" };
+        let content = if has_content_table {
+            "c.content"
+        } else {
+            "l.content"
+        };
         let mut line_sql = format!("SELECT l.lineIndex, l.heRef, {toc}, {content} FROM line l ");
         if has_content_table {
             line_sql.push_str("LEFT JOIN line_content c ON c.id = l.id ");
@@ -257,19 +303,32 @@ impl Catalog {
         if has_line_toc {
             line_sql.push_str("LEFT JOIN line_toc lt ON lt.lineId = l.id ");
         }
-        line_sql.push_str("WHERE l.bookId = ?1 AND l.lineIndex BETWEEN ?2 AND ?3 ORDER BY l.lineIndex");
+        line_sql
+            .push_str("WHERE l.bookId = ?1 AND l.lineIndex BETWEEN ?2 AND ?3 ORDER BY l.lineIndex");
         let db_version = if has_table(&conn, "schema_meta")? {
-            conn.query_row("SELECT value FROM schema_meta WHERE key = 'db_version'", [], |r| r.get::<_, Value>(0))
-                .optional()?
-                .map(|v| match v {
-                    Value::Integer(i) => i.to_string(),
-                    Value::Text(s) => s,
-                    _ => String::new(),
-                })
+            conn.query_row(
+                "SELECT value FROM schema_meta WHERE key = 'db_version'",
+                [],
+                |r| r.get::<_, Value>(0),
+            )
+            .optional()?
+            .map(|v| match v {
+                Value::Integer(i) => i.to_string(),
+                Value::Text(s) => s,
+                _ => String::new(),
+            })
         } else {
             None
         };
-        Ok(Loaded { mtime: m, books, cats, closure, ranks, line_sql, db_version })
+        Ok(Loaded {
+            mtime: m,
+            books,
+            cats,
+            closure,
+            ranks,
+            line_sql,
+            db_version,
+        })
     }
 
     fn loaded(&self) -> std::sync::Arc<Loaded> {
@@ -313,7 +372,10 @@ impl Catalog {
 
     pub fn cat_path(&self, cid: i64) -> Vec<String> {
         let l = self.loaded();
-        id_path(&l.cats, cid).into_iter().filter_map(|c| l.cats.get(&c).map(|x| x.1.clone())).collect()
+        id_path(&l.cats, cid)
+            .into_iter()
+            .filter_map(|c| l.cats.get(&c).map(|x| x.1.clone()))
+            .collect()
     }
 
     /// Category titles or ids -> the books filed under them (descendant categories included).
@@ -330,7 +392,12 @@ impl Catalog {
                     want.insert(id);
                 }
             } else {
-                want.extend(l.cats.iter().filter(|(_, (_, t))| t.trim() == s).map(|(id, _)| *id));
+                want.extend(
+                    l.cats
+                        .iter()
+                        .filter(|(_, (_, t))| t.trim() == s)
+                        .map(|(id, _)| *id),
+                );
             }
         }
         let mut cats = want.clone();
@@ -339,7 +406,11 @@ impl Catalog {
                 cats.extend(d);
             }
         }
-        l.books.iter().filter(|(_, b)| cats.contains(&b.category)).map(|(id, _)| *id).collect()
+        l.books
+            .iter()
+            .filter(|(_, b)| cats.contains(&b.category))
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Every category with its book count, as the plugin's /categories expects.
@@ -402,7 +473,9 @@ impl Catalog {
                 break;
             }
             let row = stmt
-                .query_row([id], |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)))
+                .query_row([id], |r| {
+                    Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?))
+                })
                 .optional()?;
             match row {
                 Some((parent, text)) => {
@@ -435,9 +508,15 @@ fn id_path(cats: &HashMap<i64, (Option<i64>, String)>, cid: i64) -> Vec<i64> {
 pub fn connect_ro(path: &Path, immutable: bool) -> Result<Connection> {
     let conn = if immutable {
         let uri = format!("file:{}?immutable=1", uri_path(path));
-        Connection::open_with_flags(uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
+        Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
     } else {
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
     }
     .with_context(|| format!("cannot open {}", path.display()))?;
     conn.execute_batch("PRAGMA query_only=ON;").ok();

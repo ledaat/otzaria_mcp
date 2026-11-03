@@ -155,13 +155,23 @@ async fn main() -> Result<()> {
 
     let mut server = OtzariaServer::new(lib);
     if !sem.no_semantic {
-        let url = sem.semantic_url.clone().unwrap_or_else(|| "http://127.0.0.1:8765".into());
+        let url = sem
+            .semantic_url
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:8765".into());
         let log = sem.semantic_log.clone().or_else(|| {
-            sem.plugin_data.as_ref().and_then(|d| d.parent()).map(|d| d.join("otzaria_server.log"))
+            sem.plugin_data
+                .as_ref()
+                .and_then(|d| d.parent())
+                .map(|d| d.join("otzaria_server.log"))
         });
         eprintln!("otzaria-mcp: semantic tools through {url}");
         server = server.with_semantic(otzaria_mcp::server::SemanticTools {
-            client: otzaria_mcp::semantic::client::DaemonClient::new(&url, sem.passthrough.clone(), log),
+            client: otzaria_mcp::semantic::client::DaemonClient::new(
+                &url,
+                sem.passthrough.clone(),
+                log,
+            ),
             plugin_data: sem.plugin_data.clone(),
         });
     }
@@ -174,17 +184,36 @@ async fn main() -> Result<()> {
 /// behind the HTTP API, until /shutdown.
 fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> Result<()> {
     use otzaria_mcp::semantic::{http, service};
-    let app = otzaria_mcp::secondary::app_data_dir(paths.secondary.app_data_dir.clone(), &paths.db, &[])
-        .or_else(|| paths.db.parent().and_then(Path::parent).map(Path::to_path_buf))
-        .ok_or_else(|| anyhow::anyhow!("cannot tell Otzaria's data folder; pass --app-data-dir"))?;
-    let books_dir = paths.db.parent().map(Path::to_path_buf).unwrap_or_else(|| app.join("books"));
-    let personal_dir = sem.personal_index.clone().unwrap_or_else(default_personal_index);
+    let app =
+        otzaria_mcp::secondary::app_data_dir(paths.secondary.app_data_dir.clone(), &paths.db, &[])
+            .or_else(|| {
+                paths
+                    .db
+                    .parent()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot tell Otzaria's data folder; pass --app-data-dir")
+            })?;
+    let books_dir = paths
+        .db
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| app.join("books"));
+    let personal_dir = sem
+        .personal_index
+        .clone()
+        .unwrap_or_else(default_personal_index);
     let cfg = service::SemanticConfig {
         otzaria_dir: app.clone(),
         books_dir,
         db: paths.db.clone(),
         snapshot: paths.snapshot,
-        vectors_dir: sem.vectors_dir.clone().unwrap_or_else(|| app.join("vectors")),
+        vectors_dir: sem
+            .vectors_dir
+            .clone()
+            .unwrap_or_else(|| app.join("vectors")),
         model_dir: sem.model_dir.clone(),
         onnx_runtime: sem
             .onnx_runtime
@@ -204,7 +233,13 @@ fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> 
             .clone()
             .unwrap_or_else(|| app.join("databases").join("user_books.db")),
         builder: sem.builder.clone(),
-        python: sem.python.clone().unwrap_or_else(|| if cfg!(windows) { "python".into() } else { "python3".into() }),
+        python: sem.python.clone().unwrap_or_else(|| {
+            if cfg!(windows) {
+                "python".into()
+            } else {
+                "python3".into()
+            }
+        }),
     };
     eprintln!(
         "otzaria-mcp {} --http {addr}: db={} vectors={} personal={} onnxruntime={}",
@@ -212,9 +247,14 @@ fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> 
         cfg.db.display(),
         cfg.vectors_dir.display(),
         cfg.personal_dir.display(),
-        cfg.onnx_runtime.as_ref().map_or("(sidecar default)".into(), |p| p.display().to_string())
+        cfg.onnx_runtime
+            .as_ref()
+            .map_or("(sidecar default)".into(), |p| p.display().to_string())
     );
-    let refs = otzaria_mcp::db::Db::open(&paths).map(Arc::new).map_err(|e| eprintln!("otzaria-mcp: references unavailable: {e:#}")).ok();
+    let refs = otzaria_mcp::db::Db::open(&paths)
+        .map(Arc::new)
+        .map_err(|e| eprintln!("otzaria-mcp: references unavailable: {e:#}"))
+        .ok();
     let svc = Arc::new(service::SemanticService::open(cfg, refs)?);
     http::serve(svc, addr, sem.workers.unwrap_or(4))
 }
@@ -239,19 +279,50 @@ fn default_onnx_runtime() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("LOCALAPPDATA") {
         dirs.push(PathBuf::from(v).join("Programs").join("Otzaria"));
     }
-    let lib = if cfg!(windows) { "onnxruntime.dll" } else { "libonnxruntime.so" };
-    dirs.into_iter().map(|d| d.join("onnxruntime").join(lib)).find(|p| p.is_file())
+    let lib = if cfg!(windows) {
+        "onnxruntime.dll"
+    } else {
+        "libonnxruntime.so"
+    };
+    dirs.into_iter()
+        .map(|d| d.join("onnxruntime").join(lib))
+        .find(|p| p.is_file())
 }
 
 /// Flags followed by a value.
 const VALUE_FLAGS: &[&str] = &[
-    "--app-data-dir", "--user-books-db", "--attached", "--db", "--index", "--lexical-db", "--data-dir",
-    "--dictionaries-dir", "--port", "--semantic-url", "--vectors-dir", "--model-dir", "--onnx-runtime",
-    "--personal-index", "--builder", "--python", "--plugin-data", "--semantic-log", "--scan-threads", "--workers",
+    "--app-data-dir",
+    "--user-books-db",
+    "--attached",
+    "--db",
+    "--index",
+    "--lexical-db",
+    "--data-dir",
+    "--dictionaries-dir",
+    "--port",
+    "--semantic-url",
+    "--vectors-dir",
+    "--model-dir",
+    "--onnx-runtime",
+    "--personal-index",
+    "--builder",
+    "--python",
+    "--plugin-data",
+    "--semantic-log",
+    "--scan-threads",
+    "--workers",
 ];
 
 /// Flags a started daemon does not get (they are about this process, not the data).
-const NOT_PASSED: &[&str] = &["--http", "--port", "--semantic-url", "--no-semantic", "--warm", "--plugin-data", "--semantic-log"];
+const NOT_PASSED: &[&str] = &[
+    "--http",
+    "--port",
+    "--semantic-url",
+    "--no-semantic",
+    "--warm",
+    "--plugin-data",
+    "--semantic-log",
+];
 
 /// Parse CLI args into `PathArgs` and the semantic options. Returns `Ok(None)` when
 /// help/version was printed.
@@ -267,7 +338,11 @@ fn parse_args() -> Result<Option<(PathArgs, SemanticArgs)>> {
         // `--http` takes an optional address
         let value = if VALUE_FLAGS.contains(&arg) {
             i += 1;
-            Some(raw.get(i).cloned().ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))?)
+            Some(
+                raw.get(i)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))?,
+            )
         } else if arg == "--http" && raw.get(i + 1).is_some_and(|v| !v.starts_with("--")) {
             i += 1;
             Some(raw[i].clone())

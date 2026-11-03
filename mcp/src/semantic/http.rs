@@ -14,7 +14,6 @@
 //!   POST /shutdown               (a newer plugin or MCP replacing this server)
 //! ```
 
-
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -72,17 +71,22 @@ fn handle(svc: &SemanticService, mut req: Request, server: &Server) -> bool {
         respond(req, 400, &json!({"error": "the body is not UTF-8"}));
         return false;
     }
-    let opts: Map<String, Value> = match serde_json::from_str::<Value>(if body.trim().is_empty() { "{}" } else { &body }) {
-        Ok(Value::Object(m)) => m,
-        Ok(_) => {
-            respond(req, 400, &json!({"error": "the body must be a JSON object"}));
-            return false;
-        }
-        Err(e) => {
-            respond(req, 400, &json!({"error": format!("invalid JSON: {e}")}));
-            return false;
-        }
-    };
+    let opts: Map<String, Value> =
+        match serde_json::from_str::<Value>(if body.trim().is_empty() { "{}" } else { &body }) {
+            Ok(Value::Object(m)) => m,
+            Ok(_) => {
+                respond(
+                    req,
+                    400,
+                    &json!({"error": "the body must be a JSON object"}),
+                );
+                return false;
+            }
+            Err(e) => {
+                respond(req, 400, &json!({"error": format!("invalid JSON: {e}")}));
+                return false;
+            }
+        };
     if path.starts_with("/shutdown") {
         respond(req, 200, &json!({"ok": true, "version": VERSION}));
         server.unblock();
@@ -125,24 +129,27 @@ fn handle(svc: &SemanticService, mut req: Request, server: &Server) -> bool {
 /// Serve until /shutdown. Requests are answered by a few worker threads, so a long `related`
 /// does not hold up /health.
 pub fn serve(svc: Arc<SemanticService>, addr: &str, workers: usize) -> Result<()> {
-    let server = Arc::new(Server::http(addr).map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))?);
+    let server =
+        Arc::new(Server::http(addr).map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))?);
     eprintln!("otzaria-mcp: semantic server listening on http://{addr}");
     svc.watch();
     let mut handles = Vec::new();
     for i in 0..workers.max(1) {
         let (svc, server) = (svc.clone(), server.clone());
         handles.push(
-            std::thread::Builder::new().name(format!("http-{i}")).spawn(move || {
-                while let Ok(req) = server.recv() {
-                    if handle(&svc, req, &server) {
-                        // wake the other workers too
-                        for _ in 0..workers {
-                            server.unblock();
+            std::thread::Builder::new()
+                .name(format!("http-{i}"))
+                .spawn(move || {
+                    while let Ok(req) = server.recv() {
+                        if handle(&svc, req, &server) {
+                            // wake the other workers too
+                            for _ in 0..workers {
+                                server.unblock();
+                            }
+                            break;
                         }
-                        break;
                     }
-                }
-            })?,
+                })?,
         );
     }
     for h in handles {

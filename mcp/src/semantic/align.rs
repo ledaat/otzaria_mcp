@@ -50,7 +50,12 @@ impl<'s> SequenceMatcher<'s> {
                     if j >= bhi {
                         break;
                     }
-                    let k = j.checked_sub(1).and_then(|p| j2len.get(&p)).copied().unwrap_or(0) + 1;
+                    let k = j
+                        .checked_sub(1)
+                        .and_then(|p| j2len.get(&p))
+                        .copied()
+                        .unwrap_or(0)
+                        + 1;
                     newj2len.insert(j, k);
                     if k > bestsize {
                         besti = i + 1 - k;
@@ -68,10 +73,17 @@ impl<'s> SequenceMatcher<'s> {
             bestj -= 1;
             bestsize += 1;
         }
-        while besti + bestsize < ahi && bestj + bestsize < bhi && self.a[besti + bestsize] == self.b[bestj + bestsize] {
+        while besti + bestsize < ahi
+            && bestj + bestsize < bhi
+            && self.a[besti + bestsize] == self.b[bestj + bestsize]
+        {
             bestsize += 1;
         }
-        Block { a: besti, b: bestj, size: bestsize }
+        Block {
+            a: besti,
+            b: bestj,
+            size: bestsize,
+        }
     }
 
     pub fn get_matching_blocks(&self) -> Vec<Block> {
@@ -99,7 +111,11 @@ impl<'s> SequenceMatcher<'s> {
                 k1 += blk.size;
             } else {
                 if k1 > 0 {
-                    out.push(Block { a: i1, b: j1, size: k1 });
+                    out.push(Block {
+                        a: i1,
+                        b: j1,
+                        size: k1,
+                    });
                 }
                 i1 = blk.a;
                 j1 = blk.b;
@@ -107,9 +123,17 @@ impl<'s> SequenceMatcher<'s> {
             }
         }
         if k1 > 0 {
-            out.push(Block { a: i1, b: j1, size: k1 });
+            out.push(Block {
+                a: i1,
+                b: j1,
+                size: k1,
+            });
         }
-        out.push(Block { a: la, b: lb, size: 0 });
+        out.push(Block {
+            a: la,
+            b: lb,
+            size: 0,
+        });
         out
     }
 
@@ -219,12 +243,21 @@ pub struct Alignment {
 
 /// `align_words`: the best window of `cw` for the quote `qw` (normalized words; `qo`/`co` the
 /// original tokens, used to resolve abbreviations).
-pub fn align_words(qw: &[String], cw: &[String], qo: &[String], co: &[String]) -> Option<Alignment> {
+pub fn align_words(
+    qw: &[String],
+    cw: &[String],
+    qo: &[String],
+    co: &[String],
+) -> Option<Alignment> {
     if qw.is_empty() || cw.is_empty() {
         return None;
     }
     let sm = SequenceMatcher::new(qw, cw);
-    let blocks: Vec<Block> = sm.get_matching_blocks().into_iter().filter(|b| b.size > 0).collect();
+    let blocks: Vec<Block> = sm
+        .get_matching_blocks()
+        .into_iter()
+        .filter(|b| b.size > 0)
+        .collect();
     if blocks.is_empty() {
         return None;
     }
@@ -296,5 +329,10 @@ pub fn align_words(qw: &[String], cw: &[String], qo: &[String], co: &[String]) -
         }
     }
     let ratio = (mq + mc) as f64 / (qw.len() + (end - start)).max(1) as f64;
-    Some(Alignment { ratio, start, end, ops })
+    Some(Alignment {
+        ratio,
+        start,
+        end,
+        ops,
+    })
 }

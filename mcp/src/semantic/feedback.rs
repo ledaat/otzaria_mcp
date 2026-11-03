@@ -62,7 +62,9 @@ impl Outbox {
     }
 
     pub fn enqueue(&self, event: &Value) -> Result<()> {
-        let id = event["id"].as_str().ok_or_else(|| anyhow!("the event has no id"))?;
+        let id = event["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("the event has no id"))?;
         std::fs::create_dir_all(&self.shared.dir)?;
         let tmp = self.shared.dir.join(format!("{id}.tmp"));
         std::fs::write(&tmp, serde_json::to_vec(event)?)?;
@@ -89,7 +91,10 @@ fn pending(s: &Shared) -> Vec<PathBuf> {
 
 fn flush(s: &Shared) -> Result<()> {
     for path in pending(s) {
-        let event: Value = match std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+        let event: Value = match std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+        {
             Some(v) => v,
             None => {
                 let _ = std::fs::remove_file(&path);
@@ -114,14 +119,21 @@ fn flush(s: &Shared) -> Result<()> {
 }
 
 fn send(base: &str, event: &Value) -> Result<()> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(90)).build();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(90))
+        .build();
     let resp: Value = agent
         .post(&format!("{base}/call/v2/save_feedback"))
         .timeout(Duration::from_secs(30))
         .send_json(serde_json::json!({"data": event}))?
         .into_json()?;
-    let event_id = resp["event_id"].as_str().ok_or_else(|| anyhow!("the feedback service returned no event_id"))?;
-    let stream = agent.get(&format!("{base}/call/save_feedback/{event_id}")).call()?.into_reader();
+    let event_id = resp["event_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("the feedback service returned no event_id"))?;
+    let stream = agent
+        .get(&format!("{base}/call/save_feedback/{event_id}"))
+        .call()?
+        .into_reader();
     let (mut name, mut data): (Option<String>, Option<String>) = (None, None);
     for line in std::io::BufReader::new(stream).lines() {
         let line = line?;
@@ -130,8 +142,13 @@ fn send(base: &str, event: &Value) -> Result<()> {
             match name.as_deref() {
                 Some("error") => bail!("the feedback service reported an error"),
                 Some("complete") => {
-                    let result: Value = serde_json::from_str(data.as_deref().unwrap_or("null")).unwrap_or(Value::Null);
-                    let ok = result.as_array().and_then(|a| a.first()).and_then(|r| r["success"].as_bool()) == Some(true);
+                    let result: Value = serde_json::from_str(data.as_deref().unwrap_or("null"))
+                        .unwrap_or(Value::Null);
+                    let ok = result
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|r| r["success"].as_bool())
+                        == Some(true);
                     if !ok {
                         bail!("the feedback service did not confirm saving");
                     }

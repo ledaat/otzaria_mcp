@@ -17,8 +17,9 @@ use super::feedback::Outbox;
 use super::official::{Official, OfficialConfig};
 use super::personal::PersonalSet;
 use super::textutil::{
-    char_len, char_prefix, char_slice, clean_markdown, heading_path, line_text, norm_word, note_windows,
-    parse_book_url, round_to, strip_html, strip_nikud, window_span, EchoReference, SourceKey,
+    char_len, char_prefix, char_slice, clean_markdown, heading_path, line_text, norm_word,
+    note_windows, parse_book_url, round_to, strip_html, strip_nikud, window_span, EchoReference,
+    SourceKey,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -68,7 +69,10 @@ impl<'a> Opts<'a> {
     }
     pub fn int(&self, k: &str, d: i64) -> i64 {
         match self.get(k) {
-            Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(d),
+            Some(Value::Number(n)) => n
+                .as_i64()
+                .or_else(|| n.as_f64().map(|f| f as i64))
+                .unwrap_or(d),
             Some(Value::String(s)) => s.trim().parse().unwrap_or(d),
             Some(Value::Bool(b)) => *b as i64,
             _ => d,
@@ -149,6 +153,11 @@ struct StatusState {
     busy: bool,
 }
 
+/// (categories, excluded categories) of a search scope.
+type ScopeKey = (Vec<String>, Vec<String>);
+/// Per attached database: its mtime and the era of each book.
+type EraCache = HashMap<String, (Option<SystemTime>, HashMap<i64, u8>)>;
+
 pub struct SemanticService {
     cfg: SemanticConfig,
     pub catalog: Catalog,
@@ -156,7 +165,7 @@ pub struct SemanticService {
     official: RwLock<Official>,
     personal: RwLock<Option<Arc<PersonalSet>>>,
     personal_note: Mutex<Option<String>>,
-    book_sets: Mutex<HashMap<(Vec<String>, Vec<String>), Option<Arc<BookSet>>>>,
+    book_sets: Mutex<HashMap<ScopeKey, Option<Arc<BookSet>>>>,
     status: Arc<Mutex<StatusState>>,
     outbox: Option<Outbox>,
     last_refresh: Mutex<Instant>,
@@ -186,7 +195,10 @@ impl SemanticService {
             personal: RwLock::new(None),
             personal_note: Mutex::new(None),
             book_sets: Mutex::new(HashMap::new()),
-            status: Arc::new(Mutex::new(StatusState { value: None, busy: false })),
+            status: Arc::new(Mutex::new(StatusState {
+                value: None,
+                busy: false,
+            })),
             outbox,
             last_refresh: Mutex::new(Instant::now()),
             started: Instant::now(),
@@ -217,7 +229,11 @@ impl SemanticService {
         }
         match PersonalSet::open(&self.cfg.personal_dir, Some(&self.cfg.user_books_db)) {
             Ok(ps) => {
-                eprintln!("otzaria-mcp: personal index: {} passages from {} books", ps.n, ps.books.len());
+                eprintln!(
+                    "otzaria-mcp: personal index: {} passages from {} books",
+                    ps.n,
+                    ps.books.len()
+                );
                 *self.personal.write().unwrap() = Some(Arc::new(ps));
                 self.check_personal_model();
             }
@@ -275,7 +291,9 @@ impl SemanticService {
         }
         // official vectors
         let before = self.official.read().unwrap().declared.generation;
-        let now = super::official::read_set(&self.cfg.vectors_dir).map(|d| d.generation).ok();
+        let now = super::official::read_set(&self.cfg.vectors_dir)
+            .map(|d| d.generation)
+            .ok();
         if now.is_some() && now != Some(before) {
             let mut o = self.official.write().unwrap();
             match o.reload() {
@@ -284,7 +302,9 @@ impl SemanticService {
                     eprintln!("otzaria-mcp: reload of the vector set failed ({e}); reopening it");
                     match Official::open(&official_config(&self.cfg)) {
                         Ok(fresh) => *o = fresh,
-                        Err(e2) => eprintln!("otzaria-mcp: reopening the vector set failed: {e2:#}"),
+                        Err(e2) => {
+                            eprintln!("otzaria-mcp: reopening the vector set failed: {e2:#}")
+                        }
                     }
                 }
             }
@@ -342,8 +362,16 @@ impl SemanticService {
                 admitted.remove(&b);
             }
         }
-        let set = Arc::new(BookSet(admitted.into_iter().map(|b| format!("id:{b}").into_boxed_str()).collect()));
-        self.book_sets.lock().unwrap().insert(key, Some(set.clone()));
+        let set = Arc::new(BookSet(
+            admitted
+                .into_iter()
+                .map(|b| format!("id:{b}").into_boxed_str())
+                .collect(),
+        ));
+        self.book_sets
+            .lock()
+            .unwrap()
+            .insert(key, Some(set.clone()));
         Some(set)
     }
 
@@ -368,10 +396,18 @@ impl SemanticService {
         let mut per_query: Vec<Vec<(f32, Cand)>> = Vec::with_capacity(vectors.len());
         for v in &vectors {
             let hits = official.scan(v, kc, scope.as_deref())?;
-            per_query.push(hits.into_iter().map(|h| (h.score, Cand::Official(Arc::new(h)))).collect());
+            per_query.push(
+                hits.into_iter()
+                    .map(|h| (h.score, Cand::Official(Arc::new(h))))
+                    .collect(),
+            );
         }
         drop(official);
-        let personal = if opts.bool("include_personal", true) { self.personal_searchable() } else { None };
+        let personal = if opts.bool("include_personal", true) {
+            self.personal_searchable()
+        } else {
+            None
+        };
         if let Some(ps) = &personal {
             let mask = ps.book_mask(&include, &exclude);
             let res = ps.scan(&vectors, kc, mask.as_deref());
@@ -382,7 +418,12 @@ impl SemanticService {
         for q in per_query.iter_mut() {
             q.sort_by(|a, b| b.0.total_cmp(&a.0));
         }
-        Ok(Run { per_query, personal, embed_ms, scan_ms: t1.elapsed().as_millis() })
+        Ok(Run {
+            per_query,
+            personal,
+            embed_ms,
+            scan_ms: t1.elapsed().as_millis(),
+        })
     }
 
     pub fn search(&self, req: &Map<String, Value>) -> Result<Value> {
@@ -391,10 +432,12 @@ impl SemanticService {
         if q.is_empty() {
             return Err(bad("empty query"));
         }
-        let run = self.run_queries(&[q.clone()], Vec::new(), &opts)?;
+        let run = self.run_queries(std::slice::from_ref(&q), Vec::new(), &opts)?;
         let t = Instant::now();
-        let cands: Vec<(f32, Cand, Vec<usize>)> =
-            run.per_query[0].iter().map(|(s, c)| (*s, c.clone(), vec![0])).collect();
+        let cands: Vec<(f32, Cand, Vec<usize>)> = run.per_query[0]
+            .iter()
+            .map(|(s, c)| (*s, c.clone(), vec![0]))
+            .collect();
         let hits = self.resolve(&cands, &opts, None, run.personal.as_deref())?;
         Ok(json!({"query": q, "hits": hits,
                   "timing_ms": {"embed": run.embed_ms, "scan": run.scan_ms, "resolve": t.elapsed().as_millis()}}))
@@ -409,13 +452,17 @@ impl SemanticService {
 
     fn query_cap(&self) -> usize {
         let o = self.official.read().unwrap();
-        o.declared.model.query_max_tokens.unwrap_or(o.declared.model.max_tokens)
+        o.declared
+            .model
+            .query_max_tokens
+            .unwrap_or(o.declared.model.max_tokens)
     }
 
     pub fn related(&self, req: &Map<String, Value>) -> Result<Value> {
         let opts = Opts(req);
         let count = self.count_tokens()?;
-        let wt = (opts.int("window_tokens", 160).max(8) as usize).min(self.query_cap().saturating_sub(8).max(8));
+        let wt = (opts.int("window_tokens", 160).max(8) as usize)
+            .min(self.query_cap().saturating_sub(8).max(8));
         let windows = note_windows(
             &count,
             &opts.str("text"),
@@ -425,7 +472,9 @@ impl SemanticService {
             opts.int("min_hebrew", 12).max(0) as usize,
         );
         if windows.is_empty() {
-            return Ok(json!({"windows": [], "hits": [], "note": "no Hebrew/Aramaic text long enough to search"}));
+            return Ok(
+                json!({"windows": [], "hits": [], "note": "no Hebrew/Aramaic text long enough to search"}),
+            );
         }
         let run = self.run_queries(&windows, Vec::new(), &opts)?;
         // merge: a passage keeps its best score and every window that found it, strongest first
@@ -464,7 +513,11 @@ impl SemanticService {
         if !o.contains_key("echo_text") {
             o.insert(
                 "echo_text".into(),
-                Value::String(format!("{}\n{}", clean_markdown(&opts.str("title")), clean_markdown(&opts.str("text")))),
+                Value::String(format!(
+                    "{}\n{}",
+                    clean_markdown(&opts.str("title")),
+                    clean_markdown(&opts.str("text"))
+                )),
             );
         }
         let hits = self.resolve(&cands, &Opts(&o), Some(&windows), run.personal.as_deref())?;
@@ -474,9 +527,17 @@ impl SemanticService {
 
     // ── resolution ──────────────────────────────────────────────────────────
 
-    fn base_official(&self, conn: &rusqlite::Connection, hit: &VectorHit) -> Result<Option<Map<String, Value>>> {
-        let Some((bid, li, win)) = official_book(hit) else { return Ok(None) };
-        let Some(book) = self.catalog.book(bid) else { return Ok(None) };
+    fn base_official(
+        &self,
+        conn: &rusqlite::Connection,
+        hit: &VectorHit,
+    ) -> Result<Option<Map<String, Value>>> {
+        let Some((bid, li, win)) = official_book(hit) else {
+            return Ok(None);
+        };
+        let Some(book) = self.catalog.book(bid) else {
+            return Ok(None);
+        };
         let rows = self.catalog.lines(conn, bid, li, li + 3)?;
         if rows.first().map(|r| r.index) != Some(li) {
             return Ok(None);
@@ -487,13 +548,19 @@ impl SemanticService {
             // the vector is a later window of a long line: show that part of the line
             let t = text.trim();
             let (a, b) = window_span(t, win as usize);
-            snippet = format!("… {}{}", char_slice(t, a, b), if b < char_len(t) { " …" } else { "" });
+            snippet = format!(
+                "… {}{}",
+                char_slice(t, a, b),
+                if b < char_len(t) { " …" } else { "" }
+            );
         }
         for r in &rows[1..] {
             if char_len(&snippet) >= 40 {
                 break;
             }
-            snippet = format!("{} {}", snippet, strip_html(&r.content)).trim().to_string();
+            snippet = format!("{} {}", snippet, strip_html(&r.content))
+                .trim()
+                .to_string();
         }
         let mut toc = match rows[0].toc {
             Some(id) => self.catalog.toc_path(conn, id, 6)?,
@@ -501,7 +568,8 @@ impl SemanticService {
         };
         let nq = |s: &str| s.replace('"', "");
         if let Some(first) = toc.first() {
-            if nq(first) == nq(&book.title) || nq(first) == nq(book.he_ref.as_deref().unwrap_or("")) {
+            if nq(first) == nq(&book.title) || nq(first) == nq(book.he_ref.as_deref().unwrap_or(""))
+            {
                 toc.remove(0);
             }
         }
@@ -511,7 +579,10 @@ impl SemanticService {
         let he_ref = if exact {
             heref
         } else if !toc.is_empty() {
-            std::iter::once(book.title.clone()).chain(toc.iter().cloned()).collect::<Vec<_>>().join(", ")
+            std::iter::once(book.title.clone())
+                .chain(toc.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(", ")
         } else {
             book.title.clone()
         };
@@ -520,14 +591,24 @@ impl SemanticService {
         let mut also = Vec::new();
         let others = hit.records.iter().skip(1).filter(|r| {
             r.window != 255
-                && !(r.book.strip_prefix("id:").and_then(|x| x.parse::<i64>().ok()) == Some(bid)
+                && !(r
+                    .book
+                    .strip_prefix("id:")
+                    .and_then(|x| x.parse::<i64>().ok())
+                    == Some(bid)
                     && (r.hint as i64 - li).abs() <= 2)
         });
         for r in others.take(4) {
-            if let Some(bj) = r.book.strip_prefix("id:").and_then(|x| x.parse::<i64>().ok()) {
+            if let Some(bj) = r
+                .book
+                .strip_prefix("id:")
+                .and_then(|x| x.parse::<i64>().ok())
+            {
                 if let Some(b) = self.catalog.book(bj) {
-                    also.push(json!({"book_id": bj, "book_title": b.title, "line_index": r.hint,
-                                     "url": SourceKey::Official.url(bj, r.hint as i64)}));
+                    also.push(
+                        json!({"book_id": bj, "book_title": b.title, "line_index": r.hint,
+                                     "url": SourceKey::Official.url(bj, r.hint as i64)}),
+                    );
                 }
             }
         }
@@ -535,7 +616,10 @@ impl SemanticService {
         m.insert("key".into(), json!(["o", bid]));
         m.insert("book_id".into(), json!(bid));
         m.insert("book_title".into(), json!(book.title));
-        m.insert("category".into(), json!(self.catalog.cat_path(book.category)));
+        m.insert(
+            "category".into(),
+            json!(self.catalog.cat_path(book.category)),
+        );
         m.insert("line_index".into(), json!(li));
         m.insert("he_ref".into(), json!(he_ref));
         m.insert("has_exact_ref".into(), json!(exact));
@@ -567,18 +651,30 @@ impl SemanticService {
             // a later window of a long line: the windows were cut from the line without nikud
             let t = line_text(raw);
             let (a, e) = window_span(&t, win as usize);
-            snippet = format!("… {}{}", char_slice(&t, a, e), if e < char_len(&t) { " …" } else { "" });
+            snippet = format!(
+                "… {}{}",
+                char_slice(&t, a, e),
+                if e < char_len(&t) { " …" } else { "" }
+            );
         }
         let mut j = li as usize + 1;
         while char_len(&snippet) < 40 && j < lines.len() && j <= li as usize + 3 {
-            snippet = format!("{} {}", snippet, strip_html(&lines[j])).trim().to_string();
+            snippet = format!("{} {}", snippet, strip_html(&lines[j]))
+                .trim()
+                .to_string();
             j += 1;
         }
         let mut hp = heading_path(&lines, li as usize);
-        if hp.first().is_some_and(|h| h.replace('"', "") == b.title.replace('"', "")) {
+        if hp
+            .first()
+            .is_some_and(|h| h.replace('"', "") == b.title.replace('"', ""))
+        {
             hp.remove(0);
         }
-        let he_ref = std::iter::once(b.title.clone()).chain(hp.iter().cloned()).collect::<Vec<_>>().join(", ");
+        let he_ref = std::iter::once(b.title.clone())
+            .chain(hp.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(", ");
         let attached = b.attached();
         let mut m = Map::new();
         m.insert("key".into(), json!([b.source().code(), b.book_id]));
@@ -594,9 +690,18 @@ impl SemanticService {
         m.insert("url".into(), json!(b.url(li)));
         m.insert("also_in".into(), json!([]));
         m.insert("window".into(), json!(win));
-        m.insert("book_source".into(), json!(if attached { "attached" } else { "user" }));
-        m.insert("library".into(), if attached { json!(b.lib) } else { Value::Null });
-        m.insert("library_id".into(), if attached { json!(b.slug) } else { Value::Null });
+        m.insert(
+            "book_source".into(),
+            json!(if attached { "attached" } else { "user" }),
+        );
+        m.insert(
+            "library".into(),
+            if attached { json!(b.lib) } else { Value::Null },
+        );
+        m.insert(
+            "library_id".into(),
+            if attached { json!(b.slug) } else { Value::Null },
+        );
         m.insert("personal".into(), json!(true));
         m.insert("stale".into(), json!(stale));
         Some(m)
@@ -641,7 +746,10 @@ impl SemanticService {
             0 => 2.max((2 * k).div_ceil(n_win)),
             v => v.max(1) as usize,
         };
-        let echo_ref = EchoReference::new(&opts.str("echo_text"), opts.int("echo_n", 3).max(0) as usize);
+        let echo_ref = EchoReference::new(
+            &opts.str("echo_text"),
+            opts.int("echo_n", 3).max(0) as usize,
+        );
         let echo_containment = opts.float("echo_containment", 0.5);
         let echo_run = opts.int("echo_run", 8).max(0) as usize;
         let max_chars = opts.int("max_chars", 700).max(1) as usize;
@@ -656,14 +764,20 @@ impl SemanticService {
             if *score < min_score || counted >= k || out.len() >= 3 * k {
                 break;
             }
-            let Some((src, bid, li)) = self.cand_location(ps, cand) else { continue };
+            let Some((src, bid, li)) = self.cand_location(ps, cand) else {
+                continue;
+            };
             let key = (src.clone(), bid);
-            if let Some(near) = kept
-                .get(&key)
-                .and_then(|v| v.iter().find(|&&i| (out[i]["line_index"].as_i64().unwrap_or(-99) - li).abs() <= merge_lines))
-            {
+            if let Some(near) = kept.get(&key).and_then(|v| {
+                v.iter().find(|&&i| {
+                    (out[i]["line_index"].as_i64().unwrap_or(-99) - li).abs() <= merge_lines
+                })
+            }) {
                 let h = &mut out[*near];
-                let n = h.get("also_matched_lines").and_then(Value::as_u64).unwrap_or(0);
+                let n = h
+                    .get("also_matched_lines")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 h.insert("also_matched_lines".into(), json!(n + 1));
                 continue;
             }
@@ -677,13 +791,22 @@ impl SemanticService {
             };
             let Some(base) = base else { continue };
             let text = base["text"].as_str().unwrap_or("").to_string();
-            let norm: String = strip_nikud(&text).chars().filter(|c| ('\u{05D0}'..='\u{05EA}').contains(c)).take(80).collect();
+            let norm: String = strip_nikud(&text)
+                .chars()
+                .filter(|c| ('\u{05D0}'..='\u{05EA}').contains(c))
+                .take(80)
+                .collect();
             if char_len(&norm) >= 30 {
                 if let Some(&twin) = seen_text.get(&norm) {
-                    let also = out[twin].get_mut("also_in").and_then(Value::as_array_mut).unwrap();
+                    let also = out[twin]
+                        .get_mut("also_in")
+                        .and_then(Value::as_array_mut)
+                        .unwrap();
                     if also.len() < 6 {
-                        also.push(json!({"book_id": base["book_id"], "book_title": base["book_title"],
-                                         "line_index": li, "url": base["url"]}));
+                        also.push(
+                            json!({"book_id": base["book_id"], "book_title": base["book_title"],
+                                         "line_index": li, "url": base["url"]}),
+                        );
                     }
                     continue;
                 }
@@ -691,11 +814,15 @@ impl SemanticService {
             cited = cited || cited_refs.contains(base["he_ref"].as_str().unwrap_or(""));
             let echo = echo_ref.measure(&text);
             // short lines (a heading, a rule's name) only count via the run test, never by share alone
-            let is_echo = echo
-                .as_ref()
-                .is_some_and(|e| e.run >= echo_run || (e.words >= echo_run && e.containment >= echo_containment));
+            let is_echo = echo.as_ref().is_some_and(|e| {
+                e.run >= echo_run || (e.words >= echo_run && e.containment >= echo_containment)
+            });
             let flagged = cited || is_echo;
-            if !flagged && windows.is_some() && !wins.is_empty() && per_window.get(&wins[0]).copied().unwrap_or(0) >= max_per_window {
+            if !flagged
+                && windows.is_some()
+                && !wins.is_empty()
+                && per_window.get(&wins[0]).copied().unwrap_or(0) >= max_per_window
+            {
                 continue;
             }
             let mut hit = base.clone();
@@ -747,8 +874,15 @@ impl SemanticService {
         }
         let cap = 40.max(opts.int("context_chars", 400)) as usize;
         let li = hit["line_index"].as_i64().unwrap_or(0);
-        let Ok(rows) = self.book_rows(conn, src, bid, (li - 3 * n).max(0), li + 3 * n, false, ps) else { return };
-        let texts: HashMap<i64, String> = rows.rows.iter().map(|r| (r.0, strip_html(&r.3).trim().to_string())).collect();
+        let Ok(rows) = self.book_rows(conn, src, bid, (li - 3 * n).max(0), li + 3 * n, false, ps)
+        else {
+            return;
+        };
+        let texts: HashMap<i64, String> = rows
+            .rows
+            .iter()
+            .map(|r| (r.0, strip_html(&r.3).trim().to_string()))
+            .collect();
         let url = |l: i64| src.url(bid, l);
         let side = |order: Vec<i64>| -> Vec<Value> {
             let (mut out, mut used) = (Vec::new(), 0usize);
@@ -759,7 +893,9 @@ impl SemanticService {
                 }
                 let mut t = t;
                 if used + char_len(&t) > cap {
-                    t = char_prefix(&t, cap.saturating_sub(used)).trim_end().to_string();
+                    t = char_prefix(&t, cap.saturating_sub(used))
+                        .trim_end()
+                        .to_string();
                     if t.is_empty() {
                         break;
                     }
@@ -782,12 +918,18 @@ impl SemanticService {
                 let lix = first["line_index"].as_i64().unwrap_or(0);
                 let full = &texts[&lix];
                 let keep = char_len(&ft) - 1;
-                let tail: String = full.chars().skip(char_len(full) - keep.min(char_len(full))).collect();
+                let tail: String = full
+                    .chars()
+                    .skip(char_len(full) - keep.min(char_len(full)))
+                    .collect();
                 first["text"] = json!(format!("…{tail}"));
             }
         }
         hit.insert("context_before".into(), Value::Array(before));
-        hit.insert("context_after".into(), Value::Array(side((li + 1..=li + 3 * n).collect())));
+        hit.insert(
+            "context_after".into(),
+            Value::Array(side((li + 1..=li + 3 * n).collect())),
+        );
     }
 
     // ── text by location ────────────────────────────────────────────────────
@@ -799,15 +941,25 @@ impl SemanticService {
         }
         if opts.get("book_id").is_some() {
             let src = SourceKey::parse(&opts.str("source")).ok_or_else(|| bad("unknown source"))?;
-            return Ok((src, opts.int("book_id", 0), opts.int("line_index", 0).max(0), None));
+            return Ok((
+                src,
+                opts.int("book_id", 0),
+                opts.int("line_index", 0).max(0),
+                None,
+            ));
         }
         let r = opts.str("ref").trim().to_string();
         if r.is_empty() {
             return Err(bad("give url, book_id + line_index, or ref"));
         }
-        let db = self.refs.as_ref().ok_or_else(|| bad("references cannot be resolved here; pass url or book_id"))?;
+        let db = self
+            .refs
+            .as_ref()
+            .ok_or_else(|| bad("references cannot be resolved here; pass url or book_id"))?;
         let cands = db.resolve_ref(&r, 5)?;
-        let first = cands.first().ok_or_else(|| bad(format!("no Otzaria book or location matches {r:?}")))?;
+        let first = cands
+            .first()
+            .ok_or_else(|| bad(format!("no Otzaria book or location matches {r:?}")))?;
         let note = (cands.len() > 1).then(|| {
             format!(
                 "{} candidates; took {} ({})",
@@ -820,6 +972,7 @@ impl SemanticService {
     }
 
     /// (title, category, rows (line index, heRef, TOC path, raw text), url) for any source.
+    #[allow(clippy::too_many_arguments)]
     fn book_rows(
         &self,
         conn: &rusqlite::Connection,
@@ -831,18 +984,21 @@ impl SemanticService {
         ps: Option<&PersonalSet>,
     ) -> Result<BookRows> {
         if *src == SourceKey::Official {
-            let book = self.catalog.book(bid).ok_or_else(|| bad(format!("no book {bid} in the library")))?;
+            let book = self
+                .catalog
+                .book(bid)
+                .ok_or_else(|| bad(format!("no book {bid} in the library")))?;
             let raw = self.catalog.lines(conn, bid, lo, hi)?;
             let mut tocs: HashMap<Option<i64>, Vec<String>> = HashMap::new();
             let mut rows = Vec::with_capacity(raw.len());
             for r in raw {
                 let toc = if with_toc {
-                    if !tocs.contains_key(&r.toc) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = tocs.entry(r.toc) {
                         let p = match r.toc {
                             Some(id) => self.catalog.toc_path(conn, id, 6)?,
                             None => Vec::new(),
                         };
-                        tocs.insert(r.toc, p);
+                        e.insert(p);
                     }
                     tocs[&r.toc].clone()
                 } else {
@@ -850,7 +1006,11 @@ impl SemanticService {
                 };
                 rows.push((r.index, r.he_ref, toc, r.content));
             }
-            return Ok(BookRows { title: book.title, category: self.catalog.cat_path(book.category), rows });
+            return Ok(BookRows {
+                title: book.title,
+                category: self.catalog.cat_path(book.category),
+                rows,
+            });
         }
         let ps = ps.ok_or_else(|| bad("the personal index is not loaded"))?;
         let bi = *ps.by_key.get(&(src.clone(), bid)).ok_or_else(|| {
@@ -867,7 +1027,10 @@ impl SemanticService {
         let (lines, _stale) = ps.lines_of(bi);
         let lines = lines.ok_or_else(|| anyhow!("cannot read {} right now", b.title))?;
         let mut rows = Vec::new();
-        let (lo, hi) = (lo.max(0) as usize, (hi.max(0) as usize).min(lines.len().saturating_sub(1)));
+        let (lo, hi) = (
+            lo.max(0) as usize,
+            (hi.max(0) as usize).min(lines.len().saturating_sub(1)),
+        );
         if !lines.is_empty() {
             for li in lo..=hi {
                 if li >= lines.len() {
@@ -876,7 +1039,11 @@ impl SemanticService {
                 rows.push((li as i64, None, heading_path(&lines, li), lines[li].clone()));
             }
         }
-        Ok(BookRows { title: b.title.clone(), category: b.category_path(), rows })
+        Ok(BookRows {
+            title: b.title.clone(),
+            category: b.category_path(),
+            rows,
+        })
     }
 
     pub fn text(&self, req: &Map<String, Value>) -> Result<Value> {
@@ -887,7 +1054,15 @@ impl SemanticService {
         let after = opts.int("after", 6).clamp(0, 80);
         let conn = self.catalog.connect()?;
         let ps = self.personal_any();
-        let br = self.book_rows(&conn, &src, bid, (li - before).max(0), li + after, true, ps.as_deref())?;
+        let br = self.book_rows(
+            &conn,
+            &src,
+            bid,
+            (li - before).max(0),
+            li + after,
+            true,
+            ps.as_deref(),
+        )?;
         let toc_first = br.rows.first().map(|r| r.2.clone()).unwrap_or_default();
         let lines: Vec<Value> = br
             .rows
@@ -897,16 +1072,22 @@ impl SemanticService {
                        "heading": is_heading_line(content), "text": strip_html(content)})
             })
             .collect();
-        Ok(json!({"book_id": bid, "book_title": br.title, "category": br.category, "source": src.code(),
+        Ok(
+            json!({"book_id": bid, "book_title": br.title, "category": br.category, "source": src.code(),
                   "url_pattern": src.url(bid, 0).replace("index=0", "index=<line>"),
-                  "center": li, "toc": toc_first, "note": note, "lines": lines, "timing_ms": {}}))
+                  "center": li, "toc": toc_first, "note": note, "lines": lines, "timing_ms": {}}),
+        )
     }
 
     // ── does this quotation exist, and where, and with which variants? ──────
 
     fn source_rank(&self, src: &SourceKey, bid: i64, ps: Option<&PersonalSet>) -> SourceRank {
         match src {
-            SourceKey::Official => self.catalog.rank(bid).unwrap_or((ERA_UNKNOWN, 0, 3, 1, 2, vec![(1_000_000, 0)])),
+            SourceKey::Official => {
+                self.catalog
+                    .rank(bid)
+                    .unwrap_or((ERA_UNKNOWN, 0, 3, 1, 2, vec![(1_000_000, 0)]))
+            }
             SourceKey::Attached(_) => {
                 let era = ps
                     .and_then(|p| p.by_key.get(&(src.clone(), bid)).map(|&i| &p.books[i]))
@@ -920,7 +1101,7 @@ impl SemanticService {
     }
 
     fn attached_era(&self, db: &str, bid: i64) -> u8 {
-        static CACHE: std::sync::LazyLock<Mutex<HashMap<String, (Option<SystemTime>, HashMap<i64, u8>)>>> =
+        static CACHE: std::sync::LazyLock<Mutex<EraCache>> =
             std::sync::LazyLock::new(Default::default);
         let m = std::fs::metadata(db).and_then(|m| m.modified()).ok();
         let mut cache = CACHE.lock().unwrap();
@@ -939,13 +1120,16 @@ impl SemanticService {
         if char_len(&quote) < 6 {
             return Err(bad("quote too short"));
         }
-        if !opts.str("ref").is_empty() || !opts.str("url").is_empty() || opts.get("book_id").is_some() {
+        if !opts.str("ref").is_empty()
+            || !opts.str("url").is_empty()
+            || opts.get("book_id").is_some()
+        {
             return self.check_quote_at(&quote, &opts);
         }
         let mut o = req.clone();
         o.entry("k").or_insert(json!(40));
         let passage = self.official.read().unwrap().embed_passage(&quote)?;
-        let run = self.run_queries(&[quote.clone()], vec![passage], &Opts(&o))?;
+        let run = self.run_queries(std::slice::from_ref(&quote), vec![passage], &Opts(&o))?;
         let ps = run.personal.as_deref();
         let mut best: HashMap<(u8, u64), (f32, Cand)> = HashMap::new();
         for hits in &run.per_query {
@@ -968,14 +1152,19 @@ impl SemanticService {
         let mut seen: HashSet<(SourceKey, i64, i64)> = HashSet::new();
         let mut results: Vec<(Map<String, Value>, SourceRank)> = Vec::new();
         for (score, cand) in &cands {
-            let Some((src, bid, li)) = self.cand_location(ps, cand) else { continue };
+            let Some((src, bid, li)) = self.cand_location(ps, cand) else {
+                continue;
+            };
             if src == SourceKey::Official && !self.catalog.has_book(bid) {
                 continue;
             }
             if !seen.insert((src.clone(), bid, li)) {
                 continue;
             }
-            let Ok(br) = self.book_rows(&conn, &src, bid, (li - 1).max(0), li + 3, false, ps) else { continue };
+            let Ok(br) = self.book_rows(&conn, &src, bid, (li - 1).max(0), li + 3, false, ps)
+            else {
+                continue;
+            };
             let (mut words_orig, mut owner) = (Vec::new(), Vec::new());
             for (lix, _r, _t, content) in &br.rows {
                 for w in strip_html(content).split_whitespace() {
@@ -994,13 +1183,19 @@ impl SemanticService {
                     ow.push(owner[i]);
                 }
             }
-            let Some(al) = align_words(&qw, &cw, &qw_orig, &wo) else { continue };
+            let Some(al) = align_words(&qw, &cw, &qw_orig, &wo) else {
+                continue;
+            };
             let start_line = ow.get(al.start).copied().unwrap_or(li);
             if start_line != li && seen.contains(&(src.clone(), bid, start_line)) {
                 continue; // the same stretch, already found from the line it starts on
             }
             seen.insert((src.clone(), bid, start_line));
-            let heref = br.rows.iter().find(|r| r.0 == start_line).and_then(|r| r.1.clone());
+            let heref = br
+                .rows
+                .iter()
+                .find(|r| r.0 == start_line)
+                .and_then(|r| r.1.clone());
             let rank = self.source_rank(&src, bid, ps);
             let mut m = Map::new();
             m.insert("ratio".into(), json!(round_to(al.ratio, 3)));
@@ -1011,20 +1206,32 @@ impl SemanticService {
             m.insert("source".into(), json!(src.code()));
             m.insert("era".into(), json!(era_label(rank.0)));
             m.insert("line_index".into(), json!(start_line));
-            m.insert("he_ref".into(), json!(heref.unwrap_or_else(|| br.title.clone())));
+            m.insert(
+                "he_ref".into(),
+                json!(heref.unwrap_or_else(|| br.title.clone())),
+            );
             m.insert("url".into(), json!(src.url(bid, start_line)));
             m.insert("library_text".into(), json!(wo[al.start..al.end].join(" ")));
-            m.insert("diffs".into(), diffs_json(&al.ops, &qw_orig, &wo[al.start..]));
+            m.insert(
+                "diffs".into(),
+                diffs_json(&al.ops, &qw_orig, &wo[al.start..]),
+            );
             results.push((m, rank));
         }
-        let timing = json!({"embed": run.embed_ms, "scan": run.scan_ms, "align": t.elapsed().as_millis()});
+        let timing =
+            json!({"embed": run.embed_ms, "scan": run.scan_ms, "align": t.elapsed().as_millis()});
         if results.is_empty() {
-            return Ok(json!({"quote": quote, "verdict": "not found", "best": null, "source": null, "closest": null,
-                             "alternatives": [], "timing_ms": timing}));
+            return Ok(
+                json!({"quote": quote, "verdict": "not found", "best": null, "source": null, "closest": null,
+                             "alternatives": [], "timing_ms": timing}),
+            );
         }
         let ratio = |m: &Map<String, Value>| m["ratio"].as_f64().unwrap_or(0.0);
         let score = |m: &Map<String, Value>| m["score"].as_f64().unwrap_or(0.0);
-        let top_ratio = results.iter().map(|(m, _)| ratio(m)).fold(f64::MIN, f64::max);
+        let top_ratio = results
+            .iter()
+            .map(|(m, _)| ratio(m))
+            .fold(f64::MIN, f64::max);
         // Match quality first, in tiers: within `source_tolerance` of the closest wording counts
         // as matching equally well, and inside a tier the earliest work leads. The default
         // allows one word of the quote (or 5%, for long quotes). Ratios are rounded to 3 decimals.
@@ -1075,7 +1282,11 @@ impl SemanticService {
         // A later work is reported beside the source only when its wording matches better: the
         // earliest of those with the best wording.
         let closest_idx = if ratio(&src_hit) < top_ratio {
-            results.iter().skip(1).position(|(m, _)| ratio(m) >= top_ratio).map(|i| i + 1)
+            results
+                .iter()
+                .skip(1)
+                .position(|(m, _)| ratio(m) >= top_ratio)
+                .map(|i| i + 1)
         } else {
             None
         };
@@ -1104,12 +1315,24 @@ impl SemanticService {
         let (qw_orig, qw) = words_of(quote);
         let conn = self.catalog.connect()?;
         let ps = self.personal_any();
-        let br = self.book_rows(&conn, &src, bid, (li - 2).max(0), li + span, false, ps.as_deref())?;
+        let br = self.book_rows(
+            &conn,
+            &src,
+            bid,
+            (li - 2).max(0),
+            li + span,
+            false,
+            ps.as_deref(),
+        )?;
         let line_words: Vec<(i64, Option<String>, Vec<String>)> = br
             .rows
             .iter()
             .map(|(lix, heref, _t, content)| {
-                let ws = strip_html(content).split_whitespace().filter(|w| !norm_word(w).is_empty()).map(String::from).collect();
+                let ws = strip_html(content)
+                    .split_whitespace()
+                    .filter(|w| !norm_word(w).is_empty())
+                    .map(String::from)
+                    .collect();
                 (*lix, heref.clone(), ws)
             })
             .collect();
@@ -1119,10 +1342,12 @@ impl SemanticService {
             let (mut words_orig, mut owner) = (Vec::new(), Vec::new());
             for (lix, _h, ws) in line_words.iter().skip(n).take(3) {
                 words_orig.extend(ws.iter().cloned());
-                owner.extend(std::iter::repeat(*lix).take(ws.len()));
+                owner.extend(std::iter::repeat_n(*lix, ws.len()));
             }
             let cw: Vec<String> = words_orig.iter().map(|w| norm_word(w)).collect();
-            let Some(al) = align_words(&qw, &cw, &qw_orig, &words_orig) else { continue };
+            let Some(al) = align_words(&qw, &cw, &qw_orig, &words_orig) else {
+                continue;
+            };
             let start_line = owner.get(al.start).copied().unwrap_or(line_words[n].0);
             if start_line != line_words[n].0 {
                 continue; // that window is found again from the line it starts on
@@ -1137,16 +1362,33 @@ impl SemanticService {
             m.insert("source".into(), json!(src.code()));
             m.insert("era".into(), json!(era_label(rank.0)));
             m.insert("line_index".into(), json!(start_line));
-            m.insert("he_ref".into(), json!(heref.unwrap_or_else(|| br.title.clone())));
+            m.insert(
+                "he_ref".into(),
+                json!(heref.unwrap_or_else(|| br.title.clone())),
+            );
             m.insert("url".into(), json!(src.url(bid, start_line)));
-            m.insert("library_text".into(), json!(words_orig[al.start..al.end].join(" ")));
-            m.insert("diffs".into(), diffs_json(&al.ops, &qw_orig, &words_orig[al.start..]));
+            m.insert(
+                "library_text".into(),
+                json!(words_orig[al.start..al.end].join(" ")),
+            );
+            m.insert(
+                "diffs".into(),
+                diffs_json(&al.ops, &qw_orig, &words_orig[al.start..]),
+            );
             results.push(m);
         }
         // a stable sort: equal ratios keep the order of their lines, as Python's sort does
-        results.sort_by(|a, b| b["ratio"].as_f64().unwrap_or(0.0).total_cmp(&a["ratio"].as_f64().unwrap_or(0.0)));
+        results.sort_by(|a, b| {
+            b["ratio"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .total_cmp(&a["ratio"].as_f64().unwrap_or(0.0))
+        });
         let top = results.first().cloned();
-        let r = top.as_ref().and_then(|t| t["ratio"].as_f64()).unwrap_or(0.0);
+        let r = top
+            .as_ref()
+            .and_then(|t| t["ratio"].as_f64())
+            .unwrap_or(0.0);
         let alts: Vec<Value> = results
             .iter()
             .skip(1)
@@ -1155,9 +1397,11 @@ impl SemanticService {
             .cloned()
             .map(Value::Object)
             .collect();
-        Ok(json!({"quote": quote, "verdict": verdict_of(r, "not found at this location"),
+        Ok(
+            json!({"quote": quote, "verdict": verdict_of(r, "not found at this location"),
                   "best": top, "source": top, "closest": null, "located_by": "reference",
-                  "note": note, "alternatives": alts, "timing_ms": {}}))
+                  "note": note, "alternatives": alts, "timing_ms": {}}),
+        )
     }
 
     // ── service status ──────────────────────────────────────────────────────
@@ -1190,7 +1434,10 @@ impl SemanticService {
     pub fn personal_status(&self) -> Value {
         let (snapshot, start) = {
             let mut st = self.status.lock().unwrap();
-            let fresh = st.value.as_ref().is_some_and(|(_, at)| at.elapsed().map_or(false, |e| e < Duration::from_secs(20)));
+            let fresh = st
+                .value
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed().is_ok_and(|e| e < Duration::from_secs(20)));
             let start = !st.busy && !fresh && self.cfg.builder.is_some();
             if start {
                 st.busy = true;
@@ -1223,23 +1470,33 @@ impl SemanticService {
     }
 
     pub fn feedback(&self, req: &Map<String, Value>) -> Result<Value> {
-        let ob = self.outbox.as_ref().ok_or_else(|| bad("feedback is not enabled in this server"))?;
+        let ob = self
+            .outbox
+            .as_ref()
+            .ok_or_else(|| bad("feedback is not enabled in this server"))?;
         let opts = Opts(req);
         if let Some(Value::Object(pre)) = opts.get("event") {
             // An event built by another client (the Otzaria plugin "מקבילות", which cannot reach
             // the feedback service itself): relayed as is, under its own id.
             let fid = pre.get("id").and_then(Value::as_str).unwrap_or("");
-            if !(8..=64).contains(&fid.len()) || !fid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            if !(8..=64).contains(&fid.len())
+                || !fid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
                 return Err(bad("event.id is missing or malformed"));
             }
-            if !matches!(pre.get("feedbackType").and_then(Value::as_str), Some("like" | "dislike" | "entry")) {
+            if !matches!(
+                pre.get("feedbackType").and_then(Value::as_str),
+                Some("like" | "dislike" | "entry")
+            ) {
                 return Err(bad("event.feedbackType must be like, dislike or entry"));
             }
             if !pre.get("result").is_some_and(Value::is_object) {
                 return Err(bad("event.result is required"));
             }
             ob.enqueue(&Value::Object(pre.clone()))?;
-            return Ok(json!({"queued": true, "id": fid, "pending": ob.pending_count(), "last_error": ob.last_error(), "timing_ms": {}}));
+            return Ok(
+                json!({"queued": true, "id": fid, "pending": ob.pending_count(), "last_error": ob.last_error(), "timing_ms": {}}),
+            );
         }
         let ftype = match opts.str("vote") {
             v if !v.is_empty() => v,
@@ -1255,7 +1512,9 @@ impl SemanticService {
         let event = self.feedback_event(&opts, &ftype, &hit);
         let fid = event["id"].as_str().unwrap_or("").to_string();
         ob.enqueue(&event)?;
-        Ok(json!({"queued": true, "id": fid, "pending": ob.pending_count(), "last_error": ob.last_error(), "timing_ms": {}}))
+        Ok(
+            json!({"queued": true, "id": fid, "pending": ob.pending_count(), "last_error": ob.last_error(), "timing_ms": {}}),
+        )
     }
 
     fn feedback_event(&self, opts: &Opts, ftype: &str, hit: &Map<String, Value>) -> Value {
@@ -1264,20 +1523,38 @@ impl SemanticService {
         let fid = uuid::Uuid::new_v4().to_string();
         let kind = opts.str("query_kind");
         let searched = opts.get("searched_at").and_then(Value::as_f64);
-        let personal = matches!(hit.get("book_source").and_then(Value::as_str), Some("user" | "attached"))
-            || hit.get("personal").and_then(Value::as_bool).unwrap_or(false);
+        let personal = matches!(
+            hit.get("book_source").and_then(Value::as_str),
+            Some("user" | "attached")
+        ) || hit
+            .get("personal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let source = hit
             .get("book_source")
             .and_then(Value::as_str)
             .map(String::from)
-            .unwrap_or_else(|| if personal { "user".into() } else { "official".into() });
+            .unwrap_or_else(|| {
+                if personal {
+                    "user".into()
+                } else {
+                    "official".into()
+                }
+            });
         let section_prefix = match source.as_str() {
             "user" => "user:".to_string(),
-            "attached" => format!("db:{}:", hit.get("library_id").and_then(Value::as_str).unwrap_or("")),
+            "attached" => format!(
+                "db:{}:",
+                hit.get("library_id").and_then(Value::as_str).unwrap_or("")
+            ),
             _ => String::new(),
         };
-        let paragraph = hit.get("text").and_then(Value::as_str).filter(|s| !s.is_empty())
-            .or_else(|| hit.get("snippet").and_then(Value::as_str)).unwrap_or("");
+        let paragraph = hit
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| hit.get("snippet").and_then(Value::as_str))
+            .unwrap_or("");
         json!({
             "id": fid, "eventId": fid, "schemaVersion": 1, "occurredAt": super::feedback::utc_iso(SystemTime::now()),
             "feedbackType": ftype,
@@ -1318,7 +1595,10 @@ impl SemanticService {
     fn otzaria_version(&self) -> Option<String> {
         let text = std::fs::read(self.cfg.otzaria_dir.join("logs").join("errors.txt")).ok()?;
         let text = String::from_utf8_lossy(&text);
-        text.lines().filter_map(|l| l.strip_prefix("Version:")).map(|v| v.split_whitespace().next().unwrap_or("").to_string()).filter(|v| !v.is_empty()).last()
+        text.lines()
+            .filter_map(|l| l.strip_prefix("Version:"))
+            .map(|v| v.split_whitespace().next().unwrap_or("").to_string())
+            .rfind(|v| !v.is_empty())
     }
 }
 
@@ -1338,21 +1618,28 @@ fn val_str(v: Option<&Value>) -> String {
 
 fn is_heading_line(content: &str) -> bool {
     let t = content.trim_start();
-    t.len() > 2 && t.as_bytes()[0] == b'<' && (t.as_bytes()[1] == b'h' || t.as_bytes()[1] == b'H') && t.as_bytes()[2].is_ascii_digit()
+    t.len() > 2
+        && t.as_bytes()[0] == b'<'
+        && (t.as_bytes()[1] == b'h' || t.as_bytes()[1] == b'H')
+        && t.as_bytes()[2].is_ascii_digit()
 }
 
 /// `re.fullmatch(r".*\s\d+", heref)`.
 fn ends_with_space_number(s: &str) -> bool {
     let t: Vec<char> = s.chars().collect();
     let mut i = t.len();
-    while i > 0 && t[i - 1].is_numeric() && t[i - 1].to_digit(10).is_some() {
+    while i > 0 && t[i - 1].is_numeric() && t[i - 1].is_ascii_digit() {
         i -= 1;
     }
     i < t.len() && i > 0 && t[i - 1].is_whitespace() && !s.contains('\n')
 }
 
 fn words_of(quote: &str) -> (Vec<String>, Vec<String>) {
-    let orig: Vec<String> = quote.split_whitespace().filter(|w| !norm_word(w).is_empty()).map(String::from).collect();
+    let orig: Vec<String> = quote
+        .split_whitespace()
+        .filter(|w| !norm_word(w).is_empty())
+        .map(String::from)
+        .collect();
     let norm = orig.iter().map(|w| norm_word(w)).collect();
     (orig, norm)
 }
@@ -1379,10 +1666,22 @@ fn verdict_of(r: f64, none: &str) -> String {
     }
 }
 
-fn run_check(python: &str, builder: &std::path::Path, otzaria: &std::path::Path, index: &std::path::Path) -> Value {
+fn run_check(
+    python: &str,
+    builder: &std::path::Path,
+    otzaria: &std::path::Path,
+    index: &std::path::Path,
+) -> Value {
     let mut cmd = std::process::Command::new(python);
-    cmd.arg(builder).arg("--check").arg("--json").arg("--otzaria-dir").arg(otzaria).arg("--index-dir").arg(index);
-    cmd.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.arg(builder)
+        .arg("--check")
+        .arg("--json")
+        .arg("--otzaria-dir")
+        .arg(otzaria)
+        .arg("--index-dir")
+        .arg(index);
+    cmd.stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     cmd.env("PYTHONIOENCODING", "utf-8");
     if let Some(dir) = builder.parent() {
         cmd.current_dir(dir);
@@ -1395,14 +1694,21 @@ fn run_check(python: &str, builder: &std::path::Path, otzaria: &std::path::Path,
     match cmd.output() {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
-            let last = text.lines().rev().find(|l| l.trim_start().starts_with('{')).unwrap_or("");
-            let mut v: Value = serde_json::from_str(last).unwrap_or_else(|_| json!({"error": "the builder printed no JSON"}));
+            let last = text
+                .lines()
+                .rev()
+                .find(|l| l.trim_start().starts_with('{'))
+                .unwrap_or("");
+            let mut v: Value = serde_json::from_str(last)
+                .unwrap_or_else(|_| json!({"error": "the builder printed no JSON"}));
             if let Value::Object(m) = &mut v {
                 m.entry("legacy").or_insert(json!(false));
             }
             v
         }
-        Ok(out) => json!({"error": format!("the builder's check failed (exit {:?})", out.status.code())}),
+        Ok(out) => {
+            json!({"error": format!("the builder's check failed (exit {:?})", out.status.code())})
+        }
         Err(e) => json!({"error": format!("cannot run {python}: {e}")}),
     }
 }

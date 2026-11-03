@@ -128,7 +128,11 @@ impl PersonalSet {
         let ij = Self::index_json(dir);
         let mtime = std::fs::metadata(&ij).and_then(|m| m.modified()).ok();
         let info: serde_json::Value = serde_json::from_slice(&std::fs::read(&ij)?)?;
-        let set = dir.join(info["set"].as_str().ok_or_else(|| anyhow!("index.json names no set"))?);
+        let set = dir.join(
+            info["set"]
+                .as_str()
+                .ok_or_else(|| anyhow!("index.json names no set"))?,
+        );
         let n = info["slots"].as_u64().unwrap_or(0) as usize;
         let dim = info["dim"].as_u64().unwrap_or(256) as usize;
         let (vectors, scales, slot_book, slot_line, slot_window) = if n > 0 {
@@ -145,10 +149,14 @@ impl PersonalSet {
         };
         if let Some(v) = &vectors {
             if v.len() < n * dim {
-                return Err(anyhow!("{}: vectors.i8 is shorter than {n} × {dim}", set.display()));
+                return Err(anyhow!(
+                    "{}: vectors.i8 is shorter than {n} × {dim}",
+                    set.display()
+                ));
             }
         }
-        let mut books: Vec<PersonalBook> = serde_json::from_slice(&std::fs::read(set.join("books.json"))?)?;
+        let mut books: Vec<PersonalBook> =
+            serde_json::from_slice(&std::fs::read(set.join("books.json"))?)?;
         // Otzaria may renumber personal books; links follow the file
         if let Some(db) = user_books_db.filter(|p| p.exists()) {
             if let Ok(ids) = user_book_ids(db) {
@@ -161,7 +169,11 @@ impl PersonalSet {
                 }
             }
         }
-        let by_key = books.iter().enumerate().map(|(i, b)| ((b.source(), b.book_id), i)).collect();
+        let by_key = books
+            .iter()
+            .enumerate()
+            .map(|(i, b)| ((b.source(), b.book_id), i))
+            .collect();
         Ok(PersonalSet {
             dir: dir.to_path_buf(),
             mtime,
@@ -190,7 +202,10 @@ impl PersonalSet {
 
     /// (book index, line index) of a slot.
     pub fn record(&self, slot: usize) -> (usize, i64) {
-        (Self::i32_at(&self.slot_book, slot) as usize, Self::i32_at(&self.slot_line, slot) as i64)
+        (
+            Self::i32_at(&self.slot_book, slot) as usize,
+            Self::i32_at(&self.slot_line, slot) as i64,
+        )
     }
 
     pub fn slot_window(&self, slot: usize) -> u8 {
@@ -225,7 +240,8 @@ impl PersonalSet {
                     if let Some(l) = &b.lib {
                         t.insert(l.trim());
                     }
-                    (inc.is_empty() || t.iter().any(|x| inc.contains(x))) && !t.iter().any(|x| exc.contains(x))
+                    (inc.is_empty() || t.iter().any(|x| inc.contains(x)))
+                        && !t.iter().any(|x| exc.contains(x))
                 })
                 .collect(),
         )
@@ -235,7 +251,12 @@ impl PersonalSet {
     /// (each query quantized to int8, as Otzaria's scanner does) keeps `kc` per query, which
     /// are then rescored exactly; a slot holding a later window of a long line scores
     /// [`WINDOW_PENALTY`] lower. Scores are cosine similarities.
-    pub fn scan(&self, queries: &[Vec<f32>], kc: usize, books: Option<&[bool]>) -> Vec<Vec<(f32, usize)>> {
+    pub fn scan(
+        &self,
+        queries: &[Vec<f32>],
+        kc: usize,
+        books: Option<&[bool]>,
+    ) -> Vec<Vec<(f32, usize)>> {
         let m = queries.len();
         if self.n == 0 || m == 0 || kc == 0 {
             return vec![Vec::new(); m];
@@ -248,7 +269,12 @@ impl PersonalSet {
                 if qs == 0.0 {
                     qs = 1.0;
                 }
-                (q.iter().map(|&x| (x / qs).round().clamp(-127.0, 127.0) as i8).collect(), qs)
+                (
+                    q.iter()
+                        .map(|&x| (x / qs).round().clamp(-127.0, 127.0) as i8)
+                        .collect(),
+                    qs,
+                )
             })
             .collect();
         let chunk = 1 << 16;
@@ -268,9 +294,17 @@ impl PersonalSet {
                     }
                     let codes = self.codes(slot);
                     let s = self.scale(slot);
-                    let pen = if self.slot_window(slot) > 0 { WINDOW_PENALTY } else { 0.0 };
+                    let pen = if self.slot_window(slot) > 0 {
+                        WINDOW_PENALTY
+                    } else {
+                        0.0
+                    };
                     for (qi, (qc, qs)) in quant.iter().enumerate() {
-                        let dot: i32 = codes.iter().zip(qc).map(|(&x, &y)| x as i32 * y as i32).sum();
+                        let dot: i32 = codes
+                            .iter()
+                            .zip(qc)
+                            .map(|(&x, &y)| x as i32 * y as i32)
+                            .sum();
                         heaps[qi].push(dot as f32 * s * qs - pen, slot);
                     }
                 }
@@ -279,15 +313,24 @@ impl PersonalSet {
             .collect();
         (0..m)
             .map(|qi| {
-                let mut all: Vec<(f32, usize)> = partial.iter().flat_map(|p| p[qi].iter().copied()).collect();
+                let mut all: Vec<(f32, usize)> =
+                    partial.iter().flat_map(|p| p[qi].iter().copied()).collect();
                 all.sort_by(|x, y| y.0.total_cmp(&x.0));
                 all.truncate(kc);
                 // exact rescore of what the int8 pass kept
                 let q = &queries[qi];
                 for e in all.iter_mut() {
                     let codes = self.codes(e.1);
-                    let dot: f32 = codes.iter().zip(q).map(|(&x, &y)| x as f32 * y).sum::<f32>();
-                    let pen = if self.slot_window(e.1) > 0 { WINDOW_PENALTY } else { 0.0 };
+                    let dot: f32 = codes
+                        .iter()
+                        .zip(q)
+                        .map(|(&x, &y)| x as f32 * y)
+                        .sum::<f32>();
+                    let pen = if self.slot_window(e.1) > 0 {
+                        WINDOW_PENALTY
+                    } else {
+                        0.0
+                    };
                     e.0 = dot * self.scale(e.1) - pen;
                 }
                 all.sort_by(|x, y| y.0.total_cmp(&x.0));
@@ -299,7 +342,9 @@ impl PersonalSet {
 
     /// The raw lines of a book (a small cache), and whether its text changed since indexing.
     pub fn lines_of(&self, bi: usize) -> (Option<std::sync::Arc<Vec<String>>>, bool) {
-        let Some(b) = self.books.get(bi) else { return (None, true) };
+        let Some(b) = self.books.get(bi) else {
+            return (None, true);
+        };
         let sig = match signature(b) {
             Some(s) => s,
             None => return (None, true),
@@ -320,7 +365,14 @@ impl PersonalSet {
         };
         let mut cache = self.cache.lock().unwrap();
         cache.retain(|(i, _)| *i != bi);
-        cache.push((bi, Cached { sig, lines: lines.clone(), stale }));
+        cache.push((
+            bi,
+            Cached {
+                sig,
+                lines: lines.clone(),
+                stale,
+            },
+        ));
         if cache.len() > 24 {
             cache.remove(0);
         }
@@ -337,7 +389,11 @@ struct TopK {
 
 impl TopK {
     fn new(k: usize) -> TopK {
-        TopK { k, items: Vec::with_capacity(k * 2), min: f32::NEG_INFINITY }
+        TopK {
+            k,
+            items: Vec::with_capacity(k * 2),
+            min: f32::NEG_INFINITY,
+        }
     }
 
     fn push(&mut self, s: f32, slot: usize) {
@@ -363,7 +419,11 @@ impl TopK {
 }
 
 fn signature(b: &PersonalBook) -> Option<(u64, Option<SystemTime>)> {
-    let p = if b.attached() { b.db.as_deref()? } else { b.path.as_deref()? };
+    let p = if b.attached() {
+        b.db.as_deref()?
+    } else {
+        b.path.as_deref()?
+    };
     let md = std::fs::metadata(p).ok()?;
     Some((md.len(), md.modified().ok()))
 }
@@ -395,12 +455,19 @@ pub fn read_book(b: &PersonalBook) -> Result<Vec<String>> {
 /// Every line of a book of an Otzaria-format database, by line index (gaps empty).
 pub fn attached_book_lines(db: &Path, book: i64) -> Result<Vec<String>> {
     let conn = match connect_ro(db, false) {
-        Ok(c) if c.query_row("SELECT count(*) FROM book", [], |_| Ok(())).is_ok() => c,
+        Ok(c)
+            if c.query_row("SELECT count(*) FROM book", [], |_| Ok(()))
+                .is_ok() =>
+        {
+            c
+        }
         _ => connect_ro(db, true)?,
     };
     let compressed = has_table(&conn, "line_content")? && {
         let mut stmt = conn.prepare("PRAGMA table_info(line)")?;
-        let cols: HashSet<String> = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<_>>()?;
+        let cols: HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
         !cols.contains("content")
     };
     let mut codec = LineCodec::load(&conn)?;
@@ -443,7 +510,12 @@ pub fn text_hash(lines: &[String]) -> (String, usize) {
 
 fn user_book_ids(db: &Path) -> Result<HashMap<String, i64>> {
     let conn = match connect_ro(db, false) {
-        Ok(c) if c.query_row("SELECT count(*) FROM book", [], |_| Ok(())).is_ok() => c,
+        Ok(c)
+            if c.query_row("SELECT count(*) FROM book", [], |_| Ok(()))
+                .is_ok() =>
+        {
+            c
+        }
         _ => connect_ro(db, true)?,
     };
     let mut stmt = conn.prepare("SELECT id, filePath FROM book WHERE filePath IS NOT NULL")?;

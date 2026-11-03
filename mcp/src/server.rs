@@ -32,12 +32,25 @@ pub struct SemanticTools {
 }
 
 impl SemanticTools {
-    fn context_opts(&self, context: Option<i64>, if_shorter: Option<i64>, chars: Option<i64>) -> serde_json::Value {
+    fn context_opts(
+        &self,
+        context: Option<i64>,
+        if_shorter: Option<i64>,
+        chars: Option<i64>,
+    ) -> serde_json::Value {
         let (mut lines, mut shorter) = (1i64, 80i64);
         if let Some(p) = &self.plugin_data {
-            if let Ok(v) = std::fs::read(p).map(|b| serde_json::from_slice::<serde_json::Value>(&b).unwrap_or_default()) {
-                lines = v.get("contextLines").and_then(|x| x.as_i64()).unwrap_or(lines);
-                shorter = v.get("contextIfShorter").and_then(|x| x.as_i64()).unwrap_or(shorter);
+            if let Ok(v) = std::fs::read(p)
+                .map(|b| serde_json::from_slice::<serde_json::Value>(&b).unwrap_or_default())
+            {
+                lines = v
+                    .get("contextLines")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(lines);
+                shorter = v
+                    .get("contextIfShorter")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(shorter);
             }
         }
         json!({"context": context.unwrap_or(lines), "context_if_shorter": if_shorter.unwrap_or(shorter),
@@ -457,7 +470,6 @@ fn invalid(e: impl std::fmt::Display) -> ErrorData {
 
 // ── tools ─────────────────────────────────────────────────────────────────────
 
-
 // ── semantic tool parameters (as otzaria_mcp.py declared them) ───────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -556,7 +568,10 @@ pub struct SemanticGetTextParams {
 #[tool_router]
 impl OtzariaServer {
     pub fn new(lib: Arc<Library>) -> Self {
-        Self { lib, semantic: None }
+        Self {
+            lib,
+            semantic: None,
+        }
     }
 
     pub fn with_semantic(mut self, tools: SemanticTools) -> Self {
@@ -1114,7 +1129,6 @@ impl OtzariaServer {
         self.respond(&snap, to_json(view)?)
     }
 
-
     // ── semantic tools (the former otzaria-semantic MCP) ─────────────────────
 
     #[tool(
@@ -1131,7 +1145,10 @@ impl OtzariaServer {
                        full_text_search is more precise.",
         annotations(read_only_hint = true)
     )]
-    pub async fn otzaria_search(&self, Parameters(p): Parameters<SemanticSearchParams>) -> Result<CallToolResult, ErrorData> {
+    pub async fn otzaria_search(
+        &self,
+        Parameters(p): Parameters<SemanticSearchParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let sem = self.semantic_tools()?;
         let k = p.k.unwrap_or(8);
         let mut body = sem.context_opts(p.context, p.context_if_shorter, None);
@@ -1141,9 +1158,15 @@ impl OtzariaServer {
         b.insert("min_score".into(), json!(p.min_score.unwrap_or(0.55)));
         b.insert("max_per_book".into(), json!(2));
         b.insert("categories".into(), json!(p.categories.unwrap_or_default()));
-        b.insert("exclude_categories".into(), json!(p.exclude_categories.unwrap_or_default()));
+        b.insert(
+            "exclude_categories".into(),
+            json!(p.exclude_categories.unwrap_or_default()),
+        );
         let q = p.query.clone();
-        semantic_call(sem, "/search", body, move |out| crate::semantic::format::search(&q, out, 320)).await
+        semantic_call(sem, "/search", body, move |out| {
+            crate::semantic::format::search(&q, out, 320)
+        })
+        .await
     }
 
     #[tool(
@@ -1172,7 +1195,10 @@ impl OtzariaServer {
                        full_text_search and pass book_id + line_index.",
         annotations(read_only_hint = true)
     )]
-    pub async fn otzaria_check_quote(&self, Parameters(p): Parameters<CheckQuoteParams>) -> Result<CallToolResult, ErrorData> {
+    pub async fn otzaria_check_quote(
+        &self,
+        Parameters(p): Parameters<CheckQuoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let sem = self.semantic_tools()?;
         let mut body = json!({"quote": p.quote,
                               "categories": p.categories.unwrap_or_default(),
@@ -1191,7 +1217,10 @@ impl OtzariaServer {
             b.insert("span".into(), json!(v));
         }
         let q = p.quote.clone();
-        semantic_call(sem, "/check_quote", body, move |out| crate::semantic::format::check_quote(&q, out)).await
+        semantic_call(sem, "/check_quote", body, move |out| {
+            crate::semantic::format::check_quote(&q, out)
+        })
+        .await
     }
 
     #[tool(
@@ -1204,7 +1233,10 @@ impl OtzariaServer {
                        rule) and for flagging sources the author may be alluding to.",
         annotations(read_only_hint = true)
     )]
-    pub async fn otzaria_find_parallels(&self, Parameters(p): Parameters<FindParallelsParams>) -> Result<CallToolResult, ErrorData> {
+    pub async fn otzaria_find_parallels(
+        &self,
+        Parameters(p): Parameters<FindParallelsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let sem = self.semantic_tools()?;
         let mut body = sem.context_opts(p.context, p.context_if_shorter, None);
         let b = body.as_object_mut().unwrap();
@@ -1215,8 +1247,14 @@ impl OtzariaServer {
         b.insert("max_per_book".into(), json!(2));
         b.insert("cited".into(), json!(p.cited.unwrap_or_default()));
         b.insert("categories".into(), json!(p.categories.unwrap_or_default()));
-        b.insert("exclude_categories".into(), json!(p.exclude_categories.unwrap_or_default()));
-        semantic_call(sem, "/related", body, |out| crate::semantic::format::parallels(out, 280)).await
+        b.insert(
+            "exclude_categories".into(),
+            json!(p.exclude_categories.unwrap_or_default()),
+        );
+        semantic_call(sem, "/related", body, |out| {
+            crate::semantic::format::parallels(out, 280)
+        })
+        .await
     }
 
     #[tool(
@@ -1226,15 +1264,22 @@ impl OtzariaServer {
                        heading path, the centre line marked >>. For library books use get_text.",
         annotations(read_only_hint = true)
     )]
-    pub async fn otzaria_get_text(&self, Parameters(p): Parameters<SemanticGetTextParams>) -> Result<CallToolResult, ErrorData> {
+    pub async fn otzaria_get_text(
+        &self,
+        Parameters(p): Parameters<SemanticGetTextParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let sem = self.semantic_tools()?;
-        let body = json!({"url": p.url, "before": p.before.unwrap_or(2), "after": p.after.unwrap_or(6)});
+        let body =
+            json!({"url": p.url, "before": p.before.unwrap_or(2), "after": p.after.unwrap_or(6)});
         semantic_call(sem, "/text", body, crate::semantic::format::get_text).await
     }
 
     fn semantic_tools(&self) -> Result<Arc<SemanticTools>, ErrorData> {
         self.semantic.clone().ok_or_else(|| {
-            ErrorData::internal_error("the semantic tools are off in this server (--no-semantic)", None)
+            ErrorData::internal_error(
+                "the semantic tools are off in this server (--no-semantic)",
+                None,
+            )
         })
     }
 
@@ -1292,7 +1337,6 @@ impl ServerHandler for OtzariaServer {
     }
 }
 
-
 /// Forward a semantic tool's call to the daemon and format its answer as text; a failure is
 /// the tool's error text, as otzaria_mcp.py reported it.
 async fn semantic_call<F>(
@@ -1311,7 +1355,9 @@ where
         Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
         Err(e) => {
             eprintln!("otzaria-mcp: {path} failed: {e:#}");
-            Ok(CallToolResult::error(vec![ContentBlock::text(format!("Error: {e:#}"))]))
+            Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Error: {e:#}"
+            ))]))
         }
     }
 }
