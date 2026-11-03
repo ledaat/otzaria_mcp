@@ -20,6 +20,29 @@ use crate::secondary::Source;
 #[derive(Clone)]
 pub struct OtzariaServer {
     lib: Arc<Library>,
+    /// The semantic tools, answered by the `--http` daemon (None: --no-semantic).
+    semantic: Option<Arc<SemanticTools>>,
+}
+
+/// What the semantic tools need: the daemon, and the Obsidian plugin's context settings
+/// (`data.json`: contextLines, contextIfShorter), so one setting governs panel and tools.
+pub struct SemanticTools {
+    pub client: crate::semantic::client::DaemonClient,
+    pub plugin_data: Option<std::path::PathBuf>,
+}
+
+impl SemanticTools {
+    fn context_opts(&self, context: Option<i64>, if_shorter: Option<i64>, chars: Option<i64>) -> serde_json::Value {
+        let (mut lines, mut shorter) = (1i64, 80i64);
+        if let Some(p) = &self.plugin_data {
+            if let Ok(v) = std::fs::read(p).map(|b| serde_json::from_slice::<serde_json::Value>(&b).unwrap_or_default()) {
+                lines = v.get("contextLines").and_then(|x| x.as_i64()).unwrap_or(lines);
+                shorter = v.get("contextIfShorter").and_then(|x| x.as_i64()).unwrap_or(shorter);
+            }
+        }
+        json!({"context": context.unwrap_or(lines), "context_if_shorter": if_shorter.unwrap_or(shorter),
+               "context_chars": chars.unwrap_or(300)})
+    }
 }
 
 // ── tool parameter schemas ───────────────────────────────────────────────────
@@ -434,10 +457,111 @@ fn invalid(e: impl std::fmt::Display) -> ErrorData {
 
 // ── tools ─────────────────────────────────────────────────────────────────────
 
+
+// ── semantic tool parameters (as otzaria_mcp.py declared them) ───────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SemanticSearchParams {
+    /// Hebrew/Aramaic query: a paraphrase, a sevara, or a quotation.
+    pub query: String,
+    /// Number of passages (default 8, max ~25).
+    #[serde(default)]
+    pub k: Option<i64>,
+    /// Similarity threshold (default 0.55).
+    #[serde(default)]
+    pub min_score: Option<f64>,
+    /// Only search these Otzaria categories, including everything filed under them: titles as
+    /// in the library tree or category ids, e.g. ["תלמוד בבלי"] or ["12"]. Ids are the
+    /// category_id values of browse_categories.
+    #[serde(default)]
+    pub categories: Option<Vec<String>>,
+    /// Leave these categories out (titles or ids), e.g. ["מחברי זמננו"].
+    #[serde(default)]
+    pub exclude_categories: Option<Vec<String>>,
+    /// Lines of context to show before and after each hit (↑ / ↓), for passages too short to
+    /// understand alone (0-5). Default: the Otzaria Sources plugin setting (1).
+    #[serde(default)]
+    pub context: Option<i64>,
+    /// Add context only to hits shorter than this many characters; 0 = to every hit.
+    /// Default: the plugin setting (80).
+    #[serde(default)]
+    pub context_if_shorter: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckQuoteParams {
+    /// The quoted words, as they appear in the source being processed.
+    pub quote: String,
+    /// Library book id, from resolve_ref / search_books / full_text_search / get_book_toc.
+    #[serde(default)]
+    pub book_id: Option<i64>,
+    /// 0-based line index in that book where scanning starts.
+    #[serde(default)]
+    pub line_index: Option<i64>,
+    /// otzaria://open/book/<id>?index=<line>, with source=user or source=db:<library> for
+    /// personal and database books, as otzaria_search returns it.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Lines to scan from the location (default 80, max 400).
+    #[serde(default)]
+    pub span: Option<i64>,
+    /// Only these categories (titles or ids).
+    #[serde(default)]
+    pub categories: Option<Vec<String>>,
+    /// Leave these categories out (titles or ids).
+    #[serde(default)]
+    pub exclude_categories: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindParallelsParams {
+    /// Draft note body (markdown is fine).
+    pub text: String,
+    /// Note title (claim-stating titles make good queries).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Number of candidates (default 10).
+    #[serde(default)]
+    pub k: Option<i64>,
+    /// otzaria:// urls or Hebrew refs already cited, to be flagged.
+    #[serde(default)]
+    pub cited: Option<Vec<String>>,
+    /// Only these categories (titles or ids).
+    #[serde(default)]
+    pub categories: Option<Vec<String>>,
+    /// Leave these categories out (titles or ids).
+    #[serde(default)]
+    pub exclude_categories: Option<Vec<String>>,
+    /// Lines of context before and after each hit (0-5). Default: the plugin setting (1).
+    #[serde(default)]
+    pub context: Option<i64>,
+    /// Add context only to hits shorter than this many characters; 0 = every hit.
+    #[serde(default)]
+    pub context_if_shorter: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SemanticGetTextParams {
+    /// otzaria://open/book/<id>?index=<line>, with source=user or source=db:<library> for
+    /// personal and database books, as otzaria_search returns it.
+    pub url: String,
+    /// Lines before (default 2, max 40).
+    #[serde(default)]
+    pub before: Option<i64>,
+    /// Lines after (default 6, max 80).
+    #[serde(default)]
+    pub after: Option<i64>,
+}
+
 #[tool_router]
 impl OtzariaServer {
     pub fn new(lib: Arc<Library>) -> Self {
-        Self { lib }
+        Self { lib, semantic: None }
+    }
+
+    pub fn with_semantic(mut self, tools: SemanticTools) -> Self {
+        self.semantic = Some(Arc::new(tools));
+        self
     }
 
     #[tool(
@@ -990,6 +1114,130 @@ impl OtzariaServer {
         self.respond(&snap, to_json(view)?)
     }
 
+
+    // ── semantic tools (the former otzaria-semantic MCP) ─────────────────────
+
+    #[tool(
+        name = "otzaria_search",
+        description = "Semantic search over the whole Otzaria library (Tanakh, Shas, rishonim, acharonim, \
+                       shu\"t, contemporary works), plus Philo's personal seforim and attached book databases \
+                       once their index is built with the library's model (marked by a source=user / \
+                       source=db:... url), with Otzaria's own Hebrew/Aramaic model. Best for locating a source \
+                       from a paraphrase or loose citation (e.g. 'כמש\"כ התוס' שאין מוקצה אלא בטלטול', 'עי' \
+                       בקצוה\"ח'), or a passage discussing a given sevara. Phrase the query in Hebrew/Aramaic \
+                       like the text you expect to find. Returns Hebrew refs, snippets and otzaria:// links. \
+                       Hits are leads, not facts: read the passage before relying on it (get_text; \
+                       otzaria_get_text for personal/database hits). For words you know verbatim, \
+                       full_text_search is more precise.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn otzaria_search(&self, Parameters(p): Parameters<SemanticSearchParams>) -> Result<CallToolResult, ErrorData> {
+        let sem = self.semantic_tools()?;
+        let k = p.k.unwrap_or(8);
+        let mut body = sem.context_opts(p.context, p.context_if_shorter, None);
+        let b = body.as_object_mut().unwrap();
+        b.insert("query".into(), json!(p.query));
+        b.insert("k".into(), json!(k));
+        b.insert("min_score".into(), json!(p.min_score.unwrap_or(0.55)));
+        b.insert("max_per_book".into(), json!(2));
+        b.insert("categories".into(), json!(p.categories.unwrap_or_default()));
+        b.insert("exclude_categories".into(), json!(p.exclude_categories.unwrap_or_default()));
+        let q = p.query.clone();
+        semantic_call(sem, "/search", body, move |out| crate::semantic::format::search(&q, out, 320)).await
+    }
+
+    #[tool(
+        name = "otzaria_check_quote",
+        description = "Check a quotation (e.g. an OCR'd citation from a sefer) against the library: finds the \
+                       best-matching line, returns the library's exact wording, a word-level list of differences \
+                       (OCR errors, girsa variants, abbreviations), a verdict (exact / close, with variants / \
+                       partial or paraphrased / not found) and other places with the same text. Among passages \
+                       that match about equally well (within one word, or 5%, of the closest), the earliest work \
+                       is reported as the source (era from the library's generations: תורה שבכתב, חז\"ל — \
+                       tannaitic texts before the Yerushalmi before the Bavli before later midrash —, ראשונים, \
+                       אחרונים, מחברי זמננו; base books before their commentaries; library books before \
+                       attached-database and personal books), so the base text comes before the works that \
+                       quote it; when a later work matches the quote clearly better (the author used its \
+                       girsa), it is reported as 'closest wording' too. Differences are reported, never silently \
+                       corrected: decide whether each is an OCR error (fix) or a real variant in the author's \
+                       text (keep, and mention in the report). Abbreviation differences (אע\"ג / אף על גב) are \
+                       recognized and listed separately. When the author gives a location, resolve it first \
+                       (resolve_ref, or search_books + get_book_toc) and pass book_id + line_index (or a url): \
+                       the quote is then aligned against the text from there on (span lines). Without a \
+                       location, the line is found through the vector index: one vector for a line's first 512 \
+                       characters, and for a longer line up to 5 more for later 512-character stretches \
+                       (overlapping by 128, so about the first 2,500 characters are covered). A short quote \
+                       matches a whole 512-character stretch only loosely, and later stretches rank a little \
+                       lower, so a quote from deep inside a long dibbur can still be missed: then find it with \
+                       full_text_search and pass book_id + line_index.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn otzaria_check_quote(&self, Parameters(p): Parameters<CheckQuoteParams>) -> Result<CallToolResult, ErrorData> {
+        let sem = self.semantic_tools()?;
+        let mut body = json!({"quote": p.quote,
+                              "categories": p.categories.unwrap_or_default(),
+                              "exclude_categories": p.exclude_categories.unwrap_or_default()});
+        let b = body.as_object_mut().unwrap();
+        if let Some(u) = p.url.filter(|u| !u.is_empty()) {
+            b.insert("url".into(), json!(u));
+        }
+        if let Some(v) = p.book_id {
+            b.insert("book_id".into(), json!(v));
+        }
+        if let Some(v) = p.line_index {
+            b.insert("line_index".into(), json!(v));
+        }
+        if let Some(v) = p.span {
+            b.insert("span".into(), json!(v));
+        }
+        let q = p.quote.clone();
+        semantic_call(sem, "/check_quote", body, move |out| crate::semantic::format::check_quote(&q, out)).await
+    }
+
+    #[tool(
+        name = "otzaria_find_parallels",
+        description = "Candidate parallels in the library for a draft note (title + body): the note is cut \
+                       into passages, all searched, results merged and deduplicated. Output is explicitly \
+                       UNVERIFIED and is for the post-session report (דו\"ח) only: never write these into a \
+                       note body, footnote, link or tag unless Philo confirms the sefer itself draws the \
+                       connection. Useful for judging whether a proposed tag's structure recurs (two-instance \
+                       rule) and for flagging sources the author may be alluding to.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn otzaria_find_parallels(&self, Parameters(p): Parameters<FindParallelsParams>) -> Result<CallToolResult, ErrorData> {
+        let sem = self.semantic_tools()?;
+        let mut body = sem.context_opts(p.context, p.context_if_shorter, None);
+        let b = body.as_object_mut().unwrap();
+        b.insert("text".into(), json!(p.text));
+        b.insert("title".into(), json!(p.title.unwrap_or_default()));
+        b.insert("k".into(), json!(p.k.unwrap_or(10)));
+        b.insert("min_score".into(), json!(0.6));
+        b.insert("max_per_book".into(), json!(2));
+        b.insert("cited".into(), json!(p.cited.unwrap_or_default()));
+        b.insert("categories".into(), json!(p.categories.unwrap_or_default()));
+        b.insert("exclude_categories".into(), json!(p.exclude_categories.unwrap_or_default()));
+        semantic_call(sem, "/related", body, |out| crate::semantic::format::parallels(out, 280)).await
+    }
+
+    #[tool(
+        name = "otzaria_get_text",
+        description = "Verbatim text of Philo's personal seforim and attached book databases around a search \
+                       hit, given its otzaria:// url (source=user / source=db:...): numbered lines with the \
+                       heading path, the centre line marked >>. For library books use get_text.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn otzaria_get_text(&self, Parameters(p): Parameters<SemanticGetTextParams>) -> Result<CallToolResult, ErrorData> {
+        let sem = self.semantic_tools()?;
+        let body = json!({"url": p.url, "before": p.before.unwrap_or(2), "after": p.after.unwrap_or(6)});
+        semantic_call(sem, "/text", body, crate::semantic::format::get_text).await
+    }
+
+    fn semantic_tools(&self) -> Result<Arc<SemanticTools>, ErrorData> {
+        self.semantic.clone().ok_or_else(|| {
+            ErrorData::internal_error("the semantic tools are off in this server (--no-semantic)", None)
+        })
+    }
+
     fn search_of(&self, snap: &Snapshot) -> Result<Arc<search::Search>, ErrorData> {
         snap.search.clone().ok_or_else(|| {
             ErrorData::internal_error(
@@ -1035,8 +1283,36 @@ impl ServerHandler for OtzariaServer {
                  search_facet_counts to see where a phrase occurs); get_book_info has authors, era, \
                  publication data and descriptions; library_info reports versions and status. Every \
                  response includes schema_version (library db_version) and data_version (snapshot \
-                 fingerprint).",
+                 fingerprint). Meaning-based tools, over Otzaria's own semantic model and vectors: \
+                 otzaria_search (semantic search, personal and database books too), otzaria_check_quote \
+                 (a quotation's earliest source and its word-level variants), otzaria_find_parallels \
+                 (candidate parallels for a draft note: report only) and otzaria_get_text (personal and \
+                 database books). Treat semantic results as leads to verify.",
             )
+    }
+}
+
+
+/// Forward a semantic tool's call to the daemon and format its answer as text; a failure is
+/// the tool's error text, as otzaria_mcp.py reported it.
+async fn semantic_call<F>(
+    sem: Arc<SemanticTools>,
+    path: &'static str,
+    body: serde_json::Value,
+    format: F,
+) -> Result<CallToolResult, ErrorData>
+where
+    F: FnOnce(&serde_json::Value) -> String + Send + 'static,
+{
+    let out = tokio::task::spawn_blocking(move || sem.client.call(path, &body).map(|v| format(&v)))
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    match out {
+        Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
+        Err(e) => {
+            eprintln!("otzaria-mcp: {path} failed: {e:#}");
+            Ok(CallToolResult::error(vec![ContentBlock::text(format!("Error: {e:#}"))]))
+        }
     }
 }
 

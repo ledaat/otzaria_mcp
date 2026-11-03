@@ -3,6 +3,13 @@
     "otzaria": {
       "command": "/ABSOLUTE/PATH/TO/otzaria_mcp/run-stdio.sh",
       "args": ["--data-dir", "/ABSOLUTE/PATH/TO/otzaria_latest"]
+    },
+    "otzaria-windows-example": {
+      "command": "C:\\Tools\\otzaria-mcp.exe",
+      "args": [
+        "--plugin-data", "C:\\Users\\<you>\\Documents\\Obsidian Vault\\.obsidian\\plugins\\otzaria-sources\\data.json",
+        "--builder", "C:\\Users\\<you>\\Documents\\Obsidian Vault\\.obsidian\\plugins\\otzaria-sources\\build_personal_index.py"
+      ]
     }
   }
 }
