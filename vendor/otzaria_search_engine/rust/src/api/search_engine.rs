@@ -5,6 +5,7 @@ use log::{debug, error, info, warn};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::num::NonZeroUsize;
@@ -315,6 +316,60 @@ pub struct PdfPageInput {
     pub reference: String,
     pub text: String,
     pub page_index: u32,
+}
+
+/// Internal page representation: the byte API borrows valid UTF-8 instead of
+/// allocating and copying the entire book into per-page Strings. Only malformed
+/// slices need owned replacement text. The existing API moves its Strings here.
+struct PdfPageText<'a> {
+    reference: Cow<'a, str>,
+    text: Cow<'a, str>,
+    page_index: u32,
+}
+
+/// Validate the complete buffer before decoding any page or touching the index.
+fn pdf_pages_from_bytes<'a>(
+    bytes: &'a [u8],
+    ends: &[u32],
+    page_indexes: &[u32],
+) -> Result<Vec<PdfPageText<'a>>> {
+    let (pairs, remainder) = ends.as_chunks::<2>();
+    anyhow::ensure!(
+        remainder.is_empty() && pairs.len() == page_indexes.len(),
+        "add_pdf_book_bytes: {} ends for {} pages",
+        ends.len(),
+        page_indexes.len()
+    );
+    let mut start = 0usize;
+    for &end in ends {
+        let end = end as usize;
+        anyhow::ensure!(
+            (start..=bytes.len()).contains(&end),
+            "add_pdf_book_bytes: ends out of order or past the buffer"
+        );
+        start = end;
+    }
+    anyhow::ensure!(
+        start == bytes.len(),
+        "add_pdf_book_bytes: ends do not cover the complete buffer"
+    );
+    start = 0;
+    let mut take = |end: u32| {
+        let end = end as usize;
+        // All ranges were checked above; lossy decoding allocates only on error.
+        let text = String::from_utf8_lossy(&bytes[start..end]);
+        start = end;
+        text
+    };
+    Ok(page_indexes
+        .iter()
+        .zip(pairs)
+        .map(|(&page_index, &[reference_end, text_end])| PdfPageText {
+            reference: take(reference_end),
+            text: take(text_end),
+            page_index,
+        })
+        .collect())
 }
 
 pub struct HighlightConfig {
@@ -784,6 +839,8 @@ pub struct SemanticVectorsInfo {
     pub present: bool,
     /// The set's identity as 64 hex digits: what a release must name to be installed.
     pub identity_digest: String,
+    /// The model family bound into the installed set's identity, empty when absent.
+    pub model_family_id: String,
     pub library_version: u32,
     pub library_release_tag: String,
     pub generation: u64,
@@ -1679,6 +1736,7 @@ fn vectors_info(
         return SemanticVectorsInfo {
             present: false,
             identity_digest: String::new(),
+            model_family_id: String::new(),
             library_version: 0,
             library_release_tag: String::new(),
             generation: 0,
@@ -1693,6 +1751,7 @@ fn vectors_info(
     SemanticVectorsInfo {
         present: true,
         identity_digest: info.identity_digest,
+        model_family_id: info.identity.model.family_id,
         library_version: info.library_version,
         library_release_tag: info.library_release_tag,
         generation: info.generation,
@@ -4788,7 +4847,7 @@ pub struct SearchEngine {
     dictionary_epoch: u64,
     memory_epoch: std::sync::atomic::AtomicU64,
     /// Request ids of running lexical searches: see [`crate::lexical_cancellation`].
-    lexical_cancellations: LexicalCancellations,
+    lexical_cancellations: Arc<LexicalCancellations>,
     /// Which book holds which number (see [`crate::book_order`]): read from the index when
     /// first needed.
     book_numbers: Mutex<Option<BookNumbers>>,
@@ -4985,7 +5044,7 @@ impl SearchEngine {
             grouped_cache: GroupCache::default(),
             dictionary_epoch: book_order::next_epoch(),
             memory_epoch: std::sync::atomic::AtomicU64::default(),
-            lexical_cancellations: LexicalCancellations::default(),
+            lexical_cancellations: Arc::default(),
             book_numbers: Mutex::new(None),
             numbers_stale: AtomicBool::new(true),
             book_order: RwLock::new(BookOrderState::read(Path::new(path))),
@@ -5066,7 +5125,7 @@ impl SearchEngine {
             grouped_cache: GroupCache::default(),
             dictionary_epoch: book_order::next_epoch(),
             memory_epoch: std::sync::atomic::AtomicU64::default(),
-            lexical_cancellations: LexicalCancellations::default(),
+            lexical_cancellations: Arc::default(),
             book_numbers: Mutex::new(None),
             numbers_stale: AtomicBool::new(true),
             book_order: RwLock::new(BookOrderState::read(path)),
@@ -5463,7 +5522,8 @@ impl SearchEngine {
     /// keeps its existing fuzzy behaviour (no error is surfaced, so the app can
     /// call this unconditionally at startup). Does **not** affect exact or
     /// advanced search.
-    #[frb(sync)]
+    /// Dictionary bindings are asynchronous: loading does disk I/O, and even
+    /// status queries can wait for an indexing operation to release the engine.
     pub fn set_magic_dictionary_path(&mut self, path: String) -> bool {
         self.dictionary_epoch = book_order::next_epoch();
         self.highlight_cache.clear();
@@ -5487,7 +5547,6 @@ impl SearchEngine {
 
     /// Whether a lexical dictionary is currently loaded (i.e. approximate search
     /// will use morphological expansion).
-    #[frb(sync)]
     pub fn has_magic_dictionary(&self) -> bool {
         self.magic_dict.is_some()
     }
@@ -5496,7 +5555,6 @@ impl SearchEngine {
     /// עבור אפשרות "תרגום ארמי" בחיפוש המתקדם. מחזיר `true` אם הקובץ נטען;
     /// `false` אם חסר/פגום — ואז האפשרות לא מרחיבה דבר (אין שגיאה כלפי
     /// האפליקציה, שיכולה לקרוא לזה ללא תנאי באתחול).
-    #[frb(sync)]
     pub fn set_translation_dictionary_path(&mut self, path: String) -> bool {
         self.dictionary_epoch = book_order::next_epoch();
         self.highlight_cache.clear();
@@ -5520,7 +5578,6 @@ impl SearchEngine {
     }
 
     /// האם מילון תרגום ארמי-עברי טעון כרגע.
-    #[frb(sync)]
     pub fn has_translation_dictionary(&self) -> bool {
         self.translation_dict.is_some()
     }
@@ -5529,7 +5586,6 @@ impl SearchEngine {
     /// אפשרות "ראשי תיבות" בחיפוש המתקדם. מחזיר `true` אם הקובץ נטען;
     /// `false` אם חסר/פגום — ואז האפשרות לא מרחיבה דבר (אין שגיאה כלפי
     /// האפליקציה, שיכולה לקרוא לזה ללא תנאי באתחול).
-    #[frb(sync)]
     pub fn set_acronyms_dictionary_path(&mut self, path: String) -> bool {
         self.dictionary_epoch = book_order::next_epoch();
         self.highlight_cache.clear();
@@ -5553,7 +5609,6 @@ impl SearchEngine {
     }
 
     /// האם מילון ראשי-תיבות טעון כרגע.
-    #[frb(sync)]
     pub fn has_acronyms_dictionary(&self) -> bool {
         self.acronym_dict.is_some()
     }
@@ -6876,7 +6931,16 @@ impl SearchEngine {
                 self.semantic_sessions.epoch(),
                 limit,
             );
-            let kept = self.semantic_sessions.get(&key);
+            // A search whose semantic half failed is searched again, but its pages still page.
+            let kept = self.semantic_sessions.get(&key).filter(|kept| {
+                offset > 0
+                    || kept
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .state
+                        .fallback_reason
+                        .is_none()
+            });
             let session_restarted = offset > 0 && kept.is_none();
             let offset = if session_restarted { 0 } else { offset };
             let shared = kept.unwrap_or_else(|| {
@@ -7722,7 +7786,7 @@ impl SearchEngine {
     }
 
     /// Plan an opened vector set's scan (see `crate::semantic_moves`) for the search's filter
-    /// and the foundational books' query; a filter that cannot be planned fails the semantic half.
+    /// and the foundational books' query; a filter that cannot be planned goes unplanned.
     #[cfg(feature = "semantic-integration")]
     fn plan_semantic_scan(
         &self,
@@ -7748,16 +7812,12 @@ impl SearchEngine {
         else {
             return Ok(());
         };
-        // A filtered plan that cannot be made fails the semantic half alone; an unfiltered
-        // one goes unplanned.
+        // A plan that cannot be made leaves the search unplanned, as an unfiltered one: the
+        // app's whole-library search is filtered by "/", and must not fail with it.
         match resolver.plan(filters, &view, cancel) {
             Ok(_) => {}
             Err(ResolveError::Cancelled) => return Err(SemanticError::cancelled()),
-            Err(error) => {
-                warn!("a filtered semantic search could not be planned: {error}");
-                resolver.fail(error);
-                return Ok(());
-            }
+            Err(error) => warn!("a filtered semantic search goes unplanned: {error}"),
         }
         if !PLAN_FOUNDATIONAL_QUERY
             || request.ranking.foundational_candidate_share <= 0.0
@@ -9016,6 +9076,25 @@ impl SearchEngine {
         pages: Vec<PdfPageInput>,
         extra_facets: Option<Vec<String>>,
     ) -> Result<u32> {
+        let pages = pages
+            .into_iter()
+            .map(|page| PdfPageText {
+                reference: Cow::Owned(page.reference),
+                text: Cow::Owned(page.text),
+                page_index: page.page_index,
+            })
+            .collect();
+        self.add_pdf_pages(title, topics, file_path, pages, extra_facets)
+    }
+
+    fn add_pdf_pages(
+        &mut self,
+        title: String,
+        topics: String,
+        file_path: String,
+        pages: Vec<PdfPageText<'_>>,
+        extra_facets: Option<Vec<String>>,
+    ) -> Result<u32> {
         if pages.is_empty() {
             return Ok(0);
         }
@@ -9104,7 +9183,7 @@ impl SearchEngine {
             let line_hash = line_dedup_hash(&normalized);
             let mut document = doc!(
                 title_f        => title.as_str(),
-                reference_f    => page.reference.as_str(),
+                reference_f    => page.reference.as_ref(),
                 text_f         => normalized.as_str(),
                 id_f           => id,
                 is_pdf_f       => true,
@@ -9142,6 +9221,38 @@ impl SearchEngine {
             started.elapsed()
         );
         Ok(ordinal as u32)
+    }
+
+    /// [`Self::add_pdf_book`] with the pages packed into one UTF-8 buffer:
+    /// page `i` is `ends[2i]` (end of its reference) and `ends[2i + 1]` (end of
+    /// its text), each slice starting where the previous one ended, and its
+    /// index is `page_indexes[i]`.
+    ///
+    /// The bridge decodes arguments on the caller's thread, and decoding a large
+    /// `Vec<PdfPageInput>` there froze the app's UI (Otzaria/otzaria#3443). A
+    /// buffer the app packs off its UI isolate crosses as a copy; UTF-8 is
+    /// checked here, on the worker. Valid slices borrow the input buffer without
+    /// per-page text copies. Invalid UTF-8 (including a split code point) is
+    /// replaced. End offsets must be nondecreasing and cover the entire buffer;
+    /// equal offsets allow empty references/texts. Malformed offsets return an
+    /// error before any document is added.
+    ///
+    /// Packing off the UI isolate does not remove the bridge's synchronous
+    /// O(bytes) transfer. Use Uint8List/Uint32List on Dart to avoid list conversion;
+    /// large books can still block the caller during the transfer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_pdf_book_bytes(
+        &mut self,
+        title: String,
+        topics: String,
+        file_path: String,
+        bytes: Vec<u8>,
+        ends: Vec<u32>,
+        page_indexes: Vec<u32>,
+        extra_facets: Option<Vec<String>>,
+    ) -> Result<u32> {
+        let pages = pdf_pages_from_bytes(&bytes, &ends, &page_indexes)?;
+        self.add_pdf_pages(title, topics, file_path, pages, extra_facets)
     }
 
     /// Delete then re-insert a single line, by the id [`Self::add_document`] composes for
@@ -9422,7 +9533,8 @@ impl SearchEngine {
     }
 
     /// The revision of the order mapping: 0 before any [`Self::set_book_order`].
-    #[frb(sync)]
+    /// Asynchronous because refreshing can read the mapping file or wait for
+    /// an engine or book-order write lock.
     pub fn book_order_revision(&self) -> u64 {
         self.refresh_book_order();
         self.book_order
@@ -14194,11 +14306,22 @@ impl SearchEngine {
         Ok(results)
     }
 
+    /// Obtain once after opening the engine. Its synchronous `cancel` bypasses
+    /// the engine lock and worker queue, even during indexing or a busy search.
+    pub fn lexical_cancellation_handle(&self) -> LexicalCancellationHandle {
+        LexicalCancellationHandle {
+            registry: Arc::clone(&self.lexical_cancellations),
+        }
+    }
+
     /// Stops every lexical call tagged with `request_id` (the streams, counts and
     /// per-book counts that take `cancel_request_id`), running or still to come.
     /// A cancelled count fails with [`LexicalSearchCancelled::MESSAGE`]; a
-    /// cancelled stream closes without another event. Returns at once.
-    #[frb(sync)]
+    /// cancelled stream closes without another event. Await the returned future
+    /// before starting a call that must observe the cancel.
+    ///
+    /// Prefer [`Self::lexical_cancellation_handle`] for responsive cancellation:
+    /// this compatibility entry point waits for the engine lock and worker queue.
     pub fn cancel_lexical_search(&self, request_id: u32) {
         self.lexical_cancellations.cancel(request_id);
     }
@@ -16534,6 +16657,22 @@ where
     })
 }
 
+/// Cancels request ids on one engine without waiting for its lock or workers.
+/// Keep this handle while searching; cancellation also covers calls not yet started.
+#[frb(opaque)]
+pub struct LexicalCancellationHandle {
+    registry: Arc<LexicalCancellations>,
+}
+
+impl LexicalCancellationHandle {
+    /// Stops lexical calls tagged with `request_id`; unrelated ids keep running.
+    /// Cancelled counts fail; streams close without another event.
+    #[frb(sync)]
+    pub fn cancel(&self, request_id: u32) {
+        self.registry.cancel(request_id);
+    }
+}
+
 // ── User regex (`/…/`) ─────────────────────────────────────────────────────────
 //
 // The engine side of a regular expression the user types wrapped in slashes; the work is in
@@ -16554,15 +16693,17 @@ pub enum UserRegexKind {
     /// Words separated by a space or `\s+`: an adjacent phrase of term patterns, which may
     /// continue onto the next line (`/(משה|אהרן) רבנו/`).
     WordSequence,
-    /// Anything else that spans a space: matched against each line's text (`/שמע .* ישראל/`).
+    /// Anything else that spans a space, or has `^`/`$` at an edge: matched against each
+    /// line's text (`/שמע .* ישראל/`, `/^ספר$/`).
     CrossSpace,
 }
 
 /// What [`parse_user_regex`] made of a query.
 pub struct UserRegexPlan {
     pub kind: UserRegexKind,
-    /// The pattern as searched: without `/…/` and edge anchors, folded like the index text
-    /// (no nikud, ASCII quotes, maqaf as a space). Empty when `Invalid`.
+    /// The pattern as searched: without `/…/`, edge `\b` and edge spaces, folded like the
+    /// index text (no nikud, ASCII quotes, maqaf as a space); an edge `^`/`$` stays as
+    /// `\A`/`\z`. Empty when `Invalid`.
     pub pattern: String,
     /// The pattern of each word, for `SingleWord` (one) and `WordSequence`; empty otherwise.
     pub words: Vec<String>,
@@ -16573,11 +16714,13 @@ pub struct UserRegexPlan {
 /// Classifies a query typed as `/pattern/`. Cheap and synchronous: parsing plus a
 /// size-limited compile, never more than a few milliseconds whatever the pattern.
 ///
-/// Rules: the outer `/…/` and `^`, `$`, `\b` at the pattern's edges are dropped (a term
-/// pattern matches whole terms, a cross-space one starts and ends on a word boundary when
-/// its edge is a letter). `.` and negated classes never cross a space by themselves; only
-/// explicit whitespace (a space, `\s`, `\W`, a class of spaces) makes a pattern
-/// cross-space — as do an inner anchor, and a sequence word that names no letter (`.*`).
+/// Rules: the outer `/…/` and `\b` at the pattern's edges are dropped (a term pattern
+/// matches whole terms, a cross-space one starts and ends on a word boundary when its edge is
+/// a letter). `^` or `$` at an edge makes the pattern cross-space, anchored to the line's
+/// start or end, or past an enumerator at that edge (`(ג) `, `{פ}`, a spaced `[א] `).
+/// `.` and negated classes never cross a space by themselves; only explicit whitespace (a
+/// space, `\s`, `\W`, a class of spaces) makes a pattern cross-space — as do an inner anchor,
+/// and a sequence word that names no letter (`.*`).
 /// Matching ignores case and nikud; geresh/gershayim match their ASCII forms.
 #[frb(sync)]
 pub fn parse_user_regex(raw: String) -> UserRegexPlan {
@@ -20538,6 +20681,230 @@ mod tests {
         // ל-PDF אין טביעת אצבע — contentHash נחתם כ-0 (לא נרשם).
         let fingerprints = engine.get_book_fingerprints().unwrap();
         assert_eq!(fingerprints.get("C:/books/sefer.pdf"), Some(&0u64));
+    }
+
+    #[test]
+    fn pdf_pages_from_bytes_unpacks_references_and_texts() {
+        let bytes = "ספר, עמוד 1שורה\nשנייהעמוד 2בראשית".as_bytes();
+        let ref1 = "ספר, עמוד 1".len() as u32;
+        let text1 = ref1 + "שורה\nשנייה".len() as u32;
+        let ref2 = text1 + "עמוד 2".len() as u32;
+        let ends = [ref1, text1, ref2, bytes.len() as u32];
+        let pages = pdf_pages_from_bytes(bytes, &ends, &[3, 7]).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].reference, "ספר, עמוד 1");
+        assert_eq!(pages[0].text, "שורה\nשנייה");
+        assert_eq!(pages[0].page_index, 3);
+        assert_eq!(pages[1].reference, "עמוד 2");
+        assert_eq!(pages[1].text, "בראשית");
+        assert_eq!(pages[1].page_index, 7);
+
+        // A page with an empty reference and text is still a page.
+        let pages = pdf_pages_from_bytes(b"", &[0, 0], &[0]).unwrap();
+        assert_eq!(
+            (pages[0].reference.as_ref(), pages[0].text.as_ref()),
+            ("", "")
+        );
+
+        assert!(pdf_pages_from_bytes(bytes, &ends[..3], &[3, 7]).is_err());
+        assert!(pdf_pages_from_bytes(bytes, &[ref1, 1], &[0]).is_err());
+        assert!(pdf_pages_from_bytes(bytes, &[ref1, 9999], &[0]).is_err());
+    }
+
+    #[test]
+    fn pdf_pages_from_bytes_validates_all_offsets_and_consumes_the_buffer() {
+        let bytes = b"abcdef";
+        for (ends, indexes) in [
+            (vec![], vec![]),
+            (vec![0, 5], vec![0]),
+            (vec![0], vec![0]),
+            (vec![0, 6], vec![]),
+            (vec![0, 6], vec![0, 1]),
+            (vec![2, 1], vec![0]),
+            (vec![0, 4, 3, 6], vec![0, 1]),
+            (vec![0, u32::MAX], vec![0]),
+        ] {
+            assert!(pdf_pages_from_bytes(bytes, &ends, &indexes).is_err());
+        }
+        assert!(pdf_pages_from_bytes(b"", &[], &[]).unwrap().is_empty());
+        let pages = pdf_pages_from_bytes(b"", &[0, 0, 0, 0], &[7, 7]).unwrap();
+        assert_eq!(pages.len(), 2);
+    }
+
+    #[test]
+    fn pdf_pages_from_bytes_borrows_utf8_and_replaces_only_invalid_slices() {
+        let bytes = "עמודשלום עולם".as_bytes();
+        let pages = pdf_pages_from_bytes(bytes, &[8, bytes.len() as u32], &[u32::MAX]).unwrap();
+        assert!(matches!(pages[0].reference, Cow::Borrowed(_)));
+        assert!(matches!(pages[0].text, Cow::Borrowed(_)));
+        assert_eq!(pages[0].reference.as_ptr(), bytes.as_ptr());
+        assert_eq!(pages[0].text.as_ptr(), bytes[8..].as_ptr());
+        assert_eq!(pages[0].page_index, u32::MAX);
+
+        // A code point split between reference and text is replaced in each
+        // slice independently, exactly like invalid UTF-8 in the text itself.
+        let bytes = [0xd7, 0xa9, b'a', 0xff];
+        let pages = pdf_pages_from_bytes(&bytes, &[1, 4], &[0]).unwrap();
+        assert_eq!(pages[0].reference, "\u{fffd}");
+        assert_eq!(pages[0].text, "\u{fffd}a\u{fffd}");
+        assert!(matches!(pages[0].reference, Cow::Owned(_)));
+        assert!(matches!(pages[0].text, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn add_pdf_book_bytes_matches_documents_stamps_and_search() {
+        let (mut original, _original_dir) = make_engine();
+        let (mut packed, _packed_dir) = make_engine();
+        let pages = vec![
+            PdfPageInput {
+                reference: String::new(),
+                text: String::new(),
+                page_index: 0,
+            },
+            PdfPageInput {
+                reference: "עמוד א 😀".into(),
+                text: "\n≡≡≡ ∴∴∴ ⊕⊗⊘\nבְּרֵאשִׁית ברא אלהים\r\nשורה שניה".into(),
+                page_index: 3,
+            },
+            PdfPageInput {
+                reference: String::new(),
+                text: "שלום עולם".into(),
+                page_index: u32::MAX,
+            },
+        ];
+        let mut bytes = Vec::new();
+        let mut ends = Vec::new();
+        let mut indexes = Vec::new();
+        for page in &pages {
+            bytes.extend_from_slice(page.reference.as_bytes());
+            ends.push(bytes.len() as u32);
+            bytes.extend_from_slice(page.text.as_bytes());
+            ends.push(bytes.len() as u32);
+            indexes.push(page.page_index);
+        }
+        let facets = Some(vec!["/author/מחבר".into(), "/era/אחרונים".into()]);
+        let expected = original
+            .add_pdf_book(
+                "ספר".into(),
+                "/בדיקות".into(),
+                "/book.pdf".into(),
+                pages,
+                facets.clone(),
+            )
+            .unwrap();
+        let actual = packed
+            .add_pdf_book_bytes(
+                "ספר".into(),
+                "/בדיקות".into(),
+                "/book.pdf".into(),
+                bytes,
+                ends,
+                indexes,
+                facets,
+            )
+            .unwrap();
+        assert_eq!(actual, 3);
+        assert_eq!(actual, expected);
+        original.commit().unwrap();
+        packed.commit().unwrap();
+        assert_eq!(
+            packed.get_book_stamps().unwrap(),
+            original.get_book_stamps().unwrap()
+        );
+        assert_eq!(
+            packed.get_book_fingerprints().unwrap(),
+            original.get_book_fingerprints().unwrap()
+        );
+
+        // Compare every stored field, including ids, page indexes and references.
+        let documents = |engine: &SearchEngine| {
+            let searcher = engine.index_reader.searcher();
+            let hits = searcher
+                .search(&AllQuery, &TopDocs::with_limit(20).order_by_score())
+                .unwrap();
+            let mut docs: Vec<String> = hits
+                .into_iter()
+                .map(|(_, addr)| {
+                    searcher
+                        .doc::<TantivyDocument>(addr)
+                        .unwrap()
+                        .to_json(&engine.schema)
+                })
+                .collect();
+            docs.sort();
+            docs
+        };
+        assert_eq!(documents(&packed), documents(&original));
+        for query in ["בראשית ברא", "שורה שניה", "אלהים שורה", "שלום עולם"]
+        {
+            let search = |engine: &SearchEngine| {
+                engine
+                    .search_exact(
+                        query.into(),
+                        vec!["/author/מחבר".into()],
+                        20,
+                        0,
+                        ResultsOrder::Catalogue,
+                        false,
+                        false,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| {
+                        (
+                            hit.id,
+                            hit.segment,
+                            hit.reference,
+                            hit.text,
+                            hit.continues_to_next_line,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let expected = search(&original);
+            assert!(!expected.is_empty(), "fixture must exercise query {query}");
+            assert_eq!(search(&packed), expected, "query {query}");
+        }
+    }
+
+    #[test]
+    fn add_pdf_book_bytes_rejects_bad_input_without_partial_documents() {
+        let (mut engine, _dir) = make_engine();
+        // The first page is valid; a bad later page must not enqueue that first page.
+        let bytes = "עמודשלום עולם".as_bytes().to_vec();
+        let end = bytes.len() as u32;
+        assert!(engine
+            .add_pdf_book_bytes(
+                "ספר".into(),
+                "/בדיקות".into(),
+                "/book.pdf".into(),
+                bytes.clone(),
+                vec![8, end, end - 1, end],
+                vec![0, 1],
+                None,
+            )
+            .is_err());
+        engine.commit().unwrap();
+        assert_eq!(engine.get_document_count(), 0);
+        assert!(engine.get_book_stamps().unwrap().is_empty());
+        assert_eq!(
+            engine
+                .add_pdf_book_bytes(
+                    "ספר".into(),
+                    "/בדיקות".into(),
+                    "/book.pdf".into(),
+                    bytes,
+                    vec![8, end],
+                    vec![7],
+                    None,
+                )
+                .unwrap(),
+            1
+        );
+        engine.commit().unwrap();
+        assert_eq!(engine.get_document_count(), 1);
     }
 
     #[test]
@@ -30084,6 +30451,7 @@ mod tests {
                 embedding_dim: 64,
                 pooling: "in-graph".to_string(),
                 max_tokens: 512,
+                query_max_tokens: None,
                 embedding_text_version: chunking.embedding_text_version,
                 normalization_version: chunking.normalization_version,
                 chunking_identity: chunking.identity(),
@@ -31124,7 +31492,7 @@ mod tests {
 
         /// Changed-book windows have a bounded discovery budget. Exceeding it never
         /// exposes a partial arrival set as complete: unfiltered planning backs off and
-        /// filtered planning reports why an update is needed.
+        /// filtered planning backs off in the same way.
         #[test]
         fn changed_window_discovery_overflow_backs_off_without_partial_results() {
             use crate::semantic_resolver::LiveResolver;
@@ -31180,15 +31548,7 @@ mod tests {
                 unfiltered.unwrap().is_none(),
                 "no truncated unfiltered plan"
             );
-            let error = filtered
-                .err()
-                .expect("a filter cannot silently omit discovered windows");
-            assert!(
-                error
-                    .to_string()
-                    .contains("changed-book window occurrences"),
-                "{error}"
-            );
+            assert!(filtered.unwrap().is_none(), "no truncated filtered plan");
         }
 
         /// The working-set cap is shared across Rayon workers and changed books,
@@ -31256,6 +31616,245 @@ mod tests {
                 planned.unwrap().is_none(),
                 "each book fits, but their combined window working set exceeds the cap"
             );
+        }
+
+        /// A cold plan must stop walking books when the shared window budget overflows.
+        /// A single worker makes the I/O bound deterministic, independent of host speed.
+        #[test]
+        fn window_discovery_overflow_stops_before_walking_the_rest_of_the_library() {
+            use crate::semantic_resolver::LiveResolver;
+            let dir = TempDir::new().unwrap();
+            let mut engine = opened(&dir);
+            engine.set_bulk_indexing(true).unwrap();
+            let long = (0..600)
+                .map(|n| format!("מילה{n:04}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for n in 0..32 {
+                engine
+                    .add_text_book_placed(
+                        "ספר".into(),
+                        "/root".into(),
+                        format!("/changed/{n:02}.txt"),
+                        n + 1,
+                        0,
+                        long.clone(),
+                        None,
+                        TextStorage::InIndex,
+                        None,
+                    )
+                    .unwrap();
+            }
+            engine.commit().unwrap();
+            let vectors = dir.path().join("vectors");
+            let generation = otzaria_semantic_search::semantic::segment_set::info(&vectors)
+                .unwrap()
+                .unwrap()
+                .generation;
+            let view = engine.semantic_set_view(&vectors, generation).unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut resolver = LiveResolver::new(
+                    engine.index_reader.searcher(),
+                    engine.chunk_key_field,
+                    &engine.semantic_resolver,
+                )
+                .unwrap();
+                let filters = SidecarSearchFilters {
+                    book_paths: None,
+                    facets: Some(vec!["/".into()]),
+                    include_pdf: None,
+                };
+                let previous =
+                    crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.replace(1));
+                let plan = resolver.plan(&filters, &view, &CancellationToken::new());
+                crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.set(previous));
+                assert!(plan.unwrap().is_none(), "never expose a partial plan");
+                let walked = walks(&engine);
+                assert!(
+                    walked <= 2,
+                    "overflow should stop early, walked {walked} books"
+                );
+            });
+        }
+
+        /// Reaching the limit exactly is still a complete plan; only a further window
+        /// may trigger backoff. A cancellation at that boundary is never cached as overflow.
+        #[test]
+        fn window_discovery_keeps_exact_budget_plans_and_prioritizes_cancellation() {
+            use crate::semantic_resolver::LiveResolver;
+            use otzaria_semantic_search::semantic::resolve::ResolveError;
+            let dir = TempDir::new().unwrap();
+            let mut engine = opened(&dir);
+            let long = (0..600)
+                .map(|n| format!("מילה{n:04}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let windows = crate::semantic_keys::window_keys(&long).len();
+            assert!(windows > 1);
+            engine
+                .add_text_book_placed(
+                    "ספר".into(),
+                    "/other".into(),
+                    OTHER.into(),
+                    1,
+                    0,
+                    long,
+                    None,
+                    TextStorage::InIndex,
+                    None,
+                )
+                .unwrap();
+            engine.commit().unwrap();
+            let vectors = dir.path().join("vectors");
+            let generation = otzaria_semantic_search::semantic::segment_set::info(&vectors)
+                .unwrap()
+                .unwrap()
+                .generation;
+            let view = engine.semantic_set_view(&vectors, generation).unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let filters = SidecarSearchFilters {
+                    book_paths: None,
+                    facets: Some(vec!["/".into()]),
+                    include_pdf: None,
+                };
+                let mut resolver = LiveResolver::new(
+                    engine.index_reader.searcher(),
+                    engine.chunk_key_field,
+                    &engine.semantic_resolver,
+                )
+                .unwrap();
+                let cancel = CancellationToken::new();
+                let previous = crate::semantic_resolver::WINDOW_ARRIVAL_CAP
+                    .with(|cap| cap.replace(windows - 1));
+                crate::semantic_resolver::CANCEL_ON_WINDOW_OVERFLOW.with(|flag| flag.set(true));
+                let cancelled = resolver.plan(&filters, &view, &cancel);
+                crate::semantic_resolver::CANCEL_ON_WINDOW_OVERFLOW.with(|flag| flag.set(false));
+                crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.set(previous));
+                assert_eq!(cancelled.err(), Some(ResolveError::Cancelled));
+
+                let previous =
+                    crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.replace(windows));
+                let complete = resolver.plan(&filters, &view, &CancellationToken::new());
+                crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.set(previous));
+                assert!(
+                    complete.unwrap().is_some(),
+                    "a cancelled overflow must not cache backoff; exactly the limit fits"
+                );
+            });
+        }
+
+        /// The probe's semantic hit at line 1 of [`BOOK`], in a search's results.
+        fn holds_probe_hit(response: &SemanticSearchResponse) -> bool {
+            response.results.iter().any(|result| {
+                result.file_path == BOOK && result.segment == 1 && result.semantic_score.is_some()
+            })
+        }
+
+        /// The app's whole-library search is filtered by "/": past the window budget it goes
+        /// unplanned, once per generation, and its semantic half is still served.
+        #[test]
+        fn a_whole_library_filter_past_the_window_budget_still_searches_semantically() {
+            let dir = TempDir::new().unwrap();
+            let mut engine = opened(&dir);
+            let long = (0..600)
+                .map(|n| format!("מילה{n:04}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            engine
+                .add_text_book_placed(
+                    "ספר ארוך".into(),
+                    "/other".into(),
+                    OTHER.into(),
+                    1,
+                    0,
+                    long,
+                    None,
+                    TextStorage::InIndex,
+                    None,
+                )
+                .unwrap();
+            engine.commit().unwrap();
+            let previous = crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.replace(1));
+            let response = engine.search_semantic(
+                PROBE.to_string(),
+                vec!["/".to_string()],
+                10,
+                0,
+                SemanticLexicalMode::Exact,
+                0,
+                SemanticRetrievalMode::SemanticOnly,
+                None,
+                false,
+                false,
+                None,
+                &SemanticCancellationToken::new(),
+            );
+            let walked = walks(&engine);
+            assert!(walked > 0, "the plan walked the changed book");
+            let again = engine.search_semantic(
+                "ויאמר אלהים".to_string(),
+                vec!["/".to_string()],
+                10,
+                0,
+                SemanticLexicalMode::Exact,
+                0,
+                SemanticRetrievalMode::SemanticOnly,
+                None,
+                false,
+                false,
+                None,
+                &SemanticCancellationToken::new(),
+            );
+            crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.set(previous));
+            let response = response.unwrap();
+            assert!(
+                response.semantic_available,
+                "{:?}",
+                response.fallback_reason
+            );
+            assert_eq!(response.fallback_kind, None);
+            assert!(holds_probe_hit(&response));
+            assert!(again.unwrap().semantic_available);
+            assert_eq!(
+                walks(&engine),
+                walked,
+                "not walked again in this generation"
+            );
+        }
+
+        /// The same query asked again after its semantic half failed searches again, rather
+        /// than repeating the failure until the session expires.
+        #[test]
+        fn a_failed_semantic_half_is_not_kept_for_the_next_search() {
+            let dir = TempDir::new().unwrap();
+            let engine = opened(&dir);
+            crate::semantic_resolver::FAIL_SCANS.with(|fail| fail.set(true));
+            let failed = unfiltered(&engine, PROBE, SemanticRetrievalMode::Hybrid);
+            crate::semantic_resolver::FAIL_SCANS.with(|fail| fail.set(false));
+            let failed = failed.unwrap();
+            assert!(!failed.semantic_available);
+            assert_eq!(failed.fallback_kind, Some(SemanticErrorKind::QueryFailed));
+            assert!(
+                failed
+                    .fallback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("a test made the scan fail")),
+                "{:?}",
+                failed.fallback_reason
+            );
+
+            let again = unfiltered(&engine, PROBE, SemanticRetrievalMode::Hybrid).unwrap();
+            assert!(again.semantic_available, "{:?}", again.fallback_reason);
+            assert_eq!(again.fallback_kind, None);
+            assert!(holds_probe_hit(&again));
         }
 
         fn lookups(engine: &SearchEngine) -> u64 {
@@ -31435,11 +32034,10 @@ mod tests {
             }
         }
 
-        /// A filtered search that cannot be planned — the index could not be read for it —
-        /// is a semantic half that failed, as one whose resolver cannot read the index is:
-        /// the lexical results are served, with the reason, and the next search is planned.
+        /// A filtered search that cannot be planned scans the books its filter admits, unplanned,
+        /// and its semantic half is served; the next search is planned.
         #[test]
-        fn a_filtered_search_that_cannot_be_planned_falls_back_with_a_reason() {
+        fn a_filtered_search_that_cannot_be_planned_goes_unplanned() {
             let dir = TempDir::new().unwrap();
             let engine = opened(&dir);
             let filtered = |query: &str| {
@@ -31459,31 +32057,168 @@ mod tests {
                 )
             };
             crate::semantic_resolver::FAIL_PLANS.with(|fail| fail.set(true));
-            let failed = filtered(PROBE);
+            let unplanned = filtered(PROBE);
             crate::semantic_resolver::FAIL_PLANS.with(|fail| fail.set(false));
-            let failed = failed.expect("a fallback, not an error of the call");
-            assert!(!failed.semantic_available);
-            assert_eq!(failed.fallback_kind, Some(SemanticErrorKind::QueryFailed));
+            let unplanned = unplanned.unwrap();
             assert!(
-                failed
-                    .fallback_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("a test made planning fail")),
+                unplanned.semantic_available,
                 "{:?}",
-                failed.fallback_reason
+                unplanned.fallback_reason
             );
-            assert!(
-                failed
-                    .results
-                    .iter()
-                    .any(|result| result.snippet_html.contains("ויאמר")
-                        && result.source == SemanticResultSource::Lexical),
-                "the lexical results are served"
-            );
+            assert_eq!(unplanned.fallback_kind, None);
+            assert!(holds_probe_hit(&unplanned));
 
             let planned = filtered("ויאמר אלהים יהי אור").unwrap();
             assert!(planned.semantic_available, "{:?}", planned.fallback_reason);
             assert_eq!(planned.fallback_kind, None);
+        }
+
+        /// Even without a plan, the live facets exclude a book whose category changed
+        /// after the vectors were built.
+        #[test]
+        fn an_unplanned_search_still_applies_live_book_facets() {
+            let dir = TempDir::new().unwrap();
+            let mut engine = open(
+                &dir,
+                built_of_books(
+                    &dir,
+                    false,
+                    &[(BOOK, PROBE.to_string()), (OTHER, PROBE.to_string())],
+                ),
+            );
+            engine.delete_documents_by_file_path(OTHER).unwrap();
+            engine
+                .add_text_book_placed(
+                    "other".into(),
+                    "/outside".into(),
+                    OTHER.into(),
+                    1,
+                    0,
+                    PROBE.into(),
+                    None,
+                    TextStorage::InIndex,
+                    None,
+                )
+                .unwrap();
+            engine.commit().unwrap();
+            crate::semantic_resolver::FAIL_PLANS.with(|fail| fail.set(true));
+            let response = engine.search_semantic(
+                PROBE.into(),
+                vec!["/root".into()],
+                10,
+                0,
+                SemanticLexicalMode::Exact,
+                0,
+                SemanticRetrievalMode::SemanticOnly,
+                None,
+                false,
+                false,
+                None,
+                &SemanticCancellationToken::new(),
+            );
+            crate::semantic_resolver::FAIL_PLANS.with(|fail| fail.set(false));
+            let response = response.unwrap();
+            assert!(response.semantic_available);
+            assert!(!response.results.is_empty());
+            assert!(response.results.iter().all(|r| r.file_path == BOOK));
+        }
+
+        /// Cached lexical pages stay stable after a semantic failure, while an explicit
+        /// first-page search retries the recovered semantic path.
+        #[test]
+        fn a_failed_session_keeps_its_pages_but_a_new_search_retries() {
+            let dir = TempDir::new().unwrap();
+            let text = (0..12)
+                .map(|n| format!("{PROBE} תוספת{n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let engine = open(&dir, built_of(&dir, false, text));
+            let page = |offset| {
+                engine
+                    .search_semantic(
+                        PROBE.into(),
+                        vec!["/".into()],
+                        1,
+                        offset,
+                        SemanticLexicalMode::Exact,
+                        0,
+                        SemanticRetrievalMode::Hybrid,
+                        None,
+                        false,
+                        false,
+                        None,
+                        &SemanticCancellationToken::new(),
+                    )
+                    .unwrap()
+            };
+            crate::semantic_resolver::FAIL_SCANS.with(|fail| fail.set(true));
+            let first = page(0);
+            crate::semantic_resolver::FAIL_SCANS.with(|fail| fail.set(false));
+            assert!(!first.semantic_available);
+            assert!(first.has_more);
+            let continuation = page(1);
+            assert!(!continuation.session_restarted);
+            assert!(!continuation.semantic_available);
+            assert_ne!(first.results[0].id, continuation.results[0].id);
+            let fresh = page(0);
+            assert!(fresh.semantic_available);
+            assert!(fresh.fallback_kind.is_none());
+        }
+
+        /// A commit clears an overflow backoff: a now-small plan must discover the probe
+        /// copied to another book rather than continue using the earlier unplanned scan.
+        #[test]
+        fn a_filtered_window_overflow_backoff_is_cleared_on_commit() {
+            let dir = TempDir::new().unwrap();
+            let mut engine = opened(&dir);
+            let long = (0..600)
+                .map(|n| format!("מילה{n:04}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            engine
+                .add_text_book_placed(
+                    "other".into(),
+                    "/other".into(),
+                    OTHER.into(),
+                    1,
+                    0,
+                    long,
+                    None,
+                    TextStorage::InIndex,
+                    None,
+                )
+                .unwrap();
+            engine.commit().unwrap();
+            let search = |engine: &SearchEngine| {
+                engine
+                    .search_semantic(
+                        PROBE.into(),
+                        vec!["/".into()],
+                        10,
+                        0,
+                        SemanticLexicalMode::Exact,
+                        0,
+                        SemanticRetrievalMode::SemanticOnly,
+                        None,
+                        false,
+                        false,
+                        None,
+                        &SemanticCancellationToken::new(),
+                    )
+                    .unwrap()
+            };
+            let old = crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.replace(1));
+            let first = search(&engine);
+            crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.set(old));
+            assert!(first.semantic_available);
+            engine.delete_documents_by_file_path(OTHER).unwrap();
+            add_copy(&mut engine, OTHER, 1);
+            let next = search(&engine);
+            assert!(next.semantic_available);
+            assert!(next
+                .results
+                .iter()
+                .any(|r| r.file_path == OTHER && r.semantic_score.is_some()));
         }
 
         /// Another process's cleanup can take an expansion's lock file in the instant between

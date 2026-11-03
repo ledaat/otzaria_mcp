@@ -1,9 +1,9 @@
 # Vendored: otzaria_search_engine (rust crate `search_engine`)
 
 This directory holds a **vendored copy** of the Rust crate from the
-`otzaria_search_engine` Flutter package: version **6.0.0**, tag `v6.0.0` (commit
-`5ea4900`) of `https://github.com/Otzaria/otzaria_search_engine` — the version the app
-pins (`otzaria_search_engine: ^6.0.0`, pubspec.lock 6.0.0, app commit `2617a69`).
+`otzaria_search_engine` Flutter package: version **7.0.1**, tag `v7.0.1` (commit
+`225a6d5`) of `https://github.com/Otzaria/otzaria_search_engine` — the version the app
+pins (`otzaria_search_engine: ^7.0.1`, pubspec.lock 7.0.1, app commit `5fecad2`).
 
 ## Why vendored, and why this exact version
 - The crate is not published to crates.io; it ships inside the pub.dev package.
@@ -27,14 +27,14 @@ pins (`otzaria_search_engine: ^6.0.0`, pubspec.lock 6.0.0, app commit `2617a69`)
 - Vendoring exact bytes keeps the MCP self-contained and reproducible.
 
 ## Source
-Copied from `git archive v6.0.0 rust LICENSE CHANGELOG.md`
+Copied from `git archive v7.0.1 rust LICENSE CHANGELOG.md`
 (`rust/Cargo.toml`, `src/`, `resources/`, `vendor/tantivy-fst/`, plus `LICENSE` and
 `CHANGELOG.md`). Omitted: the Flutter plugin scaffolding, the crate's `tests/`,
 `examples/` and `Cargo.lock` (not needed to build the lib). To verify, from a clone of the
 engine that has the commit:
 
 ```sh
-mkdir /tmp/engine && git archive v6.0.0 rust | tar -x -C /tmp/engine
+mkdir /tmp/engine && git archive v7.0.1 rust | tar -x -C /tmp/engine
 diff -r /tmp/engine/rust <mcp>/vendor/otzaria_search_engine/rust
 ```
 
@@ -43,9 +43,7 @@ Apart from the omitted files, the differences are the patches below.
 The crate pulls two git dependencies at pinned revisions (fetched by cargo):
 `Otzaria/tantivy@8b88320` (via the workspace `[patch.crates-io]`, which must repeat the
 crate's own patch because dependency patches are ignored) and
-`Otzaria/otzaria-semantic-search@86f4548` (default features off — only the chunk-key
-recipe and formats; no ONNX backend is compiled, since the MCP does not enable the
-crate's `semantic*` features). Cargo warns that the crate's own `[patch]` and
+`Otzaria/otzaria-semantic-search@6b006b0`, which is vendored as well (see below). Cargo warns that the crate's own `[patch]` and
 `[profile.release]` are ignored as a non-root package; that is expected.
 
 ## Local modifications (not upstream)
@@ -69,6 +67,23 @@ Two additive patches in `rust/src/api/search_engine.rs` and `rust/src/line_sourc
   row windows finish before refresh; later windows reopen the current file without
   a temporary suspended/unavailable state. The `reload_regression` integration test
   covers replacement during concurrent searches and stale-text reporting.
+
+## The semantic sidecar (vendor/otzaria-semantic-search)
+`otzaria-semantic-search` at the engine's pinned rev `6b006b0fe1440f8204385fbb42ee0d831bc8cfff`
+(the QA491 role caps: queries through `query.int8.onnx` capped at `query_max_tokens`, passages
+through `document.fp32.onnx`), copied as `Cargo.toml`, `src/`, `config/`, `benches/` and the two
+licences. The workspace `[patch."https://github.com/Otzaria/otzaria-semantic-search"]` points the
+engine's git dependency at it. The MCP uses its `OfficialSemanticIndex` directly, with the
+`onnx-backend` feature: the query is embedded and the installed vector set scanned by Otzaria's
+own code, and ONNX Runtime is loaded at run time (`--onnx-runtime`).
+
+One local addition, in `src/semantic/official_index.rs`:
+
+- **`OfficialSemanticIndex::open_read_only(config)`**: [`open`] with a `read_only` flag kept on
+  the index, so the first open and every `reload_vectors` go through
+  `SegmentSet::open_without_recovery`. Upstream `open` takes the set's lock when it can and then
+  recovers `staging/` and collects garbage in Otzaria's `vectors/` folder; a reader beside the
+  application must never do either, nor make an install wait for the lock.
 
 ## Upgrading
 When the app moves to a newer engine, re-vendor the matching version here, re-apply the

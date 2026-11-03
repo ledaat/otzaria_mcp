@@ -1,0 +1,436 @@
+use crate::config::profiles::QueryTypeAlphas;
+use std::fmt;
+
+/// Type of query based on heuristics
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryType {
+    ExactReference,
+    Conceptual,
+    Mixed,
+    Short,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RankingSignals {
+    pub agreement_bonus: f32,
+    pub section_coverage_bonus: f32,
+    pub duplicate_penalty: f32,
+    pub rare_term_bonus: f32,
+    pub phrase_match_bonus: f32,
+    pub metadata_bonus: f32,
+    pub total: f32,
+}
+
+impl fmt::Display for QueryType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            QueryType::ExactReference => "ExactReference",
+            QueryType::Conceptual => "Conceptual",
+            QueryType::Mixed => "Mixed",
+            QueryType::Short => "Short",
+            QueryType::Unknown => "Unknown",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Extracted features from the query string
+#[derive(Debug, Clone)]
+pub struct QueryFeatures {
+    pub token_count: usize,
+    pub has_quoted_phrase: bool,
+    pub avg_token_length: f32,
+    pub estimated_type: QueryType,
+    pub has_numbers: bool,
+    pub detected_language: String,
+    pub rare_tokens: Vec<String>,
+    pub quoted_phrases: Vec<String>,
+}
+
+/// Analyzes a query string to extract features useful for ranking
+pub fn analyze_query(query: &str) -> QueryFeatures {
+    let quoted_phrases = quoted_phrases(query);
+    let has_quoted_phrase = !quoted_phrases.is_empty();
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    let token_count = tokens.len();
+
+    let total_chars: usize = tokens.iter().map(|t| t.chars().count()).sum();
+    let avg_token_length = if token_count > 0 {
+        total_chars as f32 / token_count as f32
+    } else {
+        0.0
+    };
+
+    // Basic heuristic for exact references: containing numbers or specific format
+    let has_numbers = tokens.iter().any(|t| t.chars().any(|c| c.is_ascii_digit()));
+
+    let mut hebrew_chars = 0;
+    let mut latin_chars = 0;
+    let mut rare_tokens = Vec::new();
+
+    for t in &tokens {
+        let char_count = t.chars().count();
+        for c in t.chars() {
+            if c.is_ascii_alphabetic() {
+                latin_chars += 1;
+            } else if ('\u{0590}'..='\u{05FF}').contains(&c) {
+                hebrew_chars += 1;
+            }
+        }
+        if char_count > 5 {
+            rare_tokens.push(t.to_string());
+        }
+    }
+
+    let detected_language = if hebrew_chars > 0 && latin_chars == 0 {
+        "hebrew".to_string()
+    } else if latin_chars > 0 && hebrew_chars == 0 {
+        "other".to_string()
+    } else if hebrew_chars > 0 && latin_chars > 0 {
+        "mixed".to_string()
+    } else {
+        "other".to_string()
+    };
+
+    let estimated_type = if token_count == 0 {
+        QueryType::Unknown
+    } else if has_quoted_phrase {
+        QueryType::ExactReference
+    } else if token_count <= 2 {
+        if has_numbers {
+            QueryType::ExactReference
+        } else {
+            QueryType::Short
+        }
+    } else if token_count >= 5 {
+        QueryType::Conceptual
+    } else {
+        QueryType::Mixed
+    };
+
+    QueryFeatures {
+        token_count,
+        has_quoted_phrase,
+        avg_token_length,
+        estimated_type,
+        has_numbers,
+        detected_language,
+        rare_tokens,
+        quoted_phrases,
+    }
+}
+
+/// The phrases `query` quotes, each trimmed, in order.
+///
+/// ״ “ ” „ count as `"`. A `"` between two Hebrew letters is an acronym's gershayim
+/// (רמב"ם, שו"ע) and part of the text; any other is a delimiter, and a phrase is the
+/// non-blank text between two of them. So `"רמב"ם"` quotes רמב"ם, and a lone delimiter
+/// quotes nothing. Each phrase keeps the characters the query has.
+pub fn quoted_phrases(query: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    if !query.contains(['"', '״', '“', '”', '„']) {
+        return phrases;
+    }
+    let is_quote = |c: char| matches!(c, '"' | '״' | '“' | '”' | '„');
+    let is_letter = |c: Option<char>| c.is_some_and(|c| ('\u{05D0}'..='\u{05EA}').contains(&c));
+    let mut open: Option<usize> = None;
+    let mut previous = None;
+    let mut chars = query.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let next = chars.peek().map(|&(_, c)| c);
+        if is_quote(c) && !(is_letter(previous) && is_letter(next)) {
+            match open.take() {
+                Some(start) => {
+                    let phrase = query[start..at].trim();
+                    if !phrase.is_empty() {
+                        phrases.push(phrase.to_string());
+                    }
+                }
+                None => open = Some(at + c.len_utf8()),
+            }
+        }
+        // Nikud and teamim sit between the letter and the gershayim: רַמְבַּ"ם.
+        if !matches!(c, '\u{0591}'..='\u{05BD}' | '\u{05BF}'..='\u{05C7}') {
+            previous = Some(c);
+        }
+    }
+    phrases
+}
+
+/// Computes the alpha weight for lexical search (1 - alpha for semantic)
+/// Short/exact -> 0.7-0.9
+/// Conceptual -> 0.2-0.4
+/// Mixed -> 0.5
+///
+/// [`compute_alpha_with`] over the default table, [`QueryTypeAlphas::default`]: the numbers
+/// this function has always returned.
+pub fn compute_alpha(features: &QueryFeatures) -> f32 {
+    compute_alpha_with(features, &QueryTypeAlphas::default())
+}
+
+/// The alpha `alphas` gives this query's type: what the coordinator uses, with the table in
+/// the search's [`RankingProfile`](crate::config::profiles::RankingProfile).
+pub fn compute_alpha_with(features: &QueryFeatures, alphas: &QueryTypeAlphas) -> f32 {
+    match features.estimated_type {
+        // §3.1: A quoted phrase is a verbatim lookup — the lexical engine is
+        // authoritative and the semantic embedding adds only latency.
+        // An alpha of 1.0, the default, lets the coordinator skip the semantic path
+        // entirely.
+        QueryType::ExactReference if features.has_quoted_phrase => alphas.quoted_phrase,
+        QueryType::ExactReference => alphas.exact_reference,
+        QueryType::Short => alphas.short,
+        QueryType::Mixed => alphas.mixed,
+        QueryType::Conceptual => alphas.conceptual,
+        QueryType::Unknown => alphas.unknown,
+    }
+}
+
+/// Configuration for bonuses and penalties during ranking.
+///
+/// These values are unmeasured heuristics. Calibrating them — or dropping weighted
+/// fusion for RRF, where they would not apply — needs the labelled relevance set
+/// that stage S1 produces. Until then, treat the numbers as placeholders.
+///
+/// The coordinator does not read this struct: the bonuses a search applies are its
+/// [`RankingProfile`](crate::config::profiles::RankingProfile)'s, which a host can pass
+/// per search, and that is where calibrated values go.
+#[derive(Debug, Clone)]
+pub struct BonusConfig {
+    /// Added to a candidate that both engines returned.
+    ///
+    /// Named for what it actually measures: agreement between the two
+    /// retrieval paths, not an exact string match. Note that it can push a
+    /// fused score above 1.0, so a fused score is a ranking key, not a
+    /// normalized confidence.
+    pub agreement_bonus: f32,
+    /// Reserved for penalizing near-duplicate results. Not applied yet —
+    /// duplicates are currently handled by grouping
+    /// ([`GroupingMode::IdenticalText`](crate::semantic::types::GroupingMode)).
+    pub duplicate_penalty: f32,
+    /// Reserved for rewarding a result whose section has several hits. Not
+    /// applied yet.
+    pub section_coverage_bonus: f32,
+}
+
+impl Default for BonusConfig {
+    fn default() -> Self {
+        Self {
+            agreement_bonus: 0.1,
+            duplicate_penalty: 0.05,
+            section_coverage_bonus: 0.03,
+        }
+    }
+}
+
+pub fn compute_phrase_match_bonus(text: &str, phrases: &[String]) -> f32 {
+    if phrases.is_empty() {
+        return 0.0;
+    }
+    let mut matches = 0;
+    for phrase in phrases {
+        if text.contains(phrase) {
+            matches += 1;
+        }
+    }
+    (matches as f32) / (phrases.len() as f32)
+}
+
+pub fn compute_rare_term_bonus(text: &str, rare_tokens: &[String]) -> f32 {
+    if rare_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut matches = 0;
+    for token in rare_tokens {
+        if text.contains(token) {
+            matches += 1;
+        }
+    }
+    (matches as f32) / (rare_tokens.len() as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_short_query() {
+        let features = analyze_query("שלום עולם");
+        assert_eq!(features.estimated_type, QueryType::Short);
+        let alpha = compute_alpha(&features);
+        assert!((0.7..=0.9).contains(&alpha));
+    }
+
+    #[test]
+    fn test_long_conceptual_query() {
+        let features = analyze_query("מה המשמעות של החיים ביקום לפי הקבלה");
+        assert_eq!(features.estimated_type, QueryType::Conceptual);
+        let alpha = compute_alpha(&features);
+        assert!((0.2..=0.4).contains(&alpha));
+    }
+
+    #[test]
+    fn test_quoted_phrase() {
+        let features = analyze_query("\"בראשית ברא\"");
+        assert_eq!(features.estimated_type, QueryType::ExactReference);
+        assert!(features.has_quoted_phrase);
+        let alpha = compute_alpha(&features);
+        // Quoted phrases return 1.0 to let the coordinator skip semantic entirely.
+        assert_eq!(alpha, 1.0);
+    }
+
+    /// A gershayim between two letters is an acronym's, any other quote a delimiter, and only
+    /// a pair of delimiters quotes a phrase.
+    #[test]
+    fn only_a_pair_of_delimiters_quotes_a_phrase_and_an_acronym_is_text() {
+        let cases: [(&str, &[&str]); 14] = [
+            ("רמב\"ם", &[]),
+            ("רמב״ם", &[]),
+            ("רַמְבַּ\"ם", &[]),
+            ("\"רַמְבַּ\"ם\"", &["רַמְבַּ\"ם"]),
+            ("\"רמב\"ם\"", &["רמב\"ם"]),
+            ("“רמב״ם”", &["רמב״ם"]),
+            ("\"ויאמר משה\"", &["ויאמר משה"]),
+            ("„ויאמר משה“ בתורה", &["ויאמר משה"]),
+            ("ויאמר \"משה", &[]),
+            ("\"", &[]),
+            ("\" \"", &[]),
+            ("שו\"ע וחז\"ל", &[]),
+            ("\"שו\"ע\" וחז\"ל", &["שו\"ע"]),
+            ("\"אחת\" \"שתים\"", &["אחת", "שתים"]),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(quoted_phrases(query), expected, "{query:?}");
+            let features = analyze_query(query);
+            assert_eq!(features.quoted_phrases, expected, "{query:?}");
+            assert_eq!(
+                features.has_quoted_phrase,
+                !expected.is_empty(),
+                "{query:?}"
+            );
+        }
+        assert_eq!(analyze_query("רמב\"ם").estimated_type, QueryType::Short);
+    }
+
+    #[test]
+    fn test_analyze_query_tokenization() {
+        let features = analyze_query("א ב ג");
+        assert_eq!(features.token_count, 3);
+        assert_eq!(features.avg_token_length, 1.0);
+    }
+
+    #[test]
+    fn test_default_bonus_config() {
+        let config = BonusConfig::default();
+        assert_eq!(config.agreement_bonus, 0.1);
+        assert_eq!(config.duplicate_penalty, 0.05);
+        assert_eq!(config.section_coverage_bonus, 0.03);
+    }
+
+    #[test]
+    fn an_empty_query_is_classified_without_dividing_by_zero() {
+        let features = analyze_query("");
+        assert_eq!(features.token_count, 0);
+        assert_eq!(features.avg_token_length, 0.0);
+        assert_eq!(features.estimated_type, QueryType::Unknown);
+        assert_eq!(compute_alpha(&features), 0.5);
+    }
+
+    #[test]
+    fn every_query_type_produces_a_weight_inside_the_unit_interval() {
+        for query in [
+            "",
+            "שלום",
+            "שלום עולם",
+            "\"בראשית ברא\"",
+            "ברכות דף כ",
+            "מה המשמעות של החיים ביקום לפי הקבלה",
+        ] {
+            let alpha = compute_alpha(&analyze_query(query));
+            assert!(
+                (0.0..=1.0).contains(&alpha),
+                "query {query:?} produced alpha {alpha}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_types_render_for_logging() {
+        for query_type in [
+            QueryType::ExactReference,
+            QueryType::Conceptual,
+            QueryType::Mixed,
+            QueryType::Short,
+            QueryType::Unknown,
+        ] {
+            assert!(!query_type.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_compute_phrase_match_bonus() {
+        let text = "בראשית ברא אלהים את השמים ואת הארץ";
+        let phrases = vec!["בראשית ברא".to_string(), "השמים ואת".to_string()];
+        let bonus = compute_phrase_match_bonus(text, &phrases);
+        assert_eq!(bonus, 1.0);
+
+        let phrases_partial = vec!["בראשית ברא".to_string(), "לא קיים".to_string()];
+        let bonus_partial = compute_phrase_match_bonus(text, &phrases_partial);
+        assert_eq!(bonus_partial, 0.5);
+    }
+
+    #[test]
+    fn test_compute_rare_term_bonus() {
+        let text = "המולקולה מסובכת";
+        let rare_tokens = vec!["המולקולה".to_string()];
+        let bonus = compute_rare_term_bonus(text, &rare_tokens);
+        assert_eq!(bonus, 1.0);
+    }
+
+    /// One query of each type, with the alpha `compute_alpha` has always given it.
+    const ONE_OF_EACH_TYPE: [(&str, f32); 6] = [
+        ("\"בראשית ברא\"", 1.0),
+        ("ברכות 20", 0.85),
+        ("שלום עולם", 0.7),
+        ("ברכות דף כ", 0.5),
+        ("מה המשמעות של החיים ביקום לפי הקבלה", 0.3),
+        ("", 0.5),
+    ];
+
+    #[test]
+    fn the_default_table_gives_every_query_type_the_alpha_it_always_had() {
+        for (query, alpha) in ONE_OF_EACH_TYPE {
+            let features = analyze_query(query);
+            assert_eq!(
+                compute_alpha(&features).to_bits(),
+                alpha.to_bits(),
+                "{query:?}"
+            );
+            assert_eq!(
+                compute_alpha_with(&features, &QueryTypeAlphas::default()).to_bits(),
+                alpha.to_bits(),
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_passed_in_decides_the_alpha_of_each_query_type() {
+        let table = QueryTypeAlphas {
+            quoted_phrase: 0.91,
+            exact_reference: 0.81,
+            short: 0.61,
+            mixed: 0.41,
+            conceptual: 0.21,
+            unknown: 0.11,
+        };
+        let expected = [0.91, 0.81, 0.61, 0.41, 0.21, 0.11];
+        for ((query, _), alpha) in ONE_OF_EACH_TYPE.into_iter().zip(expected) {
+            assert_eq!(
+                compute_alpha_with(&analyze_query(query), &table),
+                alpha,
+                "{query:?}"
+            );
+        }
+    }
+}
