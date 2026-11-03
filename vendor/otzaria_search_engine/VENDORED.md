@@ -84,6 +84,8 @@ One local addition, in `src/semantic/official_index.rs`:
   `SegmentSet::open_without_recovery`. Upstream `open` takes the set's lock when it can and then
   recovers `staging/` and collects garbage in Otzaria's `vectors/` folder; a reader beside the
   application must never do either, nor make an install wait for the lock.
+- **`OfficialSemanticIndex::embed_query`** is `pub` (upstream `pub(crate)`): the MCP scans its
+  personal books' vectors, built with the same model, with the same query vector.
 
 ## Upgrading
 When the app moves to a newer engine, re-vendor the matching version here, re-apply the

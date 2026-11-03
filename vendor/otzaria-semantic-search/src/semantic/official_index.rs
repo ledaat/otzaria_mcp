@@ -527,7 +527,10 @@ impl OfficialSemanticIndex {
     }
 
     /// Embed a query separately, so the coordinator can cache the vector.
-    pub(crate) fn embed_query(&self, query: &str) -> Result<Vec<f32>, SemanticSearchError> {
+    ///
+    /// otzaria-mcp local addition (see VENDORED.md): `pub` rather than `pub(crate)`, so a host
+    /// can scan other vectors of the same model (its personal books) with the same query vector.
+    pub fn embed_query(&self, query: &str) -> Result<Vec<f32>, SemanticSearchError> {
         // The same recipe the stored vectors were built under. A query embedded from raw
         // text against vectors built from normalized text — or without the role prefix
         // its passages were built with — scores nonsense with full confidence.

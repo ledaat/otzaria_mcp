@@ -1,6 +1,6 @@
 [package]
 name = "otzaria-mcp"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "MCP server exposing the Otzaria Jewish-texts library (SQLite + Tantivy), read-only, offline."
 license = "MIT"
@@ -27,6 +27,24 @@ rmcp = { version = "2.2.0", features = ["transport-io", "schemars"] }
 # facets, cross-line phrases, library line source) rather than reimplementing them.
 # Default features = bundled SQLite, no semantic backend.
 search_engine = { path = "../vendor/otzaria_search_engine/rust" }
+
+# ── semantic search (the former otzaria-sources Python server) ──
+# Otzaria's semantic sidecar (vendored, see VENDORED.md): its OfficialSemanticIndex embeds
+# queries with Otzaria's model and scans Otzaria's installed vector set. ONNX Runtime is
+# loaded at run time (`--onnx-runtime`), nothing is linked.
+otzaria-semantic-search = { git = "https://github.com/Otzaria/otzaria-semantic-search", rev = "6b006b0fe1440f8204385fbb42ee0d831bc8cfff", default-features = false, features = ["onnx-backend"] }
+# the same version the sidecar pins, so one copy is built
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+fancy-regex = "0.14"
+regex = "1"
+htmlize = { version = "1", features = ["unescape"] }
+memmap2 = "0.9"
+rayon = "1"
+encoding_rs = "0.8"
+sha1_smol = "1"
+uuid = { version = "1", features = ["v4"] }
+tiny_http = "0.12"
+ureq = { version = "2", features = ["json", "tls"] }
 
 [dev-dependencies]
 tempfile = "3"
