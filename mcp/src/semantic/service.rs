@@ -515,8 +515,15 @@ impl SemanticService {
         } else {
             book.title.clone()
         };
+        // the same text elsewhere: not an alias (a short neighbouring line that shares this
+        // line's vector, window 255) nor the line's own neighbours
         let mut also = Vec::new();
-        for r in hit.records.iter().skip(1).take(4) {
+        let others = hit.records.iter().skip(1).filter(|r| {
+            r.window != 255
+                && !(r.book.strip_prefix("id:").and_then(|x| x.parse::<i64>().ok()) == Some(bid)
+                    && (r.hint as i64 - li).abs() <= 2)
+        });
+        for r in others.take(4) {
             if let Some(bj) = r.book.strip_prefix("id:").and_then(|x| x.parse::<i64>().ok()) {
                 if let Some(b) = self.catalog.book(bj) {
                     also.push(json!({"book_id": bj, "book_title": b.title, "line_index": r.hint,
