@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use otzaria_semantic_search::cancellation::CancellationToken;
+use otzaria_semantic_search::config::profiles::DEFAULT_WINDOW_PENALTY;
 use otzaria_semantic_search::semantic::embedding::EmbeddingDeployment;
 use otzaria_semantic_search::semantic::official_index::{
     LocalModel, OfficialIndexConfig, OfficialSemanticIndex, ReloadOutcome,
 };
-use otzaria_semantic_search::semantic::resolve::{BookSet, VectorHit};
+use otzaria_semantic_search::semantic::resolve::{BookSet, SlotRef, VectorHit};
 use otzaria_semantic_search::semantic::versioning::{ModelIdentity, TextIdentity};
 
 /// What the installed set declares about itself (`vectors/CURRENT` -> `set.json`).
@@ -221,6 +222,27 @@ impl Official {
         self.index
             .search_hits(vector, k, books, &cancel)
             .map_err(|e| anyhow!("the vector scan failed: {e}"))
+    }
+
+    /// The exact score of each of `slots` (of this generation) against `vector`, as the scan
+    /// scores them (the long-window penalty included): a scan that admits no book and weighs
+    /// these slots besides. A slot no longer live, or holding another text, is left out.
+    pub fn score_slots(&self, vector: &[f32], slots: &[SlotRef]) -> Result<Vec<VectorHit>> {
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let none = BookSet::default();
+        let cancel = CancellationToken::new();
+        self.index
+            .search_hits_with(
+                vector,
+                slots.len(),
+                Some(&none),
+                slots,
+                DEFAULT_WINDOW_PENALTY,
+                &cancel,
+            )
+            .map_err(|e| anyhow!("the rescore failed: {e}"))
     }
 
     /// Pick up a new generation. `Ok(true)` when the set changed.

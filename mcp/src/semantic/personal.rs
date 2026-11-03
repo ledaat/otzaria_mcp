@@ -340,6 +340,26 @@ impl PersonalSet {
             .collect()
     }
 
+    /// The exact score of one slot against `q` (cosine, the long-window penalty taken off),
+    /// as [`Self::scan`] rescores what it keeps.
+    pub fn score(&self, q: &[f32], slot: usize) -> f32 {
+        if slot >= self.n {
+            return -1.0;
+        }
+        let dot: f32 = self
+            .codes(slot)
+            .iter()
+            .zip(q)
+            .map(|(&x, &y)| x as f32 * y)
+            .sum();
+        let pen = if self.slot_window(slot) > 0 {
+            WINDOW_PENALTY
+        } else {
+            0.0
+        };
+        dot * self.scale(slot) - pen
+    }
+
     /// The raw lines of a book (a small cache), and whether its text changed since indexing.
     pub fn lines_of(&self, bi: usize) -> (Option<std::sync::Arc<Vec<String>>>, bool) {
         let Some(b) = self.books.get(bi) else {

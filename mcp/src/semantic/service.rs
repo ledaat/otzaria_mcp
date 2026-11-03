@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Result};
-use otzaria_semantic_search::semantic::resolve::{BookSet, VectorHit};
+use otzaria_semantic_search::semantic::resolve::{BookSet, SlotRef, VectorHit};
 use serde_json::{json, Map, Value};
 
 use super::align::{align_words, Op};
@@ -444,10 +444,192 @@ impl SemanticService {
     }
 
     fn count_tokens(&self) -> Result<impl Fn(&str) -> usize> {
+        type Cached = Option<(PathBuf, Arc<tokenizers::Tokenizer>)>;
+        static CACHE: std::sync::LazyLock<Mutex<Cached>> =
+            std::sync::LazyLock::new(Default::default);
         let dir = self.official.read().unwrap().model_dir.clone();
-        let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| anyhow!("cannot read the model's tokenizer: {e}"))?;
+        let mut cache = CACHE.lock().unwrap();
+        let tok = match &*cache {
+            Some((d, t)) if *d == dir => t.clone(),
+            _ => {
+                let t = Arc::new(
+                    tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+                        .map_err(|e| anyhow!("cannot read the model's tokenizer: {e}"))?,
+                );
+                *cache = Some((dir, t.clone()));
+                t
+            }
+        };
         Ok(move |s: &str| tok.encode(s, false).map(|e| e.get_ids().len()).unwrap_or(0))
+    }
+
+    /// Token counts by the query model's tokenizer, and the query cap, for a client that
+    /// cuts its own query windows (the Otzaria plugin).
+    pub fn tokens(&self, req: &Map<String, Value>) -> Result<Value> {
+        let opts = Opts(req);
+        let texts = opts.list("texts");
+        if texts.len() > 5000 {
+            return Err(bad("at most 5000 texts"));
+        }
+        let count = self.count_tokens()?;
+        let counts: Vec<usize> = texts.iter().map(|t| count(t)).collect();
+        Ok(json!({"counts": counts, "query_max_tokens": self.query_cap()}))
+    }
+
+    /// The Otzaria plugin "מקבילות": its query windows embedded and scanned in one request
+    /// (the library, and the personal index when it matches the library's model), the hits
+    /// pooled with each vector's best window, and — `rescore`, for several sources — each
+    /// pooled vector scored exactly against every window. The plugin filters, looks the books
+    /// up and reads the text through Otzaria's own API, so this returns only where each
+    /// vector is: a library book and line, or a personal book's Otzaria uid.
+    pub fn parallels(&self, req: &Map<String, Value>) -> Result<Value> {
+        let opts = Opts(req);
+        let windows: Vec<String> = opts
+            .list("windows")
+            .into_iter()
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .collect();
+        if windows.is_empty() {
+            return Err(bad("no query windows"));
+        }
+        if windows.len() > 32 {
+            return Err(bad("at most 32 query windows"));
+        }
+        self.refresh();
+        let k = opts.int("k", 120).clamp(1, 2000) as usize;
+        let min_score = opts.float("min_score", 0.0) as f32;
+        let max_cands = opts.int("max_candidates", 2 * k as i64).clamp(1, 5000) as usize;
+        let rescore = opts.bool("rescore", false) && windows.len() > 1;
+        let official = self.official.read().unwrap();
+        let t0 = Instant::now();
+        let mut vectors = Vec::with_capacity(windows.len());
+        for w in &windows {
+            vectors.push(official.embed_query(w)?);
+        }
+        let embed_ms = t0.elapsed().as_millis();
+        let t1 = Instant::now();
+        // the best window of each vector
+        let mut best: HashMap<(u8, u64), (f32, usize, Cand)> = HashMap::new();
+        let mut keep = |score: f32, wi: usize, c: Cand| {
+            if score < min_score {
+                return;
+            }
+            let e = best.entry(c.key()).or_insert((score, wi, c.clone()));
+            if score > e.0 {
+                *e = (score, wi, c);
+            }
+        };
+        for (wi, v) in vectors.iter().enumerate() {
+            for h in official.scan(v, k, None)? {
+                keep(h.score, wi, Cand::Official(Arc::new(h)));
+            }
+        }
+        let personal = if opts.bool("include_personal", true) {
+            self.personal_searchable()
+        } else {
+            None
+        };
+        if let Some(ps) = &personal {
+            for (wi, hits) in ps.scan(&vectors, k, None).into_iter().enumerate() {
+                for (score, slot) in hits {
+                    keep(score, wi, Cand::Personal(slot));
+                }
+            }
+        }
+        let mut pool: Vec<(f32, usize, Cand)> = best.into_values().collect();
+        pool.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.key().cmp(&b.2.key())));
+        pool.truncate(max_cands);
+        let scan_ms = t1.elapsed().as_millis();
+        let t2 = Instant::now();
+        let mut matrix: HashMap<(u8, u64), Vec<f32>> = HashMap::new();
+        if rescore {
+            matrix = pool
+                .iter()
+                .map(|(_, _, c)| (c.key(), vec![-1.0; vectors.len()]))
+                .collect();
+            let refs: Vec<SlotRef> = pool
+                .iter()
+                .filter_map(|(_, _, c)| match c {
+                    Cand::Official(h) => Some(SlotRef {
+                        seg: h.seg,
+                        slot: h.slot,
+                        key: h.key,
+                    }),
+                    Cand::Personal(_) => None,
+                })
+                .collect();
+            for (wi, v) in vectors.iter().enumerate() {
+                for h in official.score_slots(v, &refs)? {
+                    if let Some(row) = matrix.get_mut(&(0, ((h.seg as u64) << 32) | h.slot as u64))
+                    {
+                        row[wi] = h.score;
+                    }
+                }
+                if let Some(ps) = &personal {
+                    for (_, _, c) in &pool {
+                        if let Cand::Personal(slot) = c {
+                            if let Some(row) = matrix.get_mut(&c.key()) {
+                                row[wi] = ps.score(v, *slot);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let rescore_ms = t2.elapsed().as_millis();
+        let r5 = |x: f32| round_to(x as f64, 5);
+        let mut hits = Vec::with_capacity(pool.len());
+        for (score, wi, c) in &pool {
+            let mut o = match c {
+                Cand::Official(h) => {
+                    let Some((bid, li, win)) = official_book(h) else {
+                        continue;
+                    };
+                    // 255: a short line sharing its neighbour's vector, at its own line
+                    let win = if win == 255 { 0 } else { win };
+                    json!({"store": "lib", "key": format!("o:{}:{}", h.seg, h.slot), "source": "library",
+                           "id": bid, "line": li, "window": win})
+                }
+                Cand::Personal(slot) => {
+                    let Some(ps) = &personal else { continue };
+                    let (bi, li) = ps.record(*slot);
+                    let Some(b) = ps.books.get(bi) else { continue };
+                    let (kind, uid) = if b.attached() {
+                        (
+                            "attached",
+                            format!("db:{}:{}", b.slug.as_deref().unwrap_or(""), b.book_id),
+                        )
+                    } else {
+                        ("user", format!("uid:{}", b.book_id))
+                    };
+                    json!({"store": "personal", "key": format!("p:{slot}"), "source": kind, "kind": kind,
+                           "id": b.book_id, "bookUid": uid, "title": b.title, "line": li,
+                           "window": ps.slot_window(*slot)})
+                }
+            };
+            let m = o.as_object_mut().unwrap();
+            m.insert("score".into(), json!(r5(*score)));
+            m.insert("win".into(), json!(wi));
+            if let Some(row) = matrix.get(&c.key()) {
+                m.insert(
+                    "scores".into(),
+                    json!(row.iter().map(|x| r5(*x)).collect::<Vec<_>>()),
+                );
+            }
+            hits.push(o);
+        }
+        let any = self.personal_any();
+        Ok(json!({
+            "hits": hits, "windows": windows.len(),
+            "library": {"release_tag": official.declared.release_tag, "library_version": official.declared.library_version,
+                        "generation": official.declared.generation, "segments": official.segments(),
+                        "model_family": official.family(),
+                        "query_graph": official.query_graph.file_name().unwrap_or_default().to_string_lossy()},
+            "personal": {"searched": personal.is_some(), "books": any.as_ref().map_or(0, |p| p.books.len()),
+                         "slots": any.as_ref().map_or(0, |p| p.n), "note": self.personal_note.lock().unwrap().clone()},
+            "timing_ms": {"embed": embed_ms, "scan": scan_ms, "rescore": rescore_ms}
+        }))
     }
 
     fn query_cap(&self) -> usize {
@@ -1420,6 +1602,8 @@ impl SemanticService {
                "release_tag": o.declared.release_tag,
                "model": o.query_graph.file_name().unwrap_or_default().to_string_lossy(),
                "model_family": o.family(),
+               "query_max_tokens": o.declared.model.query_max_tokens.unwrap_or(o.declared.model.max_tokens),
+               "generation": o.declared.generation,
                "personal_searched": self.personal_searchable().is_some(),
                "personal_model": ps.as_ref().and_then(|p| p.model().map(String::from)),
                "uptime_s": self.started.elapsed().as_secs()})

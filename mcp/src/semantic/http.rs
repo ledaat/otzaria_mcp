@@ -95,6 +95,10 @@ fn handle(svc: &SemanticService, mut req: Request, server: &Server) -> bool {
     let t = Instant::now();
     let result: Result<Value> = if path.starts_with("/search") {
         svc.search(&opts)
+    } else if path.starts_with("/parallels") {
+        svc.parallels(&opts)
+    } else if path.starts_with("/tokens") {
+        svc.tokens(&opts)
     } else if path.starts_with("/related") {
         svc.related(&opts)
     } else if path.starts_with("/text") {
