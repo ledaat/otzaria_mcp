@@ -467,6 +467,8 @@ mod resolve_tests {
     const OPTS: ResolveOptions = ResolveOptions {
         heref_fallback: false,
         app_detection: true,
+        exclude_book_level: false,
+        snippets: true,
     };
 
     #[test]

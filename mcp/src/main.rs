@@ -255,8 +255,16 @@ fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> 
         .map(Arc::new)
         .map_err(|e| eprintln!("otzaria-mcp: references unavailable: {e:#}"))
         .ok();
+    // find-ref over the same library, plus personal books and attached databases
+    let findref = refs.clone().map(|db| {
+        Arc::new(otzaria_mcp::findref::FindRefService::new(
+            db,
+            otzaria_mcp::reload::fingerprint(&paths),
+            paths.secondary.clone(),
+        ))
+    });
     let svc = Arc::new(service::SemanticService::open(cfg, refs)?);
-    http::serve(svc, addr, sem.workers.unwrap_or(4))
+    http::serve(svc, findref, addr, sem.workers.unwrap_or(4))
 }
 
 fn default_personal_index() -> PathBuf {

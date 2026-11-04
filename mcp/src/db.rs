@@ -671,7 +671,7 @@ impl Db {
         // Fill snippets with the decoded text of each candidate line.
         for c in cands.iter_mut() {
             c.set_source(&crate::secondary::Source::Library);
-            if c.snippet.is_empty() {
+            if opts.snippets && c.snippet.is_empty() {
                 // a secondary database may hold no text (personal books live in files)
                 if let Ok(lines) =
                     self.lines_in_range(&mut inner, c.book_id, c.line_index, c.line_index)
