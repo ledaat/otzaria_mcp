@@ -1,6 +1,6 @@
 [package]
 name = "search_engine"
-version = "6.0.0"
+version = "7.0.1"
 edition = "2021"
 
 [lib]
@@ -90,9 +90,10 @@ once_cell = "1.21.4"
 regex = "1.13.1"
 # Term-dictionary DFAs (see src/term_automaton.rs): byte classes, multi-pattern
 # unions and size limits in bytes instead of tantivy-fst's fixed state cap.
+# `meta` exposes bounded line-regex inputs while retaining assertion context.
 # `dfa-build` also lets `regex` build a full DFA for tiny patterns: ~0.1ms more per
 # Regex::new (measured), paid once per query, never per line.
-regex-automata = { version = "0.4.16", default-features = false, features = ["std", "syntax", "unicode", "dfa-build", "dfa-search"] }
+regex-automata = { version = "0.4.16", default-features = false, features = ["std", "syntax", "unicode", "dfa-build", "dfa-search", "meta"] }
 # רג'קס מהמשתמש (user_regex): ניתוח ה-HIR, סיווג והקלה לפני הקמפול.
 regex-syntax = "0.8.11"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -133,7 +134,7 @@ sha2 = "0.10"
 # the inference crates come only with `onnx-backend`, which `semantic-onnx` turns
 # on and the sidecar declares for desktop targets only. The `semantic*` features
 # gate the code that talks to it.
-otzaria-semantic-search = { git = "https://github.com/Otzaria/otzaria-semantic-search", rev = "86f45489d2ef0dcc139681e682bb84dc1e04dd81", default-features = false }
+otzaria-semantic-search = { git = "https://github.com/Otzaria/otzaria-semantic-search", rev = "6b006b0fe1440f8204385fbb42ee0d831bc8cfff", default-features = false }
 
 [dev-dependencies]
 # תבניות ההדגשה המשולבות כוללות lookahead (הפרדת תגי inline מתגי שבירה),

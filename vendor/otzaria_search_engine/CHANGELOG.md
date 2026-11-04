@@ -1,5 +1,90 @@
 # Changelog
 
+## 7.0.1 – 2026-11-02
+
+### Fixed
+
+- Typo-tolerant phrases and words combined with expansion options now include
+  arbitrary Hebrew single-letter substitutions and insertions for words of at
+  least four letters, within the expansion budgets. Existing typo/spelling combinations, explicit nikud requirements
+  and higher-priority variants remain available. Overflowing dictionary scans
+  collect higher-priority branches first, so broad typo expansions cannot evict
+  an earlier exact match before ranking.
+- Aramaic prefixes compose with the other search options without narrowing
+  their matches; phrase budgets retain expansions on both plain and vocalized
+  searches, including suffixed forms of words ending in a final letter.
+- Smart search reads long-line window keys through the document-column loader,
+  recovering library database paths and retaining PDF exclusion in schema 6.
+- A cache probe no longer ends a readable smart-scan session that is still in use.
+- Semantic model loading validates role-specific token caps, and installed
+  vector metadata exposes the model family from the updated sidecar.
+
+### Performance
+
+- Full typo edits are generated on demand and stop at the pattern/branch
+  budgets, avoiding quadratic retained allocations for long input tokens.
+- Display highlighting reuses capture-location buffers while scanning a line.
+
+## 7.0.0 – 2026-10-30
+
+### Breaking
+
+- `cancelLexicalSearch`, the three `set*DictionaryPath` methods, the three
+  `has*Dictionary` methods and `bookOrderRevision` now return `Future`s. Await
+  dictionary changes before searching or replacing an open dictionary file.
+- **Regex line anchors.** `^` and `$` at the edges of a `/…/` pattern now
+  anchor to the start and end of the line's normalized text and make the
+  pattern a line search (crossSpace); they used to be dropped. `/^ספר$/` was
+  the word ספר and is now a line whose whole text is that word, and
+  `/^\S+\s\S+$/` is a line of exactly two words.
+
+### Added
+
+- **`addPdfBookBytes`** takes the pages of a PDF book as one UTF-8 buffer with
+  the end offsets of each page's reference and text, so FRB no longer decodes
+  a string per page on the calling thread (Otzaria/otzaria#3443). The offsets
+  are validated before the index changes, valid text is borrowed without a
+  copy, and malformed UTF-8 is replaced per field. Pass `Uint8List` /
+  `Uint32List`; the transfer itself is still O(bytes).
+- `await engine.lexicalCancellationHandle()` returns a reusable handle whose
+  synchronous `cancel(requestId: ...)` bypasses the engine lock and FRB worker
+  queue. Obtain it before starting searches or indexing. The engine's async
+  `cancelLexicalSearch` remains available as a compatibility entry point.
+
+### Changed
+
+- `^` skips leading numbering such as `(ג)` or `[א]` followed by a space, and `$`
+  skips closing numbering such as `{פ}`. A pattern of anchors only, or an anchor
+  on the wrong edge (`/$א/`, `/א^/`), is invalid and falls back to a plain text
+  search. `\b` and spaces at the edges are still dropped. An anchored pattern
+  without a fixed word of two letters or more (e.g. `/^א.*/`) reads every book
+  in the search scope. A short word in parentheses at a line edge, such as
+  `(שם)`, counts as numbering.
+
+### Fixed
+
+- A filtered semantic search whose scan cannot be planned goes unplanned, as an
+  unfiltered one does, instead of failing its semantic half with
+  `queryFailed`. The app searches the whole library with the facet `/`, so on
+  a device where more changed books' long-line windows need discovery than
+  the budget allows, every smart search fell back to its lexical results
+  (Otzaria/otzaria#3517, #3545, #3532, #3535, #3410). Discovery stops on overflow,
+  including pending books' postings and further text batches in running workers.
+  Successful plans and overflow backoffs share a 16-filter LRU cache, keyed by
+  index generation and vector-set view; a recently used filter past the budget
+  is not walked again while its backoff is cached.
+- The same query asked again after its semantic half failed searches again,
+  instead of repeating the failure for ten minutes; its later pages still page
+  (Otzaria/otzaria#3531).
+- Engine calls no longer block the Dart isolate behind a long index write or
+  merge. Cancellation through the separate handle also works when every FRB
+  worker is busy.
+- The concurrent highlight-cache test no longer mistakes another thread's
+  brief cache access for a lock held by the pattern computation.
+- An anchored regex match is highlighted once, and the candidate filter keeps
+  the token boundary on each side, so punctuation the index ignores
+  (`ספר.ספר`, `ספר[א]`) no longer drops a match the pattern accepts.
+
 ## 6.0.0 – 2026-10-26
 
 > Breaking for every existing index: schema 10 changes the terms that `text`

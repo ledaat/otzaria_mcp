@@ -39,6 +39,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -557,17 +558,6 @@ impl WordFlags {
             || self.partial
             || self.aramaic_prefix
             || self.aramaic_suffix
-    }
-
-    /// האם סומנה אפשרות הרחבה שאינה ארמית — קובע אם הענף הארמי צריך
-    /// להתלוות לענף הרגיל (שממשיך לשאת את שאר האפשרויות) או לעמוד לבדו.
-    fn expands_besides_aramaic(&self) -> bool {
-        self.prefix
-            || self.suffix
-            || self.gram_prefix
-            || self.gram_suffix
-            || self.spelling
-            || self.partial
     }
 }
 
@@ -1839,6 +1829,10 @@ pub(crate) fn escape_regex(s: &str) -> String {
 
 /// Single-char form of [`escape_regex`], for builders that walk chars.
 fn push_escaped(out: &mut String, ch: char) {
+    if let Some(class) = typo_wildcard_class(ch) {
+        out.push_str(class);
+        return;
+    }
     if matches!(
         ch,
         '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
@@ -2132,6 +2126,64 @@ fn generate_common_typo_variations(word: &str) -> Vec<String> {
 const MIN_TYPO_SUBSTITUTION_LETTERS: usize = 3;
 const MIN_TYPO_EDIT_LETTERS: usize = 4;
 
+/// Typo wildcards — Unicode noncharacters — that [`push_escaped`] renders as
+/// a letter class, quotes never included: U+FDD0+i any letter but the i-th
+/// of [`typo_letters`], [`TYPO_ANY_LETTER`] any letter.
+const TYPO_OTHER_LETTER: char = '\u{FDD0}';
+const TYPO_ANY_LETTER: char = '\u{FDEE}';
+
+/// The letters of [`AFFIX_LETTER`] (quotes aside), in its class order.
+fn typo_letters() -> impl Iterator<Item = char> {
+    ('א'..='ת').chain('װ'..='ײ')
+}
+
+/// The wildcard that replaces `grapheme`: any letter but itself, so a
+/// substitution never matches the unchanged word (whose typed marks it would drop).
+fn typo_substitute(grapheme: &str) -> char {
+    match grapheme.chars().next() {
+        Some(c) => typo_letters()
+            .position(|l| l == c)
+            .and_then(|i| char::from_u32(TYPO_OTHER_LETTER as u32 + i as u32))
+            .unwrap_or(TYPO_ANY_LETTER),
+        None => TYPO_ANY_LETTER,
+    }
+}
+
+/// The class of every typo wildcard, indexed from [`TYPO_OTHER_LETTER`].
+fn typo_wildcard_classes() -> &'static [String] {
+    static CLASSES: OnceLock<Vec<String>> = OnceLock::new();
+    CLASSES.get_or_init(|| {
+        let ranges = |except: Option<char>| -> String {
+            let mut out = String::new();
+            for (lo, hi) in [('א', 'ת'), ('װ', 'ײ')] {
+                let parts = match except.filter(|c| (lo..=hi).contains(c)) {
+                    Some(c) => [(lo as u32, c as u32 - 1), (c as u32 + 1, hi as u32)],
+                    None => [(lo as u32, hi as u32), (1, 0)],
+                };
+                for (a, b) in parts.into_iter().filter(|(a, b)| a <= b) {
+                    out.push(char::from_u32(a).unwrap());
+                    if a < b {
+                        out.push('-');
+                        out.push(char::from_u32(b).unwrap());
+                    }
+                }
+            }
+            out
+        };
+        typo_letters()
+            .map(Some)
+            .chain([None])
+            .map(|except| format!("[{}]", ranges(except)))
+            .collect()
+    })
+}
+
+/// The class a typo wildcard stands for; `None` for any other char.
+fn typo_wildcard_class(ch: char) -> Option<&'static str> {
+    let i = (ch as u32).checked_sub(TYPO_OTHER_LETTER as u32)?;
+    typo_wildcard_classes().get(i as usize).map(String::as_str)
+}
+
 /// Letters of `word` that a typo may change: quotes and marks not counted.
 pub(crate) fn typo_letter_count(word: &str) -> usize {
     word.chars()
@@ -2211,6 +2263,59 @@ fn generate_typo_variations(word: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// The whole edit distance 1 that [`generate_typo_variations`] samples: one
+/// wildcard root per substitution and per insertion, then the transpositions
+/// and deletions. Empty below [`MIN_TYPO_EDIT_LETTERS`]. Each root is built
+/// only when requested, so a budget can stop before allocating the whole
+/// quadratic edit neighborhood of a long word.
+fn generate_typo_edits(word: &str) -> impl Iterator<Item = String> + '_ {
+    enum Edit {
+        Substitute(usize),
+        Insert(usize),
+        Transpose(usize),
+        Delete(usize),
+    }
+
+    let enabled = typo_letter_count(word) >= MIN_TYPO_EDIT_LETTERS;
+    let graphemes: Vec<(usize, &str)> = word.grapheme_indices(true).collect();
+    let n = graphemes.len();
+    let edits = (0..n)
+        .map(Edit::Substitute)
+        // Beginning and end first, then the interior positions.
+        .chain([0, n].into_iter().chain(1..n).map(Edit::Insert))
+        .chain((0..n.saturating_sub(1)).map(Edit::Transpose))
+        .chain((0..n).map(Edit::Delete));
+    let mut seen = HashSet::new();
+    edits
+        .take(if enabled { usize::MAX } else { 0 })
+        .filter_map(move |edit| {
+            let (at, len) = match edit {
+                Edit::Substitute(at) | Edit::Delete(at) => (at, 1),
+                Edit::Insert(at) => (at, 0),
+                Edit::Transpose(at) => {
+                    if graphemes[at].1 == graphemes[at + 1].1 {
+                        return None;
+                    }
+                    (at, 2)
+                }
+            };
+            let boundary = |i| graphemes.get(i).map_or(word.len(), |&(start, _)| start);
+            let mut variant = String::with_capacity(word.len() + TYPO_ANY_LETTER.len_utf8());
+            variant.push_str(&word[..boundary(at)]);
+            match edit {
+                Edit::Substitute(at) => variant.push(typo_substitute(graphemes[at].1)),
+                Edit::Insert(_) => variant.push(TYPO_ANY_LETTER),
+                Edit::Transpose(at) => {
+                    variant.push_str(graphemes[at + 1].1);
+                    variant.push_str(graphemes[at].1);
+                }
+                Edit::Delete(_) => {}
+            }
+            variant.push_str(&word[boundary(at + len)..]);
+            seen.insert(variant.clone()).then_some(variant)
+        })
+}
+
 // ── Affix arms: the one source of the morphology options ──────────────────
 //
 // Every option that surrounds a root — prefix/suffix windows, grammatical
@@ -2229,10 +2334,39 @@ pub(crate) struct AffixArm {
     pub(crate) trail: String,
 }
 
-impl AffixArm {
-    fn render(&self, core: impl Fn(&str) -> String) -> String {
-        format!("{}{}{}", self.lead, core(&self.core), self.trail)
+/// Render adjacent arms with the same prefix as `lead(?:core|stem+trail)`.
+/// In particular, a final letter's bare and suffixed forms must not each pay
+/// for the entire prefix group in the phrase budget. Keep the arms themselves
+/// separate: display highlighting still needs each literal core and its affixes.
+fn render_affix_arms(arms: Vec<AffixArm>, core: impl Fn(&str) -> String) -> Vec<String> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for arm in arms {
+        let body = format!("{}{}", core(&arm.core), arm.trail);
+        if let Some((lead, bodies)) = groups.last_mut() {
+            if *lead == arm.lead {
+                bodies.push(body);
+                continue;
+            }
+        }
+        groups.push((arm.lead, vec![body]));
     }
+    groups
+        .into_iter()
+        .flat_map(|(lead, bodies)| {
+            // An inner alternation costs a wrapper when spelling forms are
+            // joined outside it. Keep the original flat arms unless sharing
+            // the prefix saves at least that cost (in particular, an empty
+            // prefix must not add a wrapper around every spelling form).
+            if bodies.len() > 1 && budget_chars(&lead) * (bodies.len() - 1) >= "(?:)".len() {
+                vec![format!("{lead}{}", alternation(bodies))]
+            } else {
+                bodies
+                    .into_iter()
+                    .map(|body| format!("{lead}{body}"))
+                    .collect()
+            }
+        })
+        .collect()
 }
 
 fn user_prefix_window(root_len: usize) -> usize {
@@ -2270,12 +2404,18 @@ const AFFIX_LETTER: &str = "[א-תװ-ײ\"']";
 /// (`28שבת`, `154רמב"ם`).
 const NOTE_DIGITS: &str = "[0-9]*";
 
-/// A branch's length against the char budget: [`AFFIX_LETTER`] costs as the one `.` it
-/// narrows, so narrowing a window does not crowd typo branches out of a phrase word, and
-/// [`NOTE_DIGITS`] costs nothing.
+/// A branch's length against the char budget: [`AFFIX_LETTER`] and the typo wildcard
+/// classes cost as the one `.` they narrow, so narrowing a window does not crowd typo
+/// branches out of a phrase word, and [`NOTE_DIGITS`] costs nothing.
 fn budget_chars(branch: &str) -> usize {
+    let classes: usize = typo_wildcard_classes()
+        .iter()
+        .map(String::as_str)
+        .chain([AFFIX_LETTER])
+        .map(|class| branch.matches(class).count() * (class.chars().count() - 1))
+        .sum();
     branch.chars().count()
-        - branch.matches(AFFIX_LETTER).count() * (AFFIX_LETTER.chars().count() - 1)
+        - classes
         - branch.matches(NOTE_DIGITS).count() * NOTE_DIGITS.chars().count()
 }
 
@@ -2317,9 +2457,8 @@ fn base_len(root: &str) -> usize {
     root.chars().filter(|&c| !is_attached_mark(c)).count()
 }
 
-/// The affix arms of one root form under `flags`: the Aramaic prefix arm
-/// when asked for, and the arm of the remaining options — prefix and suffix
-/// options compose (each side is the union of its selected options).
+/// The affix arms of one root form under `flags`: prefix and suffix options
+/// compose — each side is the union of its selected options.
 pub(crate) fn affix_arms(root: &str, flags: &WordFlags, voc: bool) -> Vec<AffixArm> {
     let letters = base_len(root);
     if letters == 0 {
@@ -2329,21 +2468,6 @@ pub(crate) fn affix_arms(root: &str, flags: &WordFlags, voc: bool) -> Vec<AffixA
     let gram_suffix =
         flags.gram_suffix && (abbreviation || letters >= MIN_GRAM_SUFFIX_ROOT_LETTERS);
     let mut arms = Vec::new();
-    if flags.aramaic_prefix {
-        let lead = prefix_group(ARAMAIC_PREFIX_ALTS_A, voc);
-        for (core, trail) in suffix_sides(root, letters, None, gram_suffix, voc) {
-            arms.push(AffixArm {
-                lead: lead.clone(),
-                core,
-                trail,
-            });
-        }
-        // The Aramaic arm already covers the bare form (its prefixes are
-        // optional); the base arm joins only for an option it lacks.
-        if !flags.expands_besides_aramaic() {
-            return arms;
-        }
-    }
     let both_windows = flags.partial || (flags.prefix && flags.suffix);
     let mut leads = Vec::new();
     let mut trail_window = None;
@@ -2364,7 +2488,11 @@ pub(crate) fn affix_arms(root: &str, flags: &WordFlags, voc: bool) -> Vec<AffixA
             trail_window = Some(user_suffix_window(letters));
         }
     }
-    if flags.gram_prefix && (abbreviation || letters >= MIN_GRAM_PREFIX_ROOT_LETTERS) {
+    // The Aramaic group contains the grammatical one, with no root-letter floor. A separate
+    // Aramaic arm would double every branch and push typo variants out of the char budget.
+    if flags.aramaic_prefix {
+        leads.push(prefix_group(ARAMAIC_PREFIX_ALTS_A, voc));
+    } else if flags.gram_prefix && (abbreviation || letters >= MIN_GRAM_PREFIX_ROOT_LETTERS) {
         leads.push(prefix_group(GRAM_PREFIX_ALTS_A, voc));
     }
     let lead = alternation(leads);
@@ -2516,8 +2644,8 @@ fn word_to_pattern(root: &str, flags: &WordFlags) -> String {
             vec![variant.clone()]
         };
         for form in forms {
-            for arm in affix_arms(&form, flags, false) {
-                push_unique(&mut branches, &mut seen, arm.render(escape_regex));
+            for pattern in render_affix_arms(affix_arms(&form, flags, false), escape_regex) {
+                push_unique(&mut branches, &mut seen, pattern);
             }
         }
     }
@@ -2604,13 +2732,9 @@ fn optional_alts_group(alts: &[&str], voc: bool) -> String {
 /// what was typed). Spelling variants arrive as their own root forms (see
 /// [`build_word_regex_vocalized`]).
 fn word_to_pattern_vocalized(text: &str, required: &VocalizedFlags, flags: &WordFlags) -> String {
-    let mut branches: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for arm in affix_arms(text, flags, true) {
-        let branch = arm.render(|core| vocalized_token_pattern(core, required));
-        push_unique(&mut branches, &mut seen, branch);
-    }
-    alternation(branches)
+    alternation(render_affix_arms(affix_arms(text, flags, true), |core| {
+        vocalized_token_pattern(core, required)
+    }))
 }
 
 /// Vocalized counterpart of [`build_word_regex`]: assembles the branch list
@@ -2716,41 +2840,13 @@ fn build_word_regex_vocalized(
         }
     }
 
-    // Char budget (phrase path): identical policy to `build_word_regex`.
-    let mut kept: Vec<String> = Vec::new();
-    let mut total = 0usize;
-    for b in branches {
-        if b.trim().is_empty() {
-            continue;
-        }
-        let len = budget_chars(&b);
-        if let Some(max_chars) = budget.max_pattern_chars {
-            if !kept.is_empty() && total + len > max_chars {
-                break;
-            }
-        }
-        total += len;
-        kept.push(b);
-    }
-    if kept.is_empty() {
-        return fallback();
-    }
-    if let Some(max_chars) = budget.max_pattern_chars {
-        let joined_chars = kept.iter().map(|b| budget_chars(b)).sum::<usize>()
-            + if kept.len() == 1 {
-                0
-            } else {
-                kept.len() - 1 + "(?:)".len()
-            };
-        if joined_chars > max_chars {
-            return fallback();
-        }
-    }
-    if kept.len() == 1 {
-        WordPattern::Literal(kept.into_iter().next().unwrap())
-    } else {
-        WordPattern::Alternation(kept)
-    }
+    let bases: Vec<String> = candidates.iter().map(|c| strip_attached_marks(c)).collect();
+    let edits = |kept: &[String]| {
+        typo_edit_branches(flags, &bases, max, kept, |root| {
+            Some(word_to_pattern_vocalized(root, &free, flags))
+        })
+    };
+    finish_word_pattern(branches, budget, edits, fallback)
 }
 
 /// Query-side normalisation for the vocalized field: folds presentation
@@ -2853,6 +2949,7 @@ fn build_word_regex(
 
     let max = flags.max_variations(budget);
     let mut branches: Vec<String> = Vec::new();
+    let mut roots: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
     // Branch order is a contract (see `single_regex_term_query`): collection
@@ -2864,14 +2961,17 @@ fn build_word_regex(
     // whose regenerated originals dedupe against pass 0 via `seen`.
     'passes: for pass in 0..=usize::from(flags.typo) {
         for candidate in &candidates {
-            let roots: Vec<String> = if pass == 0 {
+            let pass_roots: Vec<String> = if pass == 0 {
                 vec![candidate.clone()]
             } else {
                 generate_typo_variations(candidate, budget.typo_variations)
             };
-            for root in roots {
+            for root in pass_roots {
                 let pattern = word_to_pattern(&root, flags);
-                push_unique(&mut branches, &mut seen, pattern);
+                if seen.insert(pattern.clone()) {
+                    branches.push(pattern);
+                    roots.push(root);
+                }
                 if branches.len() >= max {
                     break 'passes;
                 }
@@ -2879,56 +2979,113 @@ fn build_word_regex(
         }
     }
 
-    // Apply the length budget when one exists (phrase path): keep branches
-    // while the cumulative character count stays under it (at least one
-    // branch is always kept so the term is never empty).
-    let mut kept: Vec<String> = Vec::new();
-    let mut total = 0usize;
-    for b in branches {
-        if b.trim().is_empty() {
+    // The full edits skip the roots a kept branch covers, and the spelling
+    // variants (a second edit).
+    let edit_flags = WordFlags {
+        spelling: false,
+        ..flags.clone()
+    };
+    let edits = |kept: &[String]| {
+        let covered: HashSet<&str> = roots
+            .iter()
+            .zip(&branches)
+            .filter(|(_, pattern)| kept.contains(pattern))
+            .map(|(root, _)| root.as_str())
+            .collect();
+        typo_edit_branches(flags, &candidates, max, kept, move |root| {
+            (!covered.contains(root)).then(|| word_to_pattern(root, &edit_flags))
+        })
+    };
+    finish_word_pattern(branches.clone(), budget, edits, || {
+        WordPattern::Literal(escape_regex(word))
+    })
+}
+
+/// Keep the highest-priority branches whose *joined* pattern fits, then the
+/// full typo `edits` within [`MAX_TYPO_EDIT_CHARS`] of their own, so they never
+/// displace a branch. Only an oversized first branch (or no usable branch)
+/// needs the literal fallback.
+fn finish_word_pattern<I: IntoIterator<Item = String>>(
+    branches: Vec<String>,
+    budget: &VariationBudget,
+    edits: impl FnOnce(&[String]) -> I,
+    fallback: impl FnOnce() -> WordPattern,
+) -> WordPattern {
+    let mut kept = Vec::new();
+    keep_joined(&mut kept, branches, budget.max_pattern_chars);
+    if !kept.is_empty() {
+        let edits = edits(&kept);
+        let edit_chars = budget.max_pattern_chars.map(|_| MAX_TYPO_EDIT_CHARS);
+        keep_joined(&mut kept, edits, edit_chars);
+    }
+    match kept.len() {
+        0 => fallback(),
+        1 => WordPattern::Literal(kept.pop().unwrap()),
+        _ => WordPattern::Alternation(kept),
+    }
+}
+
+/// Appends `branches` to `kept` while what they add to the joined pattern fits
+/// `max_chars`. Separators count as each branch is added, so plain and
+/// vocalized queries cannot lose every expansion to the final alternation.
+fn keep_joined(
+    kept: &mut Vec<String>,
+    branches: impl IntoIterator<Item = String>,
+    max_chars: Option<usize>,
+) {
+    let mut total = 0;
+    for branch in branches {
+        if branch.trim().is_empty() {
             continue;
         }
-        let len = budget_chars(&b);
-        if let Some(max_chars) = budget.max_pattern_chars {
-            if !kept.is_empty() && total + len > max_chars {
+        if let Some(max_chars) = max_chars {
+            // The second branch introduces `(?:`, `|` and `)`; each later
+            // branch adds just its separator. A lone branch has no wrapper.
+            let overhead = match kept.len() {
+                0 => 0,
+                1 => "(?:|)".len(),
+                _ => 1,
+            };
+            let joined_chars = total + budget_chars(&branch) + overhead;
+            if joined_chars > max_chars {
                 break;
             }
+            total = joined_chars;
         }
-        total += len;
-        kept.push(b);
+        kept.push(branch);
     }
+}
 
-    if kept.is_empty() {
-        return WordPattern::Literal(escape_regex(word));
-    }
-    // Final safety net (phrase path only): the branch totals passed the
-    // budget, but the joined form the exact phrase path / highlight
-    // automatons compile also carries `(?:`/`)`/pipe separators. Drop the
-    // lowest-priority branches until the joined form fits — never nuke the
-    // whole option set. Only a *single* branch that alone exceeds the budget
-    // (impossible for the builders above, possible for a hostile string-API
-    // pattern) still falls back to the plain literal, which always compiles.
-    if let Some(max_chars) = budget.max_pattern_chars {
-        let joined_chars = |kept: &[String]| {
-            kept.iter().map(|b| budget_chars(b)).sum::<usize>()
-                + if kept.len() == 1 {
-                    0
-                } else {
-                    kept.len() - 1 + "(?:)".len()
-                }
-        };
-        while kept.len() > 1 && joined_chars(&kept) > max_chars {
-            kept.pop();
-        }
-        if joined_chars(&kept) > max_chars {
-            return WordPattern::Literal(escape_regex(word));
-        }
-    }
-    if kept.len() == 1 {
-        WordPattern::Literal(kept.into_iter().next().unwrap())
+/// Char budget of the full typo edits ([`generate_typo_edits`]) on the
+/// phrase path, on top of [`MAX_PATTERN_CHARS`]: the edits never take the
+/// place of a sampled typo variant or of any other branch.
+const MAX_TYPO_EDIT_CHARS: usize = 6_000;
+
+/// The patterns `pattern` renders for the full typo edits of `candidates`
+/// (none without typo tolerance), absent from `kept`, at most `max`;
+/// `pattern` returns `None` for a covered root. Rendering stays lazy too:
+/// [`keep_joined`] stops requesting patterns as soon as the char budget is full.
+fn typo_edit_branches<'a>(
+    flags: &WordFlags,
+    candidates: &'a [String],
+    max: usize,
+    kept: &[String],
+    mut pattern: impl FnMut(&str) -> Option<String> + 'a,
+) -> impl Iterator<Item = String> + 'a {
+    let enabled = flags.typo;
+    let mut seen: HashSet<String> = if enabled {
+        kept.iter().cloned().collect()
     } else {
-        WordPattern::Alternation(kept)
-    }
+        HashSet::new()
+    };
+    candidates
+        .iter()
+        .flat_map(|candidate| generate_typo_edits(candidate))
+        .filter_map(move |root| {
+            let pattern = pattern(&root)?;
+            seen.insert(pattern.clone()).then_some(pattern)
+        })
+        .take(if enabled { max } else { 0 })
 }
 
 // ── Input parsing helpers ──────────────────────────────────────────────────
@@ -4395,6 +4552,143 @@ mod tests {
     }
 
     #[test]
+    fn phrase_typo_with_affixes_and_spelling_keeps_every_edit() {
+        // The sampled variants' spelling × affix forms fill the phrase char
+        // budget; the full edits still fit in their own.
+        let flags = WordFlags {
+            typo: true,
+            gram_prefix: true,
+            gram_suffix: true,
+            spelling: true,
+            ..Default::default()
+        };
+        for (word, terms) in [
+            (
+                "ברכה",
+                &["ברקה", "וברקה", "ברקתו", "ברגה", "רבכה", "ברכ"][..],
+            ),
+            ("רמב\"ם", &["רמו\"ם", "מרב\"ם", "והרמ\"ם"][..]),
+            ("שבתותיהם", &["שתותיהם", "בשתותיהם", "שבתותיכם"][..]),
+        ] {
+            let pattern = build_word_regex(word, &flags, &[], &PHRASE_BUDGET).joined();
+            assert!(
+                budget_chars(&pattern) <= MAX_PATTERN_CHARS + MAX_TYPO_EDIT_CHARS,
+                "{word}"
+            );
+            let re = regex::Regex::new(&format!("^(?:{pattern})$")).unwrap();
+            for term in terms {
+                assert!(re.is_match(term), "{word} ↛ {term}");
+            }
+        }
+    }
+
+    #[test]
+    fn typo_edits_change_or_add_any_letter() {
+        // ל→ב is no common confusion, yet ללבות is one edit from לבבות (#3673).
+        let flags = WordFlags {
+            typo: true,
+            ..Default::default()
+        };
+        let pattern = build_word_regex("ללבות", &flags, &[], &PHRASE_BUDGET).joined();
+        let re = regex::Regex::new(&format!("^(?:{pattern})$")).unwrap();
+        for term in ["ללבות", "לבבות", "לבות", "לללבות", "ללבתו", "ללבותי"]
+        {
+            assert!(re.is_match(term), "{term}");
+        }
+        for term in ["לבבבות", "לבבו", "ללב"] {
+            assert!(!re.is_match(term), "{term}");
+        }
+    }
+
+    #[test]
+    fn typo_edit_iterator_keeps_graphemes_and_priority() {
+        let edits: Vec<String> = generate_typo_edits("אָבגד").collect();
+        assert_eq!(edits.len(), 16);
+        assert_eq!(edits[0], format!("{}בגד", typo_substitute("אָ")));
+        assert_eq!(edits[4], format!("{TYPO_ANY_LETTER}אָבגד"));
+        assert_eq!(edits[5], format!("אָבגד{TYPO_ANY_LETTER}"));
+        assert_eq!(edits[9], "באָגד");
+        assert_eq!(edits[12], "בגד");
+        // Equal adjacent graphemes do not transpose; identical deletions dedupe.
+        assert_eq!(generate_typo_edits("ממממ").count(), 10);
+    }
+
+    #[test]
+    fn phrase_typo_char_budget_stops_rendering_extra_edits() {
+        let word = "מ".repeat(4_096);
+        let candidates = [word.clone()];
+        let flags = WordFlags {
+            typo: true,
+            prefix: true,
+            ..Default::default()
+        };
+        let rendered = std::cell::Cell::new(0);
+        let pattern = finish_word_pattern(
+            vec![word],
+            &PHRASE_BUDGET,
+            |kept| {
+                typo_edit_branches(&flags, &candidates, MAX_TYPO_VARIATIONS, kept, |root| {
+                    rendered.set(rendered.get() + 1);
+                    Some(word_to_pattern(root, &flags))
+                })
+            },
+            || panic!("the exact branch fits"),
+        );
+        // One edit fits the extra 6K budget; the next ends generation. Do not
+        // render 64 branches or materialize every edit of this long token.
+        assert_eq!(pattern.branches().len(), 2);
+        assert_eq!(rendered.get(), 2);
+    }
+
+    #[test]
+    fn typo_substitution_never_keeps_the_letter() {
+        // A substitution matching its own letter would drop the typed marks.
+        let flags = WordFlags {
+            typo: true,
+            ..Default::default()
+        };
+        let voc = VocalizedFlags::new(true, false);
+        let pattern =
+            build_word_regex_vocalized("בָּרכה", &flags, &[], &voc, &PHRASE_BUDGET).joined();
+        let re = regex::Regex::new(&format!("^(?:{pattern})$")).unwrap();
+        for term in ["בָּרכה", "בְּרקה", "בְּרגה", "בְּרכ", "בְּרכהו"]
+        {
+            assert!(re.is_match(term), "{term}");
+        }
+        for term in ["בְּרכה", "ברכה", "בְּרגגה"] {
+            assert!(!re.is_match(term), "{term}");
+        }
+        for (i, letter) in typo_letters().enumerate() {
+            let class = typo_wildcard_class(typo_substitute(&letter.to_string())).unwrap();
+            let re = regex::Regex::new(&format!("^{class}$")).unwrap();
+            assert!(!re.is_match(&letter.to_string()), "{letter}");
+            assert_eq!(
+                typo_letters()
+                    .filter(|l| re.is_match(&l.to_string()))
+                    .count(),
+                29,
+                "{i}"
+            );
+            assert!(!re.is_match("\"") && !re.is_match("'"));
+        }
+        assert_eq!(typo_substitute("\""), TYPO_ANY_LETTER);
+        let any = typo_wildcard_class(TYPO_ANY_LETTER).unwrap();
+        let re = regex::Regex::new(&format!("^{any}$")).unwrap();
+        assert!(re.is_match("א") && !re.is_match("\"") && !re.is_match("'"));
+        // Nor does an inserted quote: with the quotes ignored, רמב"ם is רמבם unchanged.
+        let flags = WordFlags {
+            typo: true,
+            ignore_quotes: true,
+            ..Default::default()
+        };
+        let pattern =
+            build_word_regex_vocalized("רַמְבַּ\"ם", &flags, &[], &voc, &PHRASE_BUDGET).joined();
+        let re = regex::Regex::new(&format!("^(?:{pattern})$")).unwrap();
+        assert!(re.is_match("רַמְבַּם") && re.is_match("רִמְבִּים"));
+        assert!(!re.is_match("רִמִבִ\"םִ") && !re.is_match("רִמְבִּם"));
+    }
+
+    #[test]
     fn match_tiers_order_exact_affix_spelling_typo() {
         let roots = vec!["תורה".to_string(), "ספר".to_string()];
         for (term, tier) in [
@@ -4433,6 +4727,13 @@ mod tests {
         let four = generate_typo_variations("ברכה", 500);
         for v in ["ברכ", "רבכה", "בברכה", "ברקה"] {
             assert!(four.contains(&v.to_string()), "{v}");
+        }
+        // The full edits: any letter but כ in its place, any letter before it.
+        assert!(generate_typo_edits("שבת").next().is_none());
+        let edits: Vec<String> = generate_typo_edits("ברכה").collect();
+        let other_kaf = typo_substitute("כ");
+        for v in [format!("בר{other_kaf}ה"), format!("{TYPO_ANY_LETTER}ברכה")] {
+            assert!(edits.contains(&v), "{v}");
         }
         // מרחק העריכה במנוע (אוטומט לבנשטיין) רק למילה של ארבע אותיות לפחות;
         // מילה קצרה נשארת עם הווריאנטים המוגבלים.
@@ -4827,6 +5128,164 @@ mod tests {
     }
 
     #[test]
+    fn aramaic_prefix_composes_with_the_other_options() {
+        let flags = WordFlags {
+            aramaic_prefix: true,
+            partial: true,
+            gram_suffix: true,
+            ..Default::default()
+        };
+        // קידומת ארמית (כולל א וגם בשורש קצר) עם חלון חלק-ממילה ועם סיומת דקדוקית.
+        for form in ["אשבתא", "דשבתות", "דשבתאי", "שבתותיהם"] {
+            assert!(word_accepts("שבת", &flags, form), "{form}");
+        }
+        assert!(word_accepts(
+            "אב",
+            &WordFlags {
+                aramaic_prefix: true,
+                gram_prefix: true,
+                ..Default::default()
+            },
+            "דאב"
+        ));
+        // קידומת ארמית על שורש קצר מתחברת לחלון הסיומות.
+        let short = WordFlags {
+            aramaic_prefix: true,
+            gram_prefix: true,
+            suffix: true,
+            ..Default::default()
+        };
+        assert!(word_accepts("אב", &short, "ואבות"));
+    }
+
+    /// otzaria#3673: קידומות ארמיות לא מוסיפות ענפים, כדי שתקציב התווים של הביטוי
+    /// לא ישמיט את וריאנטי שגיאות הכתיב.
+    #[test]
+    fn aramaic_prefix_keeps_the_phrase_branches_of_the_other_options() {
+        let regular = [
+            OPT_GRAM_PREFIX,
+            OPT_GRAM_SUFFIX,
+            OPT_SPELLING,
+            OPT_PARTIAL,
+            OPT_TYPO,
+        ];
+        for query in ["לבבות דקל", "ללבות דקל", "דקל ללבות"] {
+            let words = split_query_words(query);
+            let build = |extra: Option<&str>| {
+                let flags: Vec<(&str, bool)> = regular
+                    .iter()
+                    .chain(extra.iter())
+                    .map(|k| (*k, true))
+                    .collect();
+                let keys: Vec<String> = words
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| format!("{w}_{i}"))
+                    .collect();
+                let pairs: Vec<(&str, &[(&str, bool)])> = keys
+                    .iter()
+                    .map(|k| (k.as_str(), flags.as_slice()))
+                    .collect();
+                prepare_advanced_query(
+                    query,
+                    0,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &make_options(&pairs),
+                )
+            };
+            let base = build(None);
+            let aramaic = build(Some(OPT_ARAMAIC_PREFIX));
+            for (b, a) in base.regex_terms.iter().zip(&aramaic.regex_terms) {
+                assert_eq!(a.branches().len(), b.branches().len(), "{query}");
+            }
+        }
+        let aramaic = |query: &str, word: usize| {
+            let key = format!("{}_{word}", split_query_words(query)[word]);
+            let flags: Vec<(&str, bool)> = regular
+                .iter()
+                .chain([&OPT_ARAMAIC_PREFIX])
+                .map(|k| (*k, true))
+                .collect();
+            let q = prepare_advanced_query(
+                query,
+                0,
+                &HashMap::new(),
+                &HashMap::new(),
+                &make_options(&[(key.as_str(), flags.as_slice())]),
+            );
+            q.regex_terms[word].joined()
+        };
+        for term in ["דלבבות", "אלבבות"] {
+            assert!(accepts(&aramaic("לבבות דקל", 0), term), "{term}");
+        }
+        for term in ["דללבות", "וללבות"] {
+            assert!(accepts(&aramaic("דקל ללבות", 1), term), "{term}");
+        }
+    }
+
+    #[test]
+    fn vocalized_phrase_keeps_affixes_at_the_joined_budget() {
+        let flags = make_options(&[(
+            "בראשית_0",
+            &[
+                (OPT_TYPO, true),
+                (OPT_GRAM_PREFIX, true),
+                (OPT_ARAMAIC_PREFIX, true),
+            ],
+        )]);
+        let q = prepare_advanced_query_vocalized(
+            "בראשית שלום",
+            0,
+            &HashMap::new(),
+            &HashMap::new(),
+            &flags,
+            &VocalizedFlags::new(true, false),
+        );
+        let pattern = q.regex_terms[0].joined();
+        for term in ["בראשית", "ובראשית", "דבראשית", "וּבְרֵאשִׁית"]
+        {
+            assert!(accepts(&pattern, term), "lost {term}");
+        }
+        assert!(budget_chars(&pattern) <= MAX_PATTERN_CHARS + MAX_TYPO_EDIT_CHARS);
+    }
+
+    #[test]
+    fn final_letter_suffix_windows_keep_phrase_typos() {
+        let flags = make_options(&[(
+            "אברהם_0",
+            &[
+                (OPT_TYPO, true),
+                (OPT_SPELLING, true),
+                (OPT_SUFFIX, true),
+                (OPT_ARAMAIC_PREFIX, true),
+            ],
+        )]);
+        let q = prepare_advanced_query("אברהם שלום", 0, &HashMap::new(), &HashMap::new(), &flags);
+        let pattern = q.regex_terms[0].joined();
+        for term in ["אברהם", "אברעם", "ואברעם"] {
+            assert!(accepts(&pattern, term), "lost {term}");
+        }
+        assert!(budget_chars(&pattern) <= MAX_PATTERN_CHARS + MAX_TYPO_EDIT_CHARS);
+    }
+
+    #[test]
+    fn spelling_and_suffix_windows_keep_initial_insertion_typos() {
+        // With no prefix to share, wrapping each spelling form's arms in
+        // another alternation would spend the budget on grouping and drop
+        // these insertion variants that follow the common substitutions.
+        let flags = make_options(&[(
+            "אברהם_0",
+            &[(OPT_TYPO, true), (OPT_SPELLING, true), (OPT_SUFFIX, true)],
+        )]);
+        let q = prepare_advanced_query("אברהם שלום", 0, &HashMap::new(), &HashMap::new(), &flags);
+        let pattern = q.regex_terms[0].joined();
+        for term in ["אברהם", "ואברהם", "יאברהם"] {
+            assert!(accepts(&pattern, term), "lost {term}");
+        }
+    }
+
+    #[test]
     fn vocalized_aramaic_uses_voc_prefix_group() {
         let flags = WordFlags {
             aramaic_prefix: true,
@@ -4898,10 +5357,10 @@ mod tests {
 
     #[test]
     fn single_word_budget_relaxes_branch_count() {
-        // With the phrase budget, typo+partial caps at MAX_TYPO_VARIATIONS
-        // branches; the single-word budget must go beyond it. A long word is
-        // needed to saturate both caps — a 3-letter word's edit-distance-1
-        // neighborhood is naturally smaller than the raised phrase cap.
+        // With the phrase budget, typo+partial caps the sampled variants at
+        // MAX_TYPO_VARIATIONS branches, the full edits after them; the
+        // single-word budget must go beyond it. A long word is needed to
+        // saturate both caps.
         let flags = WordFlags {
             typo: true,
             partial: true,
@@ -4909,9 +5368,15 @@ mod tests {
         };
         let phrase = build_word_regex("בראשית", &flags, &[], &PHRASE_BUDGET);
         let single = build_word_regex("בראשית", &flags, &[], &SINGLE_WORD_BUDGET);
-        assert_eq!(phrase.branches().len(), MAX_TYPO_VARIATIONS);
+        let first_edit = word_to_pattern(&generate_typo_edits("בראשית").next().unwrap(), &flags);
+        let first_edit_at = phrase.branches().iter().position(|b| *b == first_edit);
+        assert_eq!(first_edit_at, Some(MAX_TYPO_VARIATIONS));
+        assert_eq!(
+            phrase.branches()[..MAX_TYPO_VARIATIONS],
+            single.branches()[..MAX_TYPO_VARIATIONS]
+        );
         assert!(
-            single.branches().len() > MAX_TYPO_VARIATIONS,
+            single.branches().len() > phrase.branches().len(),
             "single-word budget produced only {} branches",
             single.branches().len()
         );

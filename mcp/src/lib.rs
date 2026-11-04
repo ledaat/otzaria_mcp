@@ -11,6 +11,7 @@ pub mod refs;
 pub mod reload;
 pub mod search;
 pub mod secondary;
+pub mod semantic;
 pub mod server;
 pub mod text;
 pub mod toc_search;
