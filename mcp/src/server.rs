@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db::{Db, Era};
-use crate::refs::{rank_candidates, RefCandidate, ResolveOptions};
+use crate::findref::{FindRefRequest, MAX_BATCH, RESOLVER};
 use crate::reload::{Library, Snapshot};
 use crate::search::{self, Mode, SearchRequest, WordOptions};
 use crate::secondary::Source;
@@ -312,6 +312,39 @@ pub struct ResolveRefParams {
     /// id — check `source` before passing a candidate to get_text / get_links.
     #[serde(default)]
     pub sources: Option<Vec<String>>,
+    /// Drop candidates that only name a book or one of its parts ("קצות החושן",
+    /// "טור יו\"ד" — flagged `book_level`); default false.
+    #[serde(default)]
+    pub exclude_book_level: Option<bool>,
+    /// When nothing else resolves, look for the reference as a substring of the library's
+    /// heRefs (a full scan of every line — slow, and rarely the place meant). Default true.
+    #[serde(default)]
+    pub heref_fallback: Option<bool>,
+    /// Include each candidate line's text as `snippet` (default true).
+    #[serde(default)]
+    pub snippets: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResolveRefsParams {
+    /// The references, each as resolve_ref's `reference` (at most 2000). The answers come
+    /// back in the same order; a repeated reference is resolved once.
+    pub references: Vec<String>,
+    /// Max candidates per reference (default 10, capped at 50).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// As resolve_ref's `sources`.
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+    /// As resolve_ref's `exclude_book_level` (default false).
+    #[serde(default)]
+    pub exclude_book_level: Option<bool>,
+    /// As resolve_ref's `heref_fallback` (default true).
+    #[serde(default)]
+    pub heref_fallback: Option<bool>,
+    /// As resolve_ref's `snippets` (default true).
+    #[serde(default)]
+    pub snippets: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -605,6 +638,7 @@ impl OtzariaServer {
             json!({
                 "db_version": snap.db.schema_version(),
                 "db_schema_version": snap.db.db_schema_version(),
+                "resolver": RESOLVER,
                 "stats": stats,
                 "capabilities": snap.db.caps,
                 "index": index,
@@ -956,54 +990,69 @@ impl OtzariaServer {
     ) -> Result<CallToolResult, ErrorData> {
         let reference = required_text(p.reference, "reference")?;
         let snap = self.lib.current();
-        let limit = p.limit.unwrap_or(10).clamp(1, 50) as i64;
         let db = snap.db.clone();
-        let filters: Vec<String> = p
-            .sources
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec!["library".to_string()]);
-        let all = filters.iter().any(|f| f.trim() == "all");
-        let wants = move |src: &Source| all || filters.iter().any(|f| src.matches_filter(f));
+        let req = FindRefRequest::new(
+            p.limit,
+            p.sources,
+            p.exclude_book_level,
+            p.heref_fallback,
+            p.snippets,
+        );
         let secondary = self.lib.secondary();
-        let candidates = run_blocking(move || {
-            let mut out: Vec<(usize, RefCandidate)> = Vec::new();
-            if wants(&Source::Library) {
-                out.extend(
-                    db.resolve_ref(&reference, limit)?
-                        .into_iter()
-                        .map(|c| (0, c)),
-                );
-            }
-            let opts = ResolveOptions {
-                heref_fallback: false,
-                app_detection: true,
-            };
-            for sec in &secondary.dbs {
-                if !wants(&sec.spec.source) {
-                    continue;
-                }
-                let Some(sdb) = sec.db() else { continue };
-                // one broken database must not sink the lookup
-                match sdb.resolve_ref_with(&reference, limit, opts) {
-                    Ok(cands) => out.extend(cands.into_iter().map(|mut c| {
-                        c.set_source(&sec.spec.source);
-                        (0, c)
-                    })),
-                    Err(e) => eprintln!(
-                        "otzaria-mcp: resolve_ref in {} failed: {e:#}",
-                        sec.spec.path.display()
-                    ),
-                }
-            }
-            // One ranking across sources (see refs::rank_candidates).
-            let mut out = rank_candidates(&reference, out.into_iter().map(|(_, c)| c).collect());
-            out.truncate(limit as usize);
-            Ok::<_, anyhow::Error>(out)
+        let candidates =
+            run_blocking(move || crate::findref::resolve(&db, &secondary, &reference, &req))
+                .await?;
+        self.respond(
+            &snap,
+            json!({ "count": candidates.len(), "candidates": candidates, "resolver": RESOLVER }),
+        )
+    }
+
+    #[tool(
+        name = "resolve_refs",
+        description = "resolve_ref for many references in one call — e.g. every citation of a note, or \
+                       every variant of every citation. Same parameters (`limit`, `sources`, \
+                       `exclude_book_level`, `heref_fallback`, `snippets`) applied to all; `results` holds \
+                       one entry per reference, in order: {reference, count, candidates, ms}, or \
+                       {reference, error} for one that failed. `resolver` names the generation of the \
+                       answers (unchanged while the same reference gets the same candidates), for caching.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn resolve_refs(
+        &self,
+        Parameters(p): Parameters<ResolveRefsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if p.references.len() > MAX_BATCH {
+            return Err(ErrorData::invalid_params(
+                format!("at most {MAX_BATCH} references per call"),
+                None,
+            ));
+        }
+        let snap = self.lib.current();
+        let db = snap.db.clone();
+        let req = FindRefRequest::new(
+            p.limit,
+            p.sources,
+            p.exclude_book_level,
+            p.heref_fallback,
+            p.snippets,
+        );
+        let secondary = self.lib.secondary();
+        let refs = p.references;
+        let (results, ms) = run_blocking(move || {
+            let t = std::time::Instant::now();
+            let r = crate::findref::resolve_batch(&db, &secondary, &refs, &req);
+            Ok((r, t.elapsed().as_millis() as u64))
         })
         .await?;
         self.respond(
             &snap,
-            json!({ "count": candidates.len(), "candidates": candidates }),
+            json!({
+                "count": results.len(),
+                "results": results,
+                "resolver": RESOLVER,
+                "timing_ms": { "total": ms },
+            }),
         )
     }
 

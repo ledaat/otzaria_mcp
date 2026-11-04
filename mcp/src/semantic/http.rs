@@ -11,6 +11,8 @@
 //!   POST /text     {url | book_id+line_index[+source] | ref, before, after}
 //!   POST /check_quote {quote, [url | book_id+line_index | ref, span]}
 //!   POST /feedback {type: like|dislike|entry, ...} or {event: {...}}
+//!   POST /resolve_refs {references: [...], limit, sources, exclude_book_level, ...}
+//!                                (find-ref, as the stdio tool resolve_refs)
 //!   POST /shutdown               (a newer plugin or MCP replacing this server)
 //! ```
 
@@ -22,6 +24,7 @@ use serde_json::{json, Map, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use super::service::{BadRequest, SemanticService, VERSION};
+use crate::findref::FindRefService;
 
 fn respond(req: Request, code: u16, body: &Value) {
     let data = serde_json::to_vec(body).unwrap_or_default();
@@ -31,7 +34,12 @@ fn respond(req: Request, code: u16, body: &Value) {
     let _ = req.respond(resp);
 }
 
-fn handle(svc: &SemanticService, mut req: Request, server: &Server) -> bool {
+fn handle(
+    svc: &SemanticService,
+    findref: Option<&FindRefService>,
+    mut req: Request,
+    server: &Server,
+) -> bool {
     let path = req.url().split('?').next().unwrap_or("").to_string();
     let method = req.method().clone();
     if method == Method::Options {
@@ -92,6 +100,18 @@ fn handle(svc: &SemanticService, mut req: Request, server: &Server) -> bool {
         server.unblock();
         return true;
     }
+    if path.starts_with("/resolve_refs") {
+        match findref.map(|f| f.handle(&opts)) {
+            Some(Ok(v)) => respond(req, 200, &v),
+            Some(Err(e)) => respond(req, 400, &json!({ "error": e })),
+            None => respond(
+                req,
+                503,
+                &json!({ "error": "references unavailable (the library did not open)" }),
+            ),
+        }
+        return false;
+    }
     let t = Instant::now();
     let result: Result<Value> = if path.starts_with("/search") {
         svc.search(&opts)
@@ -132,20 +152,25 @@ fn handle(svc: &SemanticService, mut req: Request, server: &Server) -> bool {
 
 /// Serve until /shutdown. Requests are answered by a few worker threads, so a long `related`
 /// does not hold up /health.
-pub fn serve(svc: Arc<SemanticService>, addr: &str, workers: usize) -> Result<()> {
+pub fn serve(
+    svc: Arc<SemanticService>,
+    findref: Option<Arc<FindRefService>>,
+    addr: &str,
+    workers: usize,
+) -> Result<()> {
     let server =
         Arc::new(Server::http(addr).map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))?);
     eprintln!("otzaria-mcp: semantic server listening on http://{addr}");
     svc.watch();
     let mut handles = Vec::new();
     for i in 0..workers.max(1) {
-        let (svc, server) = (svc.clone(), server.clone());
+        let (svc, server, findref) = (svc.clone(), server.clone(), findref.clone());
         handles.push(
             std::thread::Builder::new()
                 .name(format!("http-{i}"))
                 .spawn(move || {
                     while let Ok(req) = server.recv() {
-                        if handle(&svc, req, &server) {
+                        if handle(&svc, findref.as_deref(), req, &server) {
                             // wake the other workers too
                             for _ in 0..workers {
                                 server.unblock();

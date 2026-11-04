@@ -398,6 +398,14 @@ pub struct RefCandidate {
     pub book_uid: String,
     /// Deep link that opens the location in the Otzaria app.
     pub link: String,
+    /// The reference named only the book (or one of its parts) and nothing inside it —
+    /// "קצות החושן", "טור יו\"ד": the candidate is just where the book (part) opens.
+    #[serde(skip_serializing_if = "is_false")]
+    pub book_level: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl RefCandidate {
@@ -456,6 +464,11 @@ pub struct ResolveOptions {
     /// The app's book detection (title prefix / contains, acronym prefix, ה"א before an
     /// acronym) when no book NAME leads the query or the named books yield nothing.
     pub app_detection: bool,
+    /// Drop candidates that only name a book ([`RefCandidate::book_level`]); a reference
+    /// with nothing else to offer then resolves to nothing (no heRef fallback either).
+    pub exclude_book_level: bool,
+    /// Fill each candidate's `snippet` with its line's text (see `Db::resolve_ref_with`).
+    pub snippets: bool,
 }
 
 impl Default for ResolveOptions {
@@ -463,6 +476,8 @@ impl Default for ResolveOptions {
         ResolveOptions {
             heref_fallback: true,
             app_detection: true,
+            exclude_book_level: false,
+            snippets: true,
         }
     }
 }
@@ -541,6 +556,13 @@ pub fn resolve_with(
 
     if out.is_empty() && opts.app_detection {
         out = detected_books(conn, caps, index, &ref_part, &dibbur)?;
+    }
+
+    if opts.exclude_book_level && !out.is_empty() {
+        out.retain(|c| !c.book_level);
+        if out.is_empty() {
+            return Ok(vec![]);
+        }
     }
 
     if out.is_empty() {
@@ -643,6 +665,9 @@ fn resolve_in_book(
     .join(" ");
     let toc_untitled: Vec<String> =
         crate::detect::drop_title_words(toc_tokens.to_vec(), &title_tokens, &[]);
+    // Nothing inside the book was asked for: no address beyond the title's own words and
+    // part names, and no dibbur hamatchil.
+    let book_level = dibbur.is_none() && untitled.trim().is_empty();
     for v in [cleaned.as_str(), without_title.as_str(), untitled.as_str()] {
         // A cleanup that leaves nothing would just point at the book's start.
         if !variants.iter().any(|(a, _)| *a == v) && (!v.is_empty() || address.is_empty()) {
@@ -799,6 +824,7 @@ fn resolve_in_book(
             book_uid: String::new(),
             link: String::new(),
             match_kind: kind,
+            book_level,
         });
     }
     if !out.is_empty() {
@@ -1108,6 +1134,7 @@ fn detected_books_once(
                 book_uid: String::new(),
                 link: String::new(),
                 match_kind: "book",
+                book_level: true,
             });
         }
         for c in found.iter_mut() {
@@ -1154,6 +1181,7 @@ fn by_key_only(
                 book_uid: String::new(),
                 link: String::new(),
                 match_kind: kind,
+                book_level: false,
             });
             break;
         }
@@ -1605,6 +1633,7 @@ fn fallback_heref_like(conn: &Connection, query: &str, limit: i64) -> Result<Vec
             book_uid: String::new(),
             link: String::new(),
             match_kind: "fallback",
+            book_level: false,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1728,6 +1757,42 @@ mod tests {
             (c[0].book_id, c[0].line_index, c[0].match_kind),
             (9, 5, "dibur_hamatchil")
         );
+    }
+
+    #[test]
+    fn a_bare_book_name_is_book_level_and_can_be_left_out() {
+        let conn = fixture();
+        let index = RefIndex::build(&conn);
+        let opts = |exclude| super::ResolveOptions {
+            exclude_book_level: exclude,
+            ..super::ResolveOptions::default()
+        };
+
+        // the book alone: wherever it lands, nothing inside it was asked for
+        let c = super::resolve_with(&conn, &caps(), &index, "ברכות", 3, opts(false)).unwrap();
+        assert!(!c.is_empty() && c.iter().all(|c| c.book_level), "{c:?}");
+        let c = super::resolve_with(&conn, &caps(), &index, "ברכות", 3, opts(true)).unwrap();
+        assert!(c.is_empty(), "{c:?}");
+
+        // an address, even the book's very first one, is inside it
+        for q in ["ברכות ב.", "ברכות ב., א", "ברכות פרק ראשון"] {
+            let c = super::resolve_with(&conn, &caps(), &index, q, 3, opts(true)).unwrap();
+            assert!(
+                !c.is_empty() && c.iter().all(|c| !c.book_level),
+                "{q}: {c:?}"
+            );
+        }
+        // a dibbur hamatchil is an address too
+        let c = super::resolve_with(
+            &conn,
+            &caps(),
+            &index,
+            "רש\"י על ברכות מאימתי",
+            3,
+            opts(true),
+        )
+        .unwrap();
+        assert_eq!((c[0].line_index, c[0].book_level), (5, false));
     }
 
     #[test]
