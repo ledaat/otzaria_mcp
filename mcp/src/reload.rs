@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::admission::Gate;
 use crate::db::Db;
 use crate::paths::Paths;
 use crate::search::Search;
@@ -22,6 +23,9 @@ use crate::secondary::SecondarySet;
 /// A consistent DB + index pair, tagged with the fingerprint it was built from.
 pub struct Snapshot {
     pub db: Arc<Db>,
+    /// Versions observed at open time (for startup logging). Responses read fresh values.
+    pub schema_version: Option<i64>,
+    pub db_schema_version: Option<i64>,
     pub search: Option<Arc<Search>>,
     /// data_version reported to clients (identical to `Db::data_version`).
     pub fingerprint: String,
@@ -35,6 +39,8 @@ pub struct Library {
     /// Personal books and attached databases (see `secondary`), followed separately:
     /// a change there never reopens the library.
     secondary: RwLock<Arc<SecondarySet>>,
+    reads: Gate,
+    searches: Gate,
 }
 
 impl Library {
@@ -45,6 +51,8 @@ impl Library {
             paths,
             inner: RwLock::new(Arc::new(snapshot)),
             secondary: RwLock::new(Arc::new(secondary)),
+            reads: Gate::default(),
+            searches: Gate::default(),
         }))
     }
 
@@ -58,15 +66,32 @@ impl Library {
         Arc::clone(&self.inner.read().unwrap())
     }
 
+    pub fn read_admission(&self) -> &Gate {
+        &self.reads
+    }
+
+    pub fn search_admission(&self) -> &Gate {
+        &self.searches
+    }
+
+    pub fn shutdown(&self) {
+        self.reads.close();
+        self.searches.close();
+    }
+
     fn build(paths: &Paths) -> Result<Snapshot> {
         let fingerprint = fingerprint(paths);
         let db = Arc::new(Db::open(paths)?);
+        let schema_version = db.schema_version();
+        let db_schema_version = db.db_schema_version();
         let (search, search_error) = match open_search(paths) {
             Ok(s) => (s, None),
             Err(e) => (None, Some(e)),
         };
         Ok(Snapshot {
             db,
+            schema_version,
+            db_schema_version,
             search,
             fingerprint,
             search_error,
@@ -90,15 +115,46 @@ impl Library {
             if fingerprint(&self.paths) != fp {
                 continue; // still changing; re-evaluate next tick
             }
-            match Self::build(&self.paths) {
-                Ok(snapshot) => {
-                    let new_fp = snapshot.fingerprint.clone();
-                    *self.inner.write().unwrap() = Arc::new(snapshot);
-                    eprintln!("otzaria-mcp: library changed → reloaded (data_version={new_fp})");
-                }
+            // A large index open must neither block a Tokio runtime thread nor
+            // overlap another search/reload. Take the same admission lane used by
+            // search handlers, and publish while that worker still owns its permit.
+            let admitted = match self.searches.acquire_maintenance().await {
+                Ok(admitted) => admitted,
+                Err(crate::admission::Error::Closed) => return,
                 Err(e) => {
+                    eprintln!("otzaria-mcp: reload postponed: {e}");
+                    continue;
+                }
+            };
+            let library = self.clone();
+            let result = admitted
+                .run(move || -> Result<Option<String>> {
+                    // Admission may have waited behind queries while files changed again.
+                    if fingerprint(&library.paths) != fp {
+                        return Ok(None);
+                    }
+                    let snapshot = Self::build(&library.paths)?;
+                    let new_fp = snapshot.fingerprint.clone();
+                    let retired = {
+                        let mut current = library.inner.write().unwrap();
+                        std::mem::replace(&mut *current, Arc::new(snapshot))
+                    };
+                    // Closing the last DB/index handle can block. Keep that work
+                    // on this worker, outside the short snapshot publication lock.
+                    drop(retired);
+                    Ok(Some(new_fp))
+                })
+                .await;
+            match result {
+                Ok(Ok(Some(new_fp))) => {
+                    eprintln!("otzaria-mcp: library changed → reloaded (data_version={new_fp})")
+                }
+                Ok(Ok(None)) => {} // Changed again; retry the debounce next poll.
+                Ok(Err(e)) => {
                     eprintln!("otzaria-mcp: reload failed, keeping current snapshot: {e:#}")
                 }
+                Err(crate::admission::Error::Closed) => return,
+                Err(e) => eprintln!("otzaria-mcp: reload postponed: {e}"),
             }
         }
     }
