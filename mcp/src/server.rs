@@ -519,7 +519,9 @@ pub struct SemanticSearchParams {
     /// Number of passages (default 8, max ~25).
     #[serde(default)]
     pub k: Option<i64>,
-    /// Similarity threshold (default 0.55).
+    /// Similarity threshold. Default: the served model's calibrated threshold for the query's
+    /// length (otzaria-sources' calibration suite), else 0.55. Hits show the score and, when
+    /// calibrated, the chance that a hit at that score is a true answer (`~85%`).
     #[serde(default)]
     pub min_score: Option<f64>,
     /// Only search these Otzaria categories, including everything filed under them: titles as
@@ -1307,7 +1309,12 @@ impl OtzariaServer {
         let b = body.as_object_mut().unwrap();
         b.insert("query".into(), json!(p.query));
         b.insert("k".into(), json!(k));
-        b.insert("min_score".into(), json!(p.min_score.unwrap_or(0.55)));
+        // without one, the served model's calibrated min_score for the query's length (0.55
+        // when the server has no calibration file)
+        if let Some(m) = p.min_score {
+            b.insert("min_score".into(), json!(m));
+        }
+        b.insert("min_score_fallback".into(), json!(0.55));
         b.insert("max_per_book".into(), json!(2));
         b.insert("categories".into(), json!(p.categories.unwrap_or_default()));
         b.insert(
@@ -1395,7 +1402,7 @@ impl OtzariaServer {
         b.insert("text".into(), json!(p.text));
         b.insert("title".into(), json!(p.title.unwrap_or_default()));
         b.insert("k".into(), json!(p.k.unwrap_or(10)));
-        b.insert("min_score".into(), json!(0.6));
+        b.insert("min_score_fallback".into(), json!(0.6));
         b.insert("max_per_book".into(), json!(2));
         b.insert("cited".into(), json!(p.cited.unwrap_or_default()));
         b.insert("categories".into(), json!(p.categories.unwrap_or_default()));

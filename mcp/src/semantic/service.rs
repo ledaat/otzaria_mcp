@@ -12,6 +12,7 @@ use otzaria_semantic_search::semantic::resolve::{BookSet, SlotRef, VectorHit};
 use serde_json::{json, Map, Value};
 
 use super::align::{align_words, Op};
+use super::calibration::{bucket_of, words, Calibration};
 use super::catalog::{era_label, Catalog, SourceRank, ERA_UNKNOWN};
 use super::feedback::Outbox;
 use super::official::{Official, OfficialConfig};
@@ -57,6 +58,8 @@ pub struct SemanticConfig {
     pub python: String,
     /// The feedback outbox (HTTP mode only: the stdio MCP never reaches the network).
     pub feedback_dir: Option<PathBuf>,
+    /// Where `defaults-<model>.json` may be (see [`super::calibration`]), first match wins.
+    pub calibration_dirs: Vec<PathBuf>,
 }
 
 // ── options ─────────────────────────────────────────────────────────────────
@@ -170,6 +173,8 @@ pub struct SemanticService {
     outbox: Option<Outbox>,
     last_refresh: Mutex<Instant>,
     started: Instant,
+    /// The served model's calibrated defaults, when a file for it exists.
+    calibration: RwLock<Option<Arc<Calibration>>>,
 }
 
 fn official_config(cfg: &SemanticConfig) -> OfficialConfig {
@@ -202,9 +207,11 @@ impl SemanticService {
             outbox,
             last_refresh: Mutex::new(Instant::now()),
             started: Instant::now(),
+            calibration: RwLock::new(None),
             cfg,
         };
         svc.load_personal();
+        svc.load_calibration();
         {
             let o = svc.official.read().unwrap();
             eprintln!(
@@ -321,6 +328,68 @@ impl SemanticService {
         if self.catalog.maybe_reopen() {
             self.book_sets.lock().unwrap().clear();
         }
+        self.load_calibration();
+    }
+
+    /// The files `defaults-<model>.json` is looked for in, for the served model.
+    fn calibration_candidates(&self) -> Vec<PathBuf> {
+        let family = self.official.read().unwrap().family().to_string();
+        super::calibration::candidates(&self.cfg.calibration_dirs, &family)
+    }
+
+    /// (Re)load the served model's calibration when its file appeared, changed or went away.
+    fn load_calibration(&self) {
+        let found = self
+            .calibration_candidates()
+            .into_iter()
+            .find(|p| p.is_file());
+        let mtime = found
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        {
+            let cur = self.calibration.read().unwrap();
+            let same = match (&*cur, &found) {
+                (None, None) => true,
+                (Some(c), Some(f)) => c.file == *f && c.mtime == mtime,
+                _ => false,
+            };
+            if same {
+                return;
+            }
+        }
+        let next = match found {
+            None => {
+                eprintln!(
+                    "otzaria-mcp: no calibration file for the served model; built-in defaults"
+                );
+                None
+            }
+            Some(f) => match Calibration::load(&f) {
+                Ok(c) => {
+                    eprintln!(
+                        "otzaria-mcp: calibration {}: min_score {:?}/{:?}/{:?} (short/medium/long), \
+                         window penalty {:?}",
+                        f.display(),
+                        c.short.min_score,
+                        c.medium.min_score,
+                        c.long.min_score,
+                        c.window_penalty
+                    );
+                    Some(Arc::new(c))
+                }
+                Err(e) => {
+                    // keep what was loaded: a file being rewritten is read again next time
+                    eprintln!("otzaria-mcp: calibration not loaded: {e:#}");
+                    return;
+                }
+            },
+        };
+        Calibration::apply(next.as_deref());
+        *self.calibration.write().unwrap() = next;
+    }
+
+    fn calibration(&self) -> Option<Arc<Calibration>> {
+        self.calibration.read().unwrap().clone()
     }
 
     /// Run `refresh` every 30 s in the background.
@@ -498,7 +567,14 @@ impl SemanticService {
         }
         self.refresh();
         let k = opts.int("k", 120).clamp(1, 2000) as usize;
-        let min_score = opts.float("min_score", 0.0) as f32;
+        let calibration = self.calibration();
+        let min_score = match opts.get("min_score") {
+            Some(_) => opts.float("min_score", 0.0),
+            None => calibration
+                .clone()
+                .and_then(|c| c.parallels_min_score.or_else(|| c.min_score("long")))
+                .map_or_else(|| opts.float("min_score_fallback", 0.0), f64::from),
+        } as f32;
         let max_cands = opts.int("max_candidates", 2 * k as i64).clamp(1, 5000) as usize;
         let rescore = opts.bool("rescore", false) && windows.len() > 1;
         let official = self.official.read().unwrap();
@@ -610,6 +686,12 @@ impl SemanticService {
             };
             let m = o.as_object_mut().unwrap();
             m.insert("score".into(), json!(r5(*score)));
+            if let Some(p) = calibration
+                .as_ref()
+                .and_then(|c| c.confidence(bucket_of(words(&windows[*wi])), *score))
+            {
+                m.insert("confidence".into(), json!(round_to(p as f64, 3)));
+            }
             m.insert("win".into(), json!(wi));
             if let Some(row) = matrix.get(&c.key()) {
                 m.insert(
@@ -908,7 +990,20 @@ impl SemanticService {
         ps: Option<&PersonalSet>,
     ) -> Result<Vec<Value>> {
         let k = opts.int("k", 20).max(1) as usize;
-        let min_score = opts.float("min_score", 0.0) as f32;
+        // the query's length bucket: the query, or a note's windows on average
+        let n_words = match windows {
+            Some(w) if !w.is_empty() => w.iter().map(|t| words(t)).sum::<usize>() / w.len(),
+            _ => words(&opts.str("query")),
+        };
+        let bucket = bucket_of(n_words);
+        let calibration = self.calibration();
+        let min_score = match opts.get("min_score") {
+            Some(_) => opts.float("min_score", 0.0),
+            None => calibration
+                .as_ref()
+                .and_then(|c| c.min_score(bucket))
+                .map_or_else(|| opts.float("min_score_fallback", 0.0), f64::from),
+        } as f32;
         let max_per_book = opts.int("max_per_book", 3).max(1) as usize;
         let merge_lines = opts.int("merge_lines", 2).max(0);
         let mut cited_urls: HashSet<(SourceKey, i64, i64)> = HashSet::new();
@@ -1010,6 +1105,12 @@ impl SemanticService {
             let mut hit = base.clone();
             hit.remove("key");
             hit.insert("score".into(), json!(round_to(*score as f64, 4)));
+            if let Some(p) = calibration
+                .as_ref()
+                .and_then(|c| c.confidence(bucket, *score))
+            {
+                hit.insert("confidence".into(), json!(round_to(p as f64, 3)));
+            }
             let snip = base["snippet"].as_str().unwrap_or("");
             hit.insert("snippet".into(), json!(char_prefix(snip, max_chars)));
             hit.insert("cited".into(), json!(cited));
@@ -1589,6 +1690,10 @@ impl SemanticService {
     // ── service status ──────────────────────────────────────────────────────
 
     pub fn health(&self) -> Value {
+        let calibration = Calibration::summary(
+            self.calibration().as_deref(),
+            &self.calibration_candidates(),
+        );
         let o = self.official.read().unwrap();
         let ps = self.personal_any();
         let (pending, last_error) = match &self.outbox {
@@ -1606,6 +1711,7 @@ impl SemanticService {
                "generation": o.declared.generation,
                "personal_searched": self.personal_searchable().is_some(),
                "personal_model": ps.as_ref().and_then(|p| p.model().map(String::from)),
+               "calibration": calibration,
                "uptime_s": self.started.elapsed().as_secs()})
     }
 

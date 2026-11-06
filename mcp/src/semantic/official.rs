@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use otzaria_semantic_search::cancellation::CancellationToken;
-use otzaria_semantic_search::config::profiles::DEFAULT_WINDOW_PENALTY;
 use otzaria_semantic_search::semantic::embedding::EmbeddingDeployment;
 use otzaria_semantic_search::semantic::official_index::{
     LocalModel, OfficialIndexConfig, OfficialSemanticIndex, ReloadOutcome,
@@ -220,7 +219,14 @@ impl Official {
     ) -> Result<Vec<VectorHit>> {
         let cancel = CancellationToken::new();
         self.index
-            .search_hits(vector, k, books, &cancel)
+            .search_hits_with(
+                vector,
+                k,
+                books,
+                &[],
+                super::calibration::window_penalty(),
+                &cancel,
+            )
             .map_err(|e| anyhow!("the vector scan failed: {e}"))
     }
 
@@ -239,7 +245,7 @@ impl Official {
                 slots.len(),
                 Some(&none),
                 slots,
-                DEFAULT_WINDOW_PENALTY,
+                super::calibration::window_penalty(),
                 &cancel,
             )
             .map_err(|e| anyhow!("the rescore failed: {e}"))

@@ -14,7 +14,8 @@ pub const WINDOW_OVERLAP: usize = 128;
 pub const MAX_WINDOWS: usize = 6;
 pub const MIN_EMBEDDABLE: usize = 5;
 pub const MIN_MEANINGFUL: usize = 20;
-/// A hit on a later window of a long line scores this much lower, as in Otzaria.
+/// A hit on a later window of a long line scores this much lower, as in Otzaria (the
+/// default: a calibration file can set another, see [`super::calibration::window_penalty`]).
 pub const WINDOW_PENALTY: f32 = 0.04;
 
 static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());

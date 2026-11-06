@@ -17,8 +17,9 @@ use serde::Deserialize;
 
 use crate::text::LineCodec;
 
+use super::calibration::window_penalty;
 use super::catalog::{connect_ro, has_table};
-use super::textutil::{SourceKey, WINDOW_PENALTY};
+use super::textutil::SourceKey;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonalBook {
@@ -250,7 +251,7 @@ impl PersonalSet {
     /// The `kc` best slots for each query, exact over every admitted slot: an int8 pass
     /// (each query quantized to int8, as Otzaria's scanner does) keeps `kc` per query, which
     /// are then rescored exactly; a slot holding a later window of a long line scores
-    /// [`WINDOW_PENALTY`] lower. Scores are cosine similarities.
+    /// [`window_penalty`] lower. Scores are cosine similarities.
     pub fn scan(
         &self,
         queries: &[Vec<f32>],
@@ -295,7 +296,7 @@ impl PersonalSet {
                     let codes = self.codes(slot);
                     let s = self.scale(slot);
                     let pen = if self.slot_window(slot) > 0 {
-                        WINDOW_PENALTY
+                        window_penalty()
                     } else {
                         0.0
                     };
@@ -327,7 +328,7 @@ impl PersonalSet {
                         .map(|(&x, &y)| x as f32 * y)
                         .sum::<f32>();
                     let pen = if self.slot_window(e.1) > 0 {
-                        WINDOW_PENALTY
+                        window_penalty()
                     } else {
                         0.0
                     };
@@ -353,7 +354,7 @@ impl PersonalSet {
             .map(|(&x, &y)| x as f32 * y)
             .sum();
         let pen = if self.slot_window(slot) > 0 {
-            WINDOW_PENALTY
+            window_penalty()
         } else {
             0.0
         };

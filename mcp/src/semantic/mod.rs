@@ -3,11 +3,13 @@
 //!
 //! - [`official`]: Otzaria's installed vector set, opened read-only through the sidecar.
 //! - [`personal`]: the personal-books index built by `build_personal_index.py`.
+//! - [`calibration`]: the served model's calibrated defaults (`defaults-<model>.json`).
 //! - [`service`]: search, related (a whole note), check_quote, text, feedback, status.
 //! - [`http`]: the `--http` daemon the Obsidian plugin and the stdio MCP talk to.
 //! - [`client`]: the stdio MCP's side: find or start the daemon, forward a call.
 
 pub mod align;
+pub mod calibration;
 pub mod catalog;
 pub mod client;
 pub mod feedback;

@@ -71,6 +71,12 @@ SEMANTIC SEARCH (Otzaria's own model and vectors, plus the personal-books index)
     --builder <path>      build_personal_index.py, for /personal/status
     --python <cmd>        Python for the builder's check [default: python (Windows), python3]
     --plugin-data <path>  The Obsidian plugin's data.json (context defaults of the tools)
+    --calibration-dir <dir>
+                          Where calibrate_semantic.py's defaults-<model>.json files are; the
+                          served model's sets min_score by query length, the window penalty
+                          and each hit's confidence      [env: OTZARIA_CALIBRATION_DIR]
+                          (default: calibration/ beside --builder or --plugin-data, else
+                          beside the personal index)
     --semantic-log <path> Where a started server writes its log
     --scan-threads <n>    Threads per vector scan       [default: all cores]
     --workers <n>         HTTP worker threads           [default: 4]
@@ -91,6 +97,7 @@ struct SemanticArgs {
     builder: Option<PathBuf>,
     python: Option<String>,
     plugin_data: Option<PathBuf>,
+    calibration_dir: Option<PathBuf>,
     semantic_log: Option<PathBuf>,
     scan_threads: Option<usize>,
     workers: Option<usize>,
@@ -211,6 +218,7 @@ fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> 
         .personal_index
         .clone()
         .unwrap_or_else(default_personal_index);
+    let calibration_dirs = calibration_dirs(&sem, &personal_dir);
     let cfg = service::SemanticConfig {
         otzaria_dir: app.clone(),
         books_dir,
@@ -239,6 +247,7 @@ fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> 
             .clone()
             .unwrap_or_else(|| app.join("databases").join("user_books.db")),
         builder: sem.builder.clone(),
+        calibration_dirs,
         python: sem.python.clone().unwrap_or_else(|| {
             if cfg!(windows) {
                 "python".into()
@@ -271,6 +280,24 @@ fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> 
     });
     let svc = Arc::new(service::SemanticService::open(cfg, refs)?);
     http::serve(svc, findref, addr, sem.workers.unwrap_or(4))
+}
+
+/// Where defaults-<model>.json is looked for: the flag (or env), else calibrate_semantic.py's
+/// default folder, `calibration/` in the plugin folder (beside the builder or data.json),
+/// else beside the personal index.
+fn calibration_dirs(sem: &SemanticArgs, personal_dir: &Path) -> Vec<PathBuf> {
+    if let Some(d) = &sem.calibration_dir {
+        return vec![d.clone()];
+    }
+    let mut dirs: Vec<PathBuf> = [sem.builder.as_deref(), sem.plugin_data.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(Path::parent)
+        .map(|d| d.join("calibration"))
+        .collect();
+    dirs.extend(personal_dir.parent().map(|d| d.join("calibration")));
+    dirs.dedup();
+    dirs
 }
 
 fn default_personal_index() -> PathBuf {
@@ -322,6 +349,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--builder",
     "--python",
     "--plugin-data",
+    "--calibration-dir",
     "--semantic-log",
     "--scan-threads",
     "--workers",
@@ -407,6 +435,7 @@ fn parse_args() -> Result<Option<(PathArgs, SemanticArgs)>> {
             "--builder" => sem.builder = Some(path()),
             "--python" => sem.python = value.clone(),
             "--plugin-data" => sem.plugin_data = Some(path()),
+            "--calibration-dir" => sem.calibration_dir = Some(path()),
             "--semantic-log" => sem.semantic_log = Some(path()),
             "--scan-threads" => sem.scan_threads = Some(value.clone().unwrap_or_default().parse()?),
             "--workers" => sem.workers = Some(value.clone().unwrap_or_default().parse()?),
@@ -414,6 +443,18 @@ fn parse_args() -> Result<Option<(PathArgs, SemanticArgs)>> {
             other => anyhow::bail!("unknown argument: {other} (try --help)"),
         }
         i += 1;
+    }
+    sem.calibration_dir = sem
+        .calibration_dir
+        .take()
+        .or_else(|| std::env::var_os("OTZARIA_CALIBRATION_DIR").map(PathBuf::from));
+    // a server this MCP starts does not get --plugin-data: tell it where the plugin's
+    // calibration folder is
+    if sem.calibration_dir.is_none() {
+        if let Some(dir) = sem.plugin_data.as_ref().and_then(|d| d.parent()) {
+            sem.passthrough.push("--calibration-dir".into());
+            sem.passthrough.push(dir.join("calibration").into());
+        }
     }
     if let Some(a) = http_addr {
         sem.http = Some(if !a.is_empty() {
