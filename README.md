@@ -181,6 +181,15 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
 - **ספרים אישיים**: האינדקס של `build_personal_index.py` (`--personal-index`, ברירת מחדל
   `%LOCALAPPDATA%\\otzaria-sources\\personal-index`) נסרק רק כשנבנה באותו מודל כמו הווקטורים
   של אוצריא. `--builder <build_personal_index.py>` מאפשר ל-`/personal/status` לדווח מה השתנה.
+- **ברירות מחדל מכוילות**: השרת קורא את `defaults-<model>.json` שכותב
+  `calibrate_semantic.py` של otzaria-sources — הקובץ של המודל שהווקטורים משתמשים בו
+  (`otzaria/Meivin-Embed-QA491-native256` ← `defaults-otzaria-Meivin-Embed-QA491-native256.json`),
+  מ-`--calibration-dir` (או `OTZARIA_CALIBRATION_DIR`), אחרת מ-`calibration\\` שבתיקיית התוסף
+  (ליד `--builder` או `--plugin-data`), אחרת ליד האינדקס האישי. ממנו: `min_score` לפי אורך
+  השאילתה (עד 8 מילים, 9–30, 31 ומעלה) כשהבקשה אינה קובעת סף (`/parallels`: `parallels.min_score`);
+  קנס החלונות המאוחרים של שורה ארוכה בכל סריקה; ו-`confidence` לכל תוצאה — הסיכוי שתוצאה בציון
+  הזה היא תשובה אמיתית (בכלים: `[0.71 ~85%]`). הקובץ נקרא מחדש כשהוא משתנה וכשהמודל מתחלף;
+  בלי קובץ — ברירות המחדל הקודמות (0.55 בכלי, 0 ב-API). `/health` מציג `calibration`.
 - **משוב** (👍/👎 בתוסף) נשלח לשרת של מחבר Meivin רק במצב `--http` (`--no-feedback` מבטל);
   ה-MCP ב-stdio אינו פונה לרשת.
 - `--no-semantic` מוותר על הכלים הסמנטיים.
@@ -206,6 +215,15 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
   תוצאה שאינה תואמת עוד את האינדקס מסומנת `stale`.
 - **גרסת מנוע:** ה-crate המוונדר חייב להתאים לסכימת האינדקס בדיסק (סכמה 7); אינדקס ישן
   נדחה עד שהאפליקציה בונה אותו מחדש.
+- **לא מחזיק את המסדים פתוחים:** חיבור SQLite (`seforim.db`, `user_books.db`, מסדים מצורפים, וגם
+  חיבור קריאת השורות של מנוע החיפוש) נסגר כשלא השתמשו בו 750ms, ומיד אחרי כל שאילתה כשהמסד
+  במצב WAL או כשקובץ הסימון של העדכון (`seforim.db.applying`) קיים; השאילתה הבאה פותחת אותו
+  מחדש (כמילישנייה). כך אוצריא מסיימת עדכון ספרייה — `PRAGMA journal_mode=DELETE` אחרי הטלאי,
+  שנכשל ב-"database is locked" כשקורא החזיק חיבור פתוח — ויכולה להחליף קובץ מסד (ב-Windows כל
+  ידית פתוחה חוסמת שינוי שם). ראו `mcp/src/idle.rs`.
+- **תור קבלה (admission):** כלי ה-MCP עוברים שער לפני שהם תופסים worker חוסם — מסלול קריאה
+  ומסלול חיפוש, תור חסום ופג-תוקף, ביטול בקשה שטרם התחילה (מ-upstream, `docs/admission-control.md`);
+  `library_info` מדווח `admission`.
 - **סדר קטלוג/דורות:** נלקח מ-`otzaria_book_order.json` שהאפליקציה כותבת בתיקיית האינדקס,
   ונקרא מחדש כשהוא משתנה. בלי הקובץ (או לספר שחסר בו) התוצאות ממוינות לפי מספר הספר במנוע.
   ראו [`vendor/otzaria_search_engine/VENDORED.md`](vendor/otzaria_search_engine/VENDORED.md).

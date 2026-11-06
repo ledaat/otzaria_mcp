@@ -52,6 +52,14 @@ fn score(h: &Value) -> f64 {
     h.get("score").and_then(Value::as_f64).unwrap_or(0.0)
 }
 
+/// `0.71`, or `0.71 ~85%` with the calibrated chance that the hit is a true answer.
+fn score_label(h: &Value) -> String {
+    match h.get("confidence").and_then(Value::as_f64) {
+        Some(p) => format!("{:.2} ~{:.0}%", score(h), p * 100.0),
+        None => format!("{:.2}", score(h)),
+    }
+}
+
 pub fn hits(hits: &[Value], snippet_chars: usize) -> String {
     let mut lines = Vec::new();
     for (n, h) in hits.iter().enumerate() {
@@ -61,9 +69,9 @@ pub fn hits(hits: &[Value], snippet_chars: usize) -> String {
             ""
         };
         lines.push(format!(
-            "{}. [{:.2}] {}  ({}){}\n   {}",
+            "{}. [{}] {}  ({}){}\n   {}",
             n + 1,
-            score(h),
+            score_label(h),
             s(h, "he_ref"),
             last2(h, "category"),
             flag,
@@ -323,9 +331,9 @@ pub fn parallels(out: &Value, snippet_chars: usize) -> String {
             ""
         };
         lines.push(format!(
-            "{}. [{:.2}] {}  ({}){}\n   {}",
+            "{}. [{}] {}  ({}){}\n   {}",
             n + 1,
-            score(h),
+            score_label(h),
             s(h, "he_ref"),
             last2(h, "category"),
             flag,

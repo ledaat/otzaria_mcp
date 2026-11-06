@@ -47,7 +47,7 @@ crate's own patch because dependency patches are ignored) and
 `[profile.release]` are ignored as a non-root package; that is expected.
 
 ## Local modifications (not upstream)
-Two additive patches in `rust/src/api/search_engine.rs` and `rust/src/line_source.rs`:
+Three additive patches in `rust/src/api/search_engine.rs` and `rust/src/line_source.rs`:
 
 - **`SearchEngine::open_read_only(path) -> Result<Self>`** — opens an existing index
   with `Index::open` (never `open_or_create`), acquires **no writer lock** and writes
@@ -67,6 +67,15 @@ Two additive patches in `rust/src/api/search_engine.rs` and `rust/src/line_sourc
   row windows finish before refresh; later windows reopen the current file without
   a temporary suspended/unavailable state. The `reload_regression` integration test
   covers replacement during concurrent searches and stale-text reporting.
+
+- **`release_idle_line_sources(idle_ms, force)`** — closes each source's connection that no
+  line window has used for `idle_ms` (a `last_used` stamp on the source), or whose path
+  `force` picks, skipping a source whose mutex is held or that has a scan open. Upstream keeps
+  the connection for the life of the process, which suits the app (it suspends the source
+  itself before it touches the file) but not a separate reader: an open connection holds the
+  WAL shared-memory lock that stops the app from setting `journal_mode=DELETE` after a library
+  update, and on Windows any open handle stops an atomic replace. The MCP's connection reaper
+  (`mcp/src/db.rs`) calls it every tick with the same policy as its own connections.
 
 ## The semantic sidecar (vendor/otzaria-semantic-search)
 `otzaria-semantic-search` at the engine's pinned rev `6b006b0fe1440f8204385fbb42ee0d831bc8cfff`

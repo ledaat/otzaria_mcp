@@ -1355,6 +1355,9 @@ struct Global {
     /// Open [`ScanSession`]s: suspending or moving the source waits for them to close.
     scans: u32,
     scan_validity: Vec<Weak<AtomicBool>>,
+    /// otzaria-mcp local addition: when a window last used the open store
+    /// ([`release_idle`]).
+    last_used: Option<Instant>,
 }
 
 impl Global {
@@ -1378,6 +1381,7 @@ impl Global {
             content_epoch: 0,
             scans: 0,
             scan_validity: Vec::new(),
+            last_used: None,
         }
     }
 }
@@ -1551,6 +1555,30 @@ pub(crate) fn configure_attached(slug: &str, db_path: Option<&str>, immutable: b
         wait_for_scans(g, source);
     }
     Ok(())
+}
+
+/// otzaria-mcp local addition (see VENDORED.md): closes the connection of every source whose
+/// store no window has used for `idle`, or of the sources `force` picks, so that a long-running
+/// reader leaves the database file alone between searches: the app can then change its
+/// journal mode or replace the file. A source a window is reading (its mutex is held) or
+/// that has a scan open is left alone; the next window reopens the store. Returns the
+/// number of connections closed.
+pub(crate) fn release_idle(idle: Duration, force: &dyn Fn(&Path) -> bool) -> usize {
+    let mut closed = 0;
+    for source in Source::all() {
+        let Ok(mut g) = source.cell().try_lock() else {
+            continue;
+        };
+        if g.store.is_none() || g.scans > 0 {
+            continue;
+        }
+        let stale = g.last_used.is_none_or(|t| t.elapsed() >= idle);
+        if stale || g.path.as_deref().is_some_and(force) {
+            g.drop_store();
+            closed += 1;
+        }
+    }
+    closed
 }
 
 /// The state of the attached database `slug`; `None` when it was never configured.
@@ -1853,6 +1881,7 @@ fn with_store_inner<R>(
             f(g.store.insert(store))
         }),
     };
+    g.last_used = Some(Instant::now());
     result.map_err(|err| {
         if is_busy(&err) {
             // The connection is fine; only the writer has to finish.

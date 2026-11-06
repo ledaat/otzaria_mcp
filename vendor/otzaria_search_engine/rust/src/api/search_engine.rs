@@ -3440,6 +3440,17 @@ pub fn refresh_line_source(db_path: String) -> Result<()> {
     crate::line_source::refresh(&db_path)
 }
 
+/// otzaria-mcp local addition (see VENDORED.md): closes each line source's SQLite connection
+/// that has been idle for `idle_ms`, or whose database `force(path)` asks to release now,
+/// without waiting for a reader (a source in use is skipped). The next window reopens it.
+/// Returns the number of connections closed.
+pub fn release_idle_line_sources(
+    idle_ms: u64,
+    force: &dyn Fn(&std::path::Path) -> bool,
+) -> usize {
+    crate::line_source::release_idle(std::time::Duration::from_millis(idle_ms), force)
+}
+
 /// Closes the library database so it can be renamed or replaced, waiting for a
 /// window that is reading it (milliseconds). Returns once the file handle is
 /// released. Calls nest; while suspended, `LibraryDb` results come back

@@ -2,6 +2,23 @@
 
 ## fork (ledaat/otzaria_mcp) — על גבי 0.2.0
 
+### 0.5.0 — ברירות מחדל מכוילות, שחרור המסדים, תור קבלה מ-upstream
+- **עדכון ספרייה באוצריא לא ננעל עוד ע"י ה-MCP**: אוצריא מעבירה את `seforim.db` ל-WAL, מחילה את
+  הטלאי וחוזרת ל-`journal_mode=DELETE` — צעד שנכשל ב-"database is locked" כשה-MCP החזיק חיבור
+  קריאה פתוח (חיבור רדום למסד WAL מחזיק נעילה ב-`-shm`), והמסד נשאר ב-WAL. עכשיו כל חיבור
+  שנפתח מקובץ — הספרייה, `user_books.db`, מסדים מצורפים, וחיבור השורות של המנוע (תוספת מקומית,
+  `release_idle_line_sources`, ראו VENDORED.md) — נסגר אחרי 750ms בלי שימוש, ומיד בתום כל
+  שאילתה כשהמסד ב-WAL או כש-`<db>.applying` קיים; השאילתה הבאה פותחת אותו מחדש. `busy_timeout`
+  של 5 שניות לכל חיבור, כדי שקריאה תמתין למעבר מצב היומן של האפליקציה.
+- **`defaults-<model>.json`** של `calibrate_semantic.py` (otzaria-sources) למודל המוגש:
+  `min_score` לפי אורך השאילתה כשהבקשה לא קבעה (`otzaria_search`, `otzaria_find_parallels`,
+  `/search`, `/related`, `/parallels`), קנס החלונות, ו-`confidence` לכל תוצאה (גם ב-`/parallels`).
+  `--calibration-dir` / `OTZARIA_CALIBRATION_DIR`; ברירת מחדל `calibration\\` בתיקיית התוסף.
+  `/health` → `calibration`. בקשה יכולה לשלוח `min_score_fallback` — הסף כשאין קובץ.
+- **מ-upstream (Otzaria/otzaria_mcp#4)**: שערי קבלה (admission) לכלים — עבודה חוסמת חסומה בתור,
+  ניתנת לביטול לפני שהתחילה, עם מדדים ב-`library_info.admission`; הטעינה החמה עוברת בשער
+  החיפוש. `search_books`, `resolve_ref` ו-`resolve_refs` של ה-fork עוברים במסלול הקריאה.
+
 ### 0.4.2 — איתור מקורות בקריאה אחת
 - **`resolve_refs`**: `resolve_ref` לרשימת הפניות בקריאה אחת (עד 2000), באותם פרמטרים; תשובה
   לכל הפניה לפי הסדר (`{reference, count, candidates, ms}`, או `{reference, error}` — כשל של
