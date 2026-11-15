@@ -10,7 +10,7 @@
 //! update swaps its file so).
 //!
 //! So every [`crate::db::Db`] opened from a file, and the search engine's own line-source
-//! connections, are closed once they have been idle for [`IDLE`], by a background thread
+//! connection (through its public `refresh_line_source`, see `crate::search`), are closed once they have been idle for [`IDLE`], by a background thread
 //! that looks every [`TICK`]; and at once after each use while the database is in WAL mode
 //! or the app's update marker (`<db>.applying`) is present. The next query reopens the file
 //! (about a millisecond; the zstd dictionaries and the table probe are kept).
@@ -62,11 +62,7 @@ pub fn sweep(idle: Duration) -> usize {
             closed += 1;
         }
     }
-    closed
-        + search_engine::api::search_engine::release_idle_line_sources(
-            idle.as_millis() as u64,
-            &release_now,
-        )
+    closed + crate::search::release_idle_line_source(idle, &release_now)
 }
 
 /// The databases followed now (open or closed), for `library_info`.

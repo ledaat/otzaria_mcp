@@ -1,5 +1,5 @@
 //! Otzaria's own vectors, through Otzaria's own code: the semantic sidecar's
-//! `OfficialSemanticIndex`, opened read-only (vendored patch, see VENDORED.md). It embeds a
+//! `OfficialSemanticIndex`, opened read-only (vendored patch, see vendor/otzaria-semantic-search/VENDORED.md). It embeds a
 //! query by the installed family's recipe — QA491's `query.int8.onnx` capped at
 //! `query_max_tokens`, and its `document.fp32.onnx` for a text embedded as a passage — and
 //! scans the installed set exactly.
