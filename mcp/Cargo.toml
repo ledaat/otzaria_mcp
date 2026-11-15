@@ -1,6 +1,6 @@
 [package]
 name = "otzaria-mcp"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "MCP server exposing the Otzaria Jewish-texts library (SQLite + Tantivy), read-only, offline."
 license = "MIT"
@@ -23,17 +23,15 @@ serde_json = "1"
 anyhow = "1"
 schemars = "1.0"
 rmcp = { version = "2.2.0", features = ["transport-io", "schemars"] }
-# Otzaria's actual Tantivy search engine (vendored, see VENDORED.md). Reused so the MCP
-# reproduces the app's exact search semantics (Hebrew morphology, regex-phrase,
-# facets, cross-line phrases, library line source) rather than reimplementing them.
-# Default features = bundled SQLite, no semantic backend.
-search_engine = { path = "../vendor/otzaria_search_engine/rust" }
+# Rust-only adapter to the canonical app engine: no Flutter/ONNX runtime and no
+# copied search source. The reviewed Git revision and Cargo.lock pin updates.
+search_engine = { package = "otzaria-search-core", git = "https://github.com/Otzaria/otzaria_search_engine", rev = "4bb3d8e7d11499861ce0655c88841eb23e0f1649" }
 
 # ── semantic search (the former otzaria-sources Python server) ──
 # Otzaria's semantic sidecar (vendored, see VENDORED.md): its OfficialSemanticIndex embeds
 # queries with Otzaria's model and scans Otzaria's installed vector set. ONNX Runtime is
 # loaded at run time (`--onnx-runtime`), nothing is linked.
-otzaria-semantic-search = { git = "https://github.com/Otzaria/otzaria-semantic-search", rev = "6b006b0fe1440f8204385fbb42ee0d831bc8cfff", default-features = false, features = ["onnx-backend"] }
+otzaria-semantic-search = { git = "https://github.com/Otzaria/otzaria-semantic-search", rev = "a79901ff1a34bc9d57b994b905de7ec9ad69bb7a", default-features = false, features = ["onnx-backend"] }
 # the same version the sidecar pins, so one copy is built
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
 fancy-regex = "0.14"

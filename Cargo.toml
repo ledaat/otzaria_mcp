@@ -1,29 +1,17 @@
 [workspace]
 members = ["mcp"]
-# The vendored engine is a member too (a path dependency inside the workspace); plain
-# `cargo build` / `cargo test` / `cargo clippy` at the root act on the MCP crate only.
 default-members = ["mcp"]
 resolver = "2"
 
-# `search_engine` is VENDORED (not a submodule) at vendor/otzaria_search_engine —
-# the otzaria_search_engine rust crate 7.0.1 (tag v7.0.1, index schema 10), the
-# version the app pins.
-# Matching the engine to the index is required: an older engine refuses a
-# newer index (`engine_too_old`) and a newer one may need a rebuild.
-# See vendor/otzaria_search_engine/VENDORED.md.
-
-# The engine's own `[patch.crates-io]` is ignored when it is a dependency, so the two
-# patches it relies on are repeated here, exactly as in its manifest:
-#  * tantivy-fst 0.5.0 with the regex-DFA STATE_LIMIT raised to 8192 (RegexPhraseQuery);
-#  * Otzaria's tantivy fork (0.26.2 + quickwit-oss/tantivy#3059, #3134–#3138, #3189–#3191)
-#    at the pinned rev.
+# Cargo applies patches only at the workspace root. The FST patch and core
+# dependency must use the same reviewed canonical engine revision.
 [patch.crates-io]
-tantivy-fst = { path = "vendor/otzaria_search_engine/rust/vendor/tantivy-fst" }
-tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "8b8832069b871e11fe0fd0da1c4c2de8c270596f" }
+tantivy-fst = { git = "https://github.com/Otzaria/otzaria_search_engine", rev = "4bb3d8e7d11499861ce0655c88841eb23e0f1649" }
+tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "130b2682807d2a609d09ba432ba4d0ccc8faf7ed" }
 
-# The semantic sidecar is VENDORED too (vendor/otzaria-semantic-search, the engine's pinned
-# rev 6b006b0), for one local addition: OfficialSemanticIndex::open_read_only, so the MCP
-# opens Otzaria's vector set without taking its lock, recovering or collecting garbage.
-# See vendor/otzaria_search_engine/VENDORED.md.
+# The semantic sidecar is VENDORED (vendor/otzaria-semantic-search, rev a79901f, the one the search core pins), for one
+# local addition: OfficialSemanticIndex::open_read_only, so the MCP opens Otzaria's vector
+# set without taking its lock, recovering or collecting garbage.
+# See vendor/otzaria-semantic-search/VENDORED.md.
 [patch."https://github.com/Otzaria/otzaria-semantic-search"]
 otzaria-semantic-search = { path = "vendor/otzaria-semantic-search" }

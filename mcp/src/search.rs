@@ -1,14 +1,14 @@
-//! Full-text search over Otzaria's Tantivy index, via the reused (vendored)
-//! `search_engine` crate — reproducing the app's exact search semantics.
+//! Full-text search through the canonical `otzaria-search-core` Rust adapter.
+//! Flutter and MCP compile the same source; only their host wrappers differ.
 //!
-//! Index contract (schema 7, verified against the app's indexer):
+//! Index contract (schema 10/11, verified against the app's indexer):
 //!   * `file_path` = `id:<bookId>` for official text books (`uid:` = user book, `ext:` /
 //!     `attached:` = external or attached catalogues); for PDFs a file path and `is_pdf`.
 //!   * `segment` = the 0-based position of the line among the book's rows ordered by
 //!     `lineIndex`, which is the seforim.db `line.lineIndex` (dense 0..n-1 in the library).
 //!   * Official books' line text is NOT stored in the index (`TextStorage::LibraryDb`): the
 //!     engine reads each result line back from seforim.db through its process-wide *library
-//!     line source*, which must be configured with the DB path ([`configure_line_source`]).
+//!     line source*, refreshed with the DB path ([`refresh_line_source`]).
 //!     A result whose row no longer matches the indexed text is `stale`.
 //!   * Facets: the category path (`/תנ״ך/תורה/…`) plus dimension facets `/author/<name>`,
 //!     `/era/<era>` and `/base` (OR inside a dimension, AND across dimensions).
@@ -17,7 +17,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock, RwLockReadGuard};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -29,8 +31,9 @@ use search_engine::api::search_engine::{
 };
 
 pub struct Search {
-    // SearchEngine is used from one thread at a time (its docs); a Mutex makes the whole
-    // thing Sync so it can live behind an Arc and be used from blocking tasks.
+    // Preserve the adapter's serialization policy while sharing the engine's
+    // caches and process-wide line source. Admission limits workers before this
+    // mutex; removing it would require separate safety and contention analysis.
     engine: Mutex<SearchEngine>,
     pub info: IndexInfo,
 }
@@ -273,6 +276,65 @@ fn fuzzy_distance(req: &SearchRequest) -> u8 {
     req.distance.unwrap_or(2).min(2) as u8
 }
 
+// ── releasing the engine's line source while idle ──────────────────────────────────────
+//
+// The engine reads result lines from seforim.db through a process-wide connection that it
+// keeps open. A reader beside the app must not hold the database between searches (see
+// `crate::idle`), so searches are counted here and, once none has run for a moment,
+// `refresh_line_source` closes the connection through the engine's public API; the next
+// search's first window reopens the file.
+
+/// Held (shared) by every engine call that may read lines; the release takes it exclusively.
+static LINE_ACTIVITY: RwLock<()> = RwLock::new(());
+/// A search ran since the line source was last released.
+static LINE_DIRTY: AtomicBool = AtomicBool::new(false);
+/// The database the line source reads, and when a search last finished.
+static LINE_STATE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+struct LineUse(#[allow(dead_code)] RwLockReadGuard<'static, ()>);
+
+fn line_use() -> LineUse {
+    LineUse(LINE_ACTIVITY.read().unwrap_or_else(|p| p.into_inner()))
+}
+
+impl Drop for LineUse {
+    fn drop(&mut self) {
+        if let Some(state) = LINE_STATE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            state.1 = Instant::now();
+        }
+        LINE_DIRTY.store(true, Ordering::Release);
+    }
+}
+
+/// Close the engine's library connection when no search has used it for `idle`, or at once
+/// when `force` says the app needs the database; never while a search runs. Returns how
+/// many connections were closed (0 or 1).
+pub fn release_idle_line_source(idle: Duration, force: &dyn Fn(&Path) -> bool) -> usize {
+    if !LINE_DIRTY.load(Ordering::Acquire) {
+        return 0;
+    }
+    let Ok(_exclusive) = LINE_ACTIVITY.try_write() else {
+        return 0; // a search is running
+    };
+    let Some((db, last)) = LINE_STATE.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+        return 0;
+    };
+    if last.elapsed() < idle && !force(Path::new(&db)) {
+        return 0;
+    }
+    match refresh_line_source(db) {
+        Ok(()) => {
+            LINE_DIRTY.store(false, Ordering::Release);
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
 impl Search {
     /// Open the Tantivy index read-only. Fails cleanly on an incompatible index instead of
     /// letting the engine panic. Points the engine's library line source at `db_path`, and
@@ -310,6 +372,8 @@ impl Search {
             .to_string();
         refresh_line_source(db_str.clone())
             .with_context(|| format!("refreshing the engine's line source at {db_str}"))?;
+        *LINE_STATE.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((db_str.clone(), Instant::now()));
 
         let mut engine = SearchEngine::open_read_only(&index_str)?;
         let lexical = lexical_db
@@ -354,6 +418,7 @@ impl Search {
         let order = parse_order(&req.order)?;
         let grouping = parse_grouping(&req.grouping)?;
         let mode = req.effective_mode();
+        let _lines = line_use();
         let engine = self.lock();
         let page: SearchPageResult = match mode {
             Mode::Exact => engine.search_and_count_exact(
@@ -428,6 +493,7 @@ impl Search {
     /// Hit counts per child facet under `facet_prefix` (`/` = top-level categories,
     /// `/era`, `/author`, or any category path).
     pub fn facet_counts(&self, req: &SearchRequest, facet_prefix: &str) -> Result<Vec<FacetCount>> {
+        let _lines = line_use();
         let engine = self.lock();
         let prefix = facet_prefix.to_string();
         match req.effective_mode() {
@@ -476,6 +542,7 @@ impl Search {
 
     /// Hit counts per indexed book (`file_path` → count).
     pub fn count_by_book(&self, req: &SearchRequest) -> Result<HashMap<String, u32>> {
+        let _lines = line_use();
         let engine = self.lock();
         match req.effective_mode() {
             Mode::Exact => engine.count_by_book_exact(

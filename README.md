@@ -7,13 +7,15 @@
 
 - **`seforim.db`** (SQLite) — ספרים, שורות, הפניות (heRef), עץ קטגוריות, ראשי-תיבות,
   קישורים (24 סוגים) ומטא-דאטה. נתמכות סכמות **6 ו־7**: בסכמה 7 גופי הערות משוחזרים
-  מ־`line_note` באותו קוד המשמש את מנוע החיפוש; טקסט השורות ב-`line_content` דחוס ב-zstd עם מילון מטבלת `zstd_dict`, מהדורות ב-`version_line`,
+  מ־`line_note` באותו קוד המשמש את מנוע החיפוש, כולל `hasMarker` וגופים דחוסים
+  לצד תמיכה בייצוג `marker` הישן; טקסט השורות ב-`line_content` דחוס ב-zstd עם מילון מטבלת `zstd_dict`, מהדורות ב-`version_line`,
   אינדקס הפניות `line_ref`, דיבורי-המתחיל `line_dh`, עוגני-מילים `link_anchor`, קישורי-טווח
   `link_range`/`link_coverage`, צדדים מוסתרים `link_suppressed_side`, תאריכי/מקומות הוצאה,
   תיאורים קצרים/ארוכים — וגם מסדים ישנים (טקסט גלוי ב-`line.content`) בירידה הדרגתית.
 - **אינדקס Tantivy** — חיפוש טקסט מלא עם מורפולוגיה עברית. המנוע המקורי של אוצריא
-  (`otzaria_search_engine` **7.0.1**, אינדקס בסכמה 10 — הגרסה שהאפליקציה מצמידה) עבר
-  **vendoring** ומשמש ישירות, כך שהחיפוש נאמן במדויק לזה שבאפליקציה — כולל אפשרויות
+  נצרך דרך `otzaria-search-core`, מתאם Rust לליבה הקנונית בהצמדה לקומיט Git
+  מדויק, ללא runtime של Flutter. המנוע הנוכחי תומך באינדקסים בסכמות **10 ו־11**,
+  ואותו מקור Rust במנוע הקנוני משמש גם את מתאם FRB לאפליקציה — כולל אפשרויות
   החיפוש המתקדם, ביטויים שחוצים שורה, סינון לפי קטגוריה/תקופה/מחבר/ספרי יסוד, וקריאת
   טקסט השורות בחזרה מ-`seforim.db`. ספרים עם גופי הערות שהופרדו ל־`line_note`
   שומרים את הטקסט המשוחזר באינדקס, כדי להחזיר בתוצאות גם את גופי ההערות.
@@ -39,16 +41,18 @@ xattr -d com.apple.quarantine otzaria-mcp-* 2>/dev/null || true   # macOS: הס�
 ### מסלול ב' — בנייה מהמקור
 
 צריך **Rust** (toolchain יציב, `cargo`), מהדר C (Xcode CLT / gcc / MSVC — עבור SQLite
-ו-zstd המובנים) וגישה ל-GitHub בזמן הבנייה (שתי תלויות git מוצמדות של המנוע:
-`Otzaria/tantivy` ו-`Otzaria/otzaria-semantic-search`). ואז:
+ו-zstd המובנים) וגישה ל-GitHub בזמן הבנייה. תלויות Git מוצמדות במאגר הקנוני
+`Otzaria/otzaria_search_engine`, ב־`Otzaria/tantivy` וב־`Otzaria/otzaria-semantic-search`.
+ה־sidecar מספק פורמטים בלבד; backend של ONNX אינו מופעל. ואז:
 
 ```bash
 git clone https://github.com/Otzaria/otzaria_mcp && cd otzaria_mcp
-cargo build --release      # הבינארי: target/release/otzaria-mcp
+cargo build --locked --release      # הבינארי: target/release/otzaria-mcp
 ```
 
-הקומפילציה הראשונה כוללת את tantivy ולוקחת מספר דקות. מנוע החיפוש כלול בריפו תחת
-[`vendor/otzaria_search_engine`](vendor/otzaria_search_engine).
+הקומפילציה הראשונה כוללת את Tantivy. מקור המנוע נשאר במאגר הקנוני;
+`Cargo.toml` ו־`Cargo.lock` שומרים את ההצמדה. ראו
+[מדריך המעבר לליבה המשותפת](docs/SHARED_CORE_MIGRATION.md).
 
 ## הרצה (stdio)
 
@@ -158,7 +162,7 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
 
 ארבעה כלים נוספים עובדים עם המודל הסמנטי של אוצריא ועם הווקטורים שהיא הורידה
 (`%APPDATA%\\otzaria\\vectors`), באמצעות הקוד של אוצריא עצמה (ה-sidecar, ראו
-`VENDORED.md`): `otzaria_search` (חיפוש לפי משמעות, גם בספרים אישיים ובמסדים מצורפים),
+`vendor/otzaria-semantic-search/VENDORED.md`): `otzaria_search` (חיפוש לפי משמעות, גם בספרים אישיים ובמסדים מצורפים),
 `otzaria_check_quote` (בדיקת ציטוט: המקור הקדום ביותר, ההבדלים מילה במילה, ראשי תיבות),
 `otzaria_find_parallels` (מקבילות לטיוטת פתק — לדו"ח בלבד) ו-`otzaria_get_text` (טקסט של
 ספרים אישיים ומסדים מצורפים).
@@ -209,14 +213,16 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
   `seforim.db` לקריאה בלבד.
 - **מיפוי קנוני:** רק באינדקס `file_path="id:<bookId>"` ו-`segment`=מיקום השורה (=`lineIndex`)
   יש מיפוי חד-משמעי לספר ולשורה. ספרים אישיים, קטלוגים חיצוניים ו-PDF מסומנים ב-`source`.
-- **עדכון-חם:** משימת-רקע מנטרת טביעת-אצבע (mtime+גודל של ה-DB ושני קבצי meta של
-  האינדקס); כשהיא משתנה ומתייצבת, נפתחים מחדש ה-DB והאינדקס מאחורי `RwLock`.
-  גם חיבור קריאת השורות של מנוע החיפוש מתרענן כשמחליפים את קובץ המסד באותו נתיב.
-  תוצאה שאינה תואמת עוד את האינדקס מסומנת `stale`.
-- **גרסת מנוע:** ה-crate המוונדר חייב להתאים לסכימת האינדקס בדיסק (סכמה 7); אינדקס ישן
-  נדחה עד שהאפליקציה בונה אותו מחדש.
+- **עדכון-חם:** משימת רקע בודקת את המסד, WAL גלוי וקובצי המטא־דאטה וסדר הספרים.
+  לאחר התייצבות, הפתיחה והפרסום עוברים דרך תור החיפוש ובעובד חסימה, עם בדיקת
+  טביעת הקבצים לפני ואחרי הפתיחה. מקור השורות משותף לתהליך; החלפת הידיות אינה
+  עסקה בין המסד לאינדקס. טקסט שאינו תואם לאינדקס מסומן `stale` ללא הדגשה מטעה.
+- **גרסת מנוע:** הליבה הנוכחית קוראת אינדקסים בסכמות **10 ו־11** לאחר בדיקת
+  התאימות הקנונית. אינדקסים בסכמות 7–9 מחייבים בנייה מחדש באפליקציה; אינדקס
+  חדש יותר מחייב עדכון MCP. השרת מדווח על אי־התאימות ומשאיר את כלי המסד זמינים.
+  האפליקציה עדיין מוצמדת לגרסת המנוע `2da2309` עם סכמה 10, הנתמכת במעבר הזה.
 - **לא מחזיק את המסדים פתוחים:** חיבור SQLite (`seforim.db`, `user_books.db`, מסדים מצורפים, וגם
-  חיבור קריאת השורות של מנוע החיפוש) נסגר כשלא השתמשו בו 750ms, ומיד אחרי כל שאילתה כשהמסד
+  חיבור קריאת השורות של מנוע החיפוש — דרך `refresh_line_source` של הליבה, בלי טלאי במנוע) נסגר כשלא השתמשו בו 750ms, ומיד אחרי כל שאילתה כשהמסד
   במצב WAL או כשקובץ הסימון של העדכון (`seforim.db.applying`) קיים; השאילתה הבאה פותחת אותו
   מחדש (כמילישנייה). כך אוצריא מסיימת עדכון ספרייה — `PRAGMA journal_mode=DELETE` אחרי הטלאי,
   שנכשל ב-"database is locked" כשקורא החזיק חיבור פתוח — ויכולה להחליף קובץ מסד (ב-Windows כל
@@ -226,7 +232,7 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
   `library_info` מדווח `admission`.
 - **סדר קטלוג/דורות:** נלקח מ-`otzaria_book_order.json` שהאפליקציה כותבת בתיקיית האינדקס,
   ונקרא מחדש כשהוא משתנה. בלי הקובץ (או לספר שחסר בו) התוצאות ממוינות לפי מספר הספר במנוע.
-  ראו [`vendor/otzaria_search_engine/VENDORED.md`](vendor/otzaria_search_engine/VENDORED.md).
+  ראו [מדיניות התאימות](docs/SHARED_CORE_MIGRATION.md).
 - **חיפוש סמנטי ("חיפוש חכם")** — עדיין לא נחשף; ראו [CHANGELOG](CHANGELOG.md) ("עבודה עתידית").
 
 ## פיתוח
@@ -250,7 +256,7 @@ cargo clippy -p otzaria-mcp --all-targets --no-deps -- -D warnings
 
 ```
 Cargo.toml                      # workspace + [patch.crates-io] של המנוע
-vendor/otzaria_search_engine/   # מנוע Tantivy מוונדר + open_read_only, refresh_line_source
+docs/SHARED_CORE_MIGRATION.md   # מקור יחיד, הצמדה, תאימות וסדר מיזוג
 mcp/src/
   main.rs       # CLI + serve stdio
   paths.rs      # גילוי נתיבים
