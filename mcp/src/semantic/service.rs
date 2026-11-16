@@ -1295,15 +1295,19 @@ impl SemanticService {
                 continue;
             };
             let key = (src.clone(), bid);
-            // beside a line already shown — a result's own, or one of its `also_in` places
-            let near = kept
-                .get(&key)
-                .and_then(|v| {
-                    v.iter().copied().find(|&i| {
-                        (out[i]["line_index"].as_i64().unwrap_or(-99) - li).abs() <= merge_lines
+            // any of its places beside a line already shown — a result's own, or one of its
+            // `also_in` places: the same passage again, from either side
+            let near = places.iter().find_map(|p| {
+                let pk = (p.src.clone(), p.bid);
+                kept.get(&pk)
+                    .and_then(|v| {
+                        v.iter().copied().find(|&i| {
+                            (out[i]["line_index"].as_i64().unwrap_or(-99) - p.li).abs()
+                                <= merge_lines
+                        })
                     })
-                })
-                .or_else(|| covered.find(&key, li, merge_lines));
+                    .or_else(|| covered.find(&pk, p.li, merge_lines))
+            });
             if let Some(near) = near {
                 let h = &mut out[near];
                 let n = h
