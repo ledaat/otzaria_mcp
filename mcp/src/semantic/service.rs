@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Result};
-use otzaria_semantic_search::semantic::resolve::{BookSet, SlotRef, VectorHit};
+use otzaria_semantic_search::semantic::resolve::{BookSet, RecordRef, SlotRef, VectorHit};
 use serde_json::{json, Map, Value};
 
 use super::align::{align_words, Op};
@@ -60,6 +60,13 @@ pub struct SemanticConfig {
     pub feedback_dir: Option<PathBuf>,
     /// Where `defaults-<model>.json` may be (see [`super::calibration`]), first match wins.
     pub calibration_dirs: Vec<PathBuf>,
+    /// Where the vectors of personal and database books are read from. `false` (the default):
+    /// Otzaria's own vector set, where `oxv_export.py` publishes them — one scan finds
+    /// library, personal and database books, and the personal index serves only as the list
+    /// of those books (titles, files, text). `true` (`--scan-personal-index`): the personal
+    /// index's own vectors are scanned beside Otzaria's set, and whatever the set holds of
+    /// books outside the library is ignored.
+    pub scan_personal_index: bool,
 }
 
 // ── options ─────────────────────────────────────────────────────────────────
@@ -136,15 +143,93 @@ impl Cand {
     }
 }
 
-fn official_book(hit: &VectorHit) -> Option<(i64, i64, u8)> {
-    let r = hit.records.first()?;
-    let id = r.book.strip_prefix("id:")?.parse().ok()?;
-    Some((id, r.hint as i64, r.window))
+/// One place a candidate's text is at: a line of a library book, or of a personal or
+/// database book (`book`: its index in the personal set).
+#[derive(Debug, Clone, PartialEq)]
+struct Place {
+    src: SourceKey,
+    bid: i64,
+    li: i64,
+    /// The window of the line the vector was embedded from (255: a short line that shares
+    /// its neighbour's vector).
+    win: u8,
+    book: Option<usize>,
+}
+
+fn library_book_id(name: &str) -> Option<i64> {
+    name.strip_prefix("id:")?.parse().ok()
+}
+
+/// The places of a vector's records, library books first and each kind in the records'
+/// order (the scan lists the books its filter admitted first). `scope`: the books the search
+/// admitted, when it was filtered — a record of another book is not a place of this search.
+/// `personal`: a book outside the library (`uid:…`, `db:…`) to its index in the personal
+/// set; a record no book answers for is left out.
+fn record_places(
+    records: &[RecordRef],
+    scope: Option<&BookSet>,
+    library: impl Fn(i64) -> bool,
+    personal: impl Fn(&str) -> Option<(SourceKey, i64, usize)>,
+) -> Vec<Place> {
+    let mut lib = Vec::new();
+    let mut other = Vec::new();
+    for r in records {
+        if scope.is_some_and(|s| !s.contains(&r.book)) {
+            continue;
+        }
+        let (li, win) = (r.hint as i64, r.window);
+        if r.book.starts_with("id:") {
+            if let Some(bid) = library_book_id(&r.book).filter(|b| library(*b)) {
+                lib.push(Place {
+                    src: SourceKey::Official,
+                    bid,
+                    li,
+                    win,
+                    book: None,
+                });
+            }
+        } else if let Some((src, bid, bi)) = personal(&r.book) {
+            other.push(Place {
+                src,
+                bid,
+                li,
+                win,
+                book: Some(bi),
+            });
+        }
+    }
+    lib.extend(other);
+    lib
+}
+
+/// Lines a result already stands for besides its own: the other books its text is in
+/// (`also_in`). A later candidate at or beside one of them is the same passage again.
+#[derive(Default)]
+struct Covered(HashMap<(SourceKey, i64), Vec<(i64, usize)>>);
+
+impl Covered {
+    fn add(&mut self, src: &SourceKey, bid: i64, li: i64, hit: usize) {
+        self.0
+            .entry((src.clone(), bid))
+            .or_default()
+            .push((li, hit));
+    }
+
+    /// The result that covers a line within `merge_lines` of `li` in this book.
+    fn find(&self, key: &(SourceKey, i64), li: i64, merge_lines: i64) -> Option<usize> {
+        self.0
+            .get(key)?
+            .iter()
+            .find(|(l, _)| (l - li).abs() <= merge_lines)
+            .map(|(_, hit)| *hit)
+    }
 }
 
 struct Run {
     per_query: Vec<Vec<(f32, Cand)>>,
     personal: Option<Arc<PersonalSet>>,
+    /// The books the scan of Otzaria's set admitted, when it was filtered.
+    scope: Option<Arc<BookSet>>,
     embed_ms: u128,
     scan_ms: u128,
 }
@@ -156,8 +241,8 @@ struct StatusState {
     busy: bool,
 }
 
-/// (categories, excluded categories) of a search scope.
-type ScopeKey = (Vec<String>, Vec<String>);
+/// (categories, excluded categories, personal books admitted, library only) of a search scope.
+type ScopeKey = (Vec<String>, Vec<String>, bool, bool);
 /// Per attached database: its mtime and the era of each book.
 type EraCache = HashMap<String, (Option<SystemTime>, HashMap<i64, u8>)>;
 
@@ -234,13 +319,25 @@ impl SemanticService {
             *self.personal.write().unwrap() = None;
             return;
         }
-        match PersonalSet::open(&self.cfg.personal_dir, Some(&self.cfg.user_books_db)) {
+        match PersonalSet::open(
+            &self.cfg.personal_dir,
+            Some(&self.cfg.user_books_db),
+            self.cfg.scan_personal_index,
+        ) {
             Ok(ps) => {
-                eprintln!(
-                    "otzaria-mcp: personal index: {} passages from {} books",
-                    ps.n,
-                    ps.books.len()
-                );
+                if self.cfg.scan_personal_index {
+                    eprintln!(
+                        "otzaria-mcp: personal index: {} passages from {} books",
+                        ps.n,
+                        ps.books.len()
+                    );
+                } else {
+                    eprintln!(
+                        "otzaria-mcp: personal index: {} books (their vectors are read from \
+                         Otzaria's set; --scan-personal-index scans the index's own)",
+                        ps.books.len()
+                    );
+                }
                 *self.personal.write().unwrap() = Some(Arc::new(ps));
                 self.check_personal_model();
             }
@@ -252,16 +349,32 @@ impl SemanticService {
         self.book_sets.lock().unwrap().clear();
     }
 
-    /// Personal vectors are searched only when they come from the vector set's model.
+    /// What keeps personal and database books out of searches, if anything. Scanning the
+    /// personal index: its vectors must come from the vector set's model. Reading them from
+    /// Otzaria's set (the default): the set must hold vectors of those books at all.
     fn check_personal_model(&self) {
-        let want = self.official.read().unwrap().family().to_string();
         let ps = self.personal.read().unwrap().clone();
-        let note = match ps.as_ref().and_then(|p| p.model().map(String::from)) {
-            Some(have) if have != want => Some(format!(
-                "personal index was built with {have}; Otzaria's vectors now use {want}. Personal \
-                 and database books are left out of searches until the personal index is rebuilt."
-            )),
-            _ => None,
+        let note = if self.cfg.scan_personal_index {
+            let want = self.official.read().unwrap().family().to_string();
+            match ps.as_ref().and_then(|p| p.model().map(String::from)) {
+                Some(have) if have != want => Some(format!(
+                    "personal index was built with {have}; Otzaria's vectors now use {want}. \
+                     Personal and database books are left out of searches until the personal \
+                     index is rebuilt."
+                )),
+                _ => None,
+            }
+        } else {
+            match &ps {
+                Some(p) if !self.set_holds_books_of(p) => Some(
+                    "Otzaria's vector set holds no vectors of the personal and database books: \
+                     they are left out of searches until they are published into it \
+                     (oxv_export.py, or build_personal_index.py --publish-oxv), or the server is \
+                     started with --scan-personal-index."
+                        .to_string(),
+                ),
+                _ => None,
+            }
         };
         let mut cur = self.personal_note.lock().unwrap();
         if note.is_some() && *cur != note {
@@ -270,11 +383,33 @@ impl SemanticService {
         *cur = note;
     }
 
+    /// Whether Otzaria's set holds a vector of any book of the personal set: one scan that
+    /// admits only those books. A scan that fails says nothing, and is not held against them.
+    fn set_holds_books_of(&self, ps: &PersonalSet) -> bool {
+        let names: BookSet = ps.set_names(None).collect();
+        if names.is_empty() {
+            return false;
+        }
+        let o = self.official.read().unwrap();
+        let mut probe = vec![0f32; (o.declared.model.embedding_dim as usize).max(1)];
+        probe[0] = 1.0;
+        o.scan(&probe, 1, Some(&names))
+            .map(|hits| !hits.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// The personal set a search reads personal and database books through: its vectors when
+    /// the personal index is scanned, else its books (the vectors are in Otzaria's set).
     fn personal_searchable(&self) -> Option<Arc<PersonalSet>> {
         if self.personal_note.lock().unwrap().is_some() {
             return None;
         }
-        self.personal.read().unwrap().clone().filter(|p| p.n > 0)
+        let ps = self.personal.read().unwrap().clone();
+        if self.cfg.scan_personal_index {
+            ps.filter(|p| p.n > 0)
+        } else {
+            ps
+        }
     }
 
     fn personal_any(&self) -> Option<Arc<PersonalSet>> {
@@ -413,11 +548,26 @@ impl SemanticService {
 
     // ── scopes ──────────────────────────────────────────────────────────────
 
-    fn official_scope(&self, include: &[String], exclude: &[String]) -> Option<Arc<BookSet>> {
-        if include.is_empty() && exclude.is_empty() {
+    /// The books a scan of Otzaria's set admits (`None`: every book). `personal`: the personal
+    /// set whose books the scan may return (their vectors are read from Otzaria's set), by
+    /// the same category scope. `library_only`: a search without personal books of a set that
+    /// holds them.
+    fn official_scope(
+        &self,
+        include: &[String],
+        exclude: &[String],
+        personal: Option<&PersonalSet>,
+        library_only: bool,
+    ) -> Option<Arc<BookSet>> {
+        if include.is_empty() && exclude.is_empty() && !library_only {
             return None;
         }
-        let key = (include.to_vec(), exclude.to_vec());
+        let key = (
+            include.to_vec(),
+            exclude.to_vec(),
+            personal.is_some(),
+            library_only,
+        );
         if let Some(v) = self.book_sets.lock().unwrap().get(&key) {
             return v.clone();
         }
@@ -431,17 +581,48 @@ impl SemanticService {
                 admitted.remove(&b);
             }
         }
-        let set = Arc::new(BookSet(
-            admitted
-                .into_iter()
-                .map(|b| format!("id:{b}").into_boxed_str())
-                .collect(),
-        ));
+        let mut names: HashSet<Box<str>> = admitted
+            .into_iter()
+            .map(|b| format!("id:{b}").into_boxed_str())
+            .collect();
+        if let Some(ps) = personal {
+            let mask = ps.book_mask(include, exclude);
+            names.extend(ps.set_names(mask.as_deref()).map(Box::from));
+        }
+        let set = Arc::new(BookSet(names));
         self.book_sets
             .lock()
             .unwrap()
             .insert(key, Some(set.clone()));
         Some(set)
+    }
+
+    /// The personal set of a request (`include_personal`), and the scope of its scan of
+    /// Otzaria's set.
+    fn request_scope(
+        &self,
+        opts: &Opts,
+        include: &[String],
+        exclude: &[String],
+    ) -> (Option<Arc<PersonalSet>>, Option<Arc<BookSet>>) {
+        let searchable = self.personal_searchable();
+        let personal = if opts.bool("include_personal", true) {
+            searchable.clone()
+        } else {
+            None
+        };
+        let scope = if self.cfg.scan_personal_index {
+            self.official_scope(include, exclude, None, false)
+        } else {
+            // the set holds the personal books' vectors: a search without them names the library
+            self.official_scope(
+                include,
+                exclude,
+                personal.as_deref(),
+                personal.is_none() && searchable.is_some(),
+            )
+        };
+        (personal, scope)
     }
 
     // ── scanning ────────────────────────────────────────────────────────────
@@ -461,7 +642,7 @@ impl SemanticService {
         vectors.extend(extra);
         let embed_ms = t0.elapsed().as_millis();
         let t1 = Instant::now();
-        let scope = self.official_scope(&include, &exclude);
+        let (personal, scope) = self.request_scope(opts, &include, &exclude);
         let mut per_query: Vec<Vec<(f32, Cand)>> = Vec::with_capacity(vectors.len());
         for v in &vectors {
             let hits = official.scan(v, kc, scope.as_deref())?;
@@ -472,12 +653,7 @@ impl SemanticService {
             );
         }
         drop(official);
-        let personal = if opts.bool("include_personal", true) {
-            self.personal_searchable()
-        } else {
-            None
-        };
-        if let Some(ps) = &personal {
+        if let Some(ps) = personal.as_ref().filter(|_| self.cfg.scan_personal_index) {
             let mask = ps.book_mask(&include, &exclude);
             let res = ps.scan(&vectors, kc, mask.as_deref());
             for (qi, hits) in res.into_iter().enumerate() {
@@ -490,6 +666,7 @@ impl SemanticService {
         Ok(Run {
             per_query,
             personal,
+            scope,
             embed_ms,
             scan_ms: t1.elapsed().as_millis(),
         })
@@ -507,7 +684,13 @@ impl SemanticService {
             .iter()
             .map(|(s, c)| (*s, c.clone(), vec![0]))
             .collect();
-        let hits = self.resolve(&cands, &opts, None, run.personal.as_deref())?;
+        let hits = self.resolve(
+            &cands,
+            &opts,
+            None,
+            run.personal.as_deref(),
+            run.scope.as_deref(),
+        )?;
         Ok(json!({"query": q, "hits": hits,
                   "timing_ms": {"embed": run.embed_ms, "scan": run.scan_ms, "resolve": t.elapsed().as_millis()}}))
     }
@@ -577,6 +760,7 @@ impl SemanticService {
         } as f32;
         let max_cands = opts.int("max_candidates", 2 * k as i64).clamp(1, 5000) as usize;
         let rescore = opts.bool("rescore", false) && windows.len() > 1;
+        let (personal, scope) = self.request_scope(&opts, &[], &[]);
         let official = self.official.read().unwrap();
         let t0 = Instant::now();
         let mut vectors = Vec::with_capacity(windows.len());
@@ -597,16 +781,11 @@ impl SemanticService {
             }
         };
         for (wi, v) in vectors.iter().enumerate() {
-            for h in official.scan(v, k, None)? {
+            for h in official.scan(v, k, scope.as_deref())? {
                 keep(h.score, wi, Cand::Official(Arc::new(h)));
             }
         }
-        let personal = if opts.bool("include_personal", true) {
-            self.personal_searchable()
-        } else {
-            None
-        };
-        if let Some(ps) = &personal {
+        if let Some(ps) = personal.as_ref().filter(|_| self.cfg.scan_personal_index) {
             for (wi, hits) in ps.scan(&vectors, k, None).into_iter().enumerate() {
                 for (score, slot) in hits {
                     keep(score, wi, Cand::Personal(slot));
@@ -659,29 +838,28 @@ impl SemanticService {
         for (score, wi, c) in &pool {
             let mut o = match c {
                 Cand::Official(h) => {
-                    let Some((bid, li, win)) = official_book(h) else {
+                    let places = self.hit_places(personal.as_deref(), scope.as_deref(), h);
+                    let Some(at) = places.first() else {
                         continue;
                     };
                     // 255: a short line sharing its neighbour's vector, at its own line
-                    let win = if win == 255 { 0 } else { win };
-                    json!({"store": "lib", "key": format!("o:{}:{}", h.seg, h.slot), "source": "library",
-                           "id": bid, "line": li, "window": win})
+                    let win = if at.win == 255 { 0 } else { at.win };
+                    let key = format!("o:{}:{}", h.seg, h.slot);
+                    match at.book.and_then(|bi| personal.as_ref()?.books.get(bi)) {
+                        // a personal or database book whose vector is in Otzaria's set
+                        Some(b) => personal_parallel(b, key, at.li, win),
+                        None if at.book.is_some() => continue,
+                        None => {
+                            json!({"store": "lib", "key": key, "source": "library",
+                                   "id": at.bid, "line": at.li, "window": win})
+                        }
+                    }
                 }
                 Cand::Personal(slot) => {
                     let Some(ps) = &personal else { continue };
                     let (bi, li) = ps.record(*slot);
                     let Some(b) = ps.books.get(bi) else { continue };
-                    let (kind, uid) = if b.attached() {
-                        (
-                            "attached",
-                            format!("db:{}:{}", b.slug.as_deref().unwrap_or(""), b.book_id),
-                        )
-                    } else {
-                        ("user", format!("uid:{}", b.book_id))
-                    };
-                    json!({"store": "personal", "key": format!("p:{slot}"), "source": kind, "kind": kind,
-                           "id": b.book_id, "bookUid": uid, "title": b.title, "line": li,
-                           "window": ps.slot_window(*slot)})
+                    personal_parallel(b, format!("p:{slot}"), li, ps.slot_window(*slot))
                 }
             };
             let m = o.as_object_mut().unwrap();
@@ -709,7 +887,8 @@ impl SemanticService {
                         "model_family": official.family(),
                         "query_graph": official.query_graph.file_name().unwrap_or_default().to_string_lossy()},
             "personal": {"searched": personal.is_some(), "books": any.as_ref().map_or(0, |p| p.books.len()),
-                         "slots": any.as_ref().map_or(0, |p| p.n), "note": self.personal_note.lock().unwrap().clone()},
+                         "slots": any.as_ref().map_or(0, |p| p.n), "vectors": self.personal_vectors(),
+                         "note": self.personal_note.lock().unwrap().clone()},
             "timing_ms": {"embed": embed_ms, "scan": scan_ms, "rescore": rescore_ms}
         }))
     }
@@ -784,21 +963,122 @@ impl SemanticService {
                 )),
             );
         }
-        let hits = self.resolve(&cands, &Opts(&o), Some(&windows), run.personal.as_deref())?;
+        let hits = self.resolve(
+            &cands,
+            &Opts(&o),
+            Some(&windows),
+            run.personal.as_deref(),
+            run.scope.as_deref(),
+        )?;
         Ok(json!({"windows": windows, "hits": hits,
                   "timing_ms": {"embed": run.embed_ms, "scan": run.scan_ms, "resolve": t.elapsed().as_millis()}}))
     }
 
     // ── resolution ──────────────────────────────────────────────────────────
 
+    /// Where a vector of Otzaria's set is: see [`record_places`]. Books outside the library
+    /// are places only when their vectors are read from the set (not `--scan-personal-index`)
+    /// and the personal set names them.
+    fn hit_places(
+        &self,
+        ps: Option<&PersonalSet>,
+        scope: Option<&BookSet>,
+        hit: &VectorHit,
+    ) -> Vec<Place> {
+        let ps = ps.filter(|_| !self.cfg.scan_personal_index);
+        record_places(
+            &hit.records,
+            scope,
+            |bid| self.catalog.has_book(bid),
+            |name| {
+                let ps = ps?;
+                let bi = *ps.by_set_name.get(name)?;
+                let b = &ps.books[bi];
+                Some((b.source(), b.book_id, bi))
+            },
+        )
+    }
+
+    /// Every place of a candidate, the one it is shown at first.
+    fn cand_places(
+        &self,
+        ps: Option<&PersonalSet>,
+        scope: Option<&BookSet>,
+        c: &Cand,
+    ) -> Vec<Place> {
+        match c {
+            Cand::Official(h) => self.hit_places(ps, scope, h),
+            Cand::Personal(slot) => {
+                let Some(ps) = ps else { return Vec::new() };
+                let (bi, li) = ps.record(*slot);
+                ps.books
+                    .get(bi)
+                    .map(|b| Place {
+                        src: b.source(),
+                        bid: b.book_id,
+                        li,
+                        win: ps.slot_window(*slot),
+                        book: Some(bi),
+                    })
+                    .into_iter()
+                    .collect()
+            }
+        }
+    }
+
+    /// Where the personal and database books' vectors are read from (`/health`).
+    fn personal_vectors(&self) -> &'static str {
+        if self.cfg.scan_personal_index {
+            "personal-index"
+        } else {
+            "otzaria-set"
+        }
+    }
+
+    /// A candidate as a result, at the first of its places, with the others as `also_in`.
+    fn base_at(
+        &self,
+        conn: &rusqlite::Connection,
+        ps: Option<&PersonalSet>,
+        places: &[Place],
+    ) -> Result<Option<Map<String, Value>>> {
+        let Some(at) = places.first() else {
+            return Ok(None);
+        };
+        let base = match at.book {
+            None => self.base_official(conn, at.bid, at.li, at.win)?,
+            Some(bi) => ps.and_then(|p| self.base_personal(p, bi, at.li, at.win)),
+        };
+        let Some(mut m) = base else { return Ok(None) };
+        // the same text elsewhere: not an alias (a short neighbouring line that shares this
+        // line's vector, window 255) nor the line's own neighbours
+        let mut also = Vec::new();
+        let others = places[1..].iter().filter(|p| {
+            p.win != 255 && !(p.src == at.src && p.bid == at.bid && (p.li - at.li).abs() <= 2)
+        });
+        for p in others.take(4) {
+            let title = match p.book {
+                None => self.catalog.book(p.bid).map(|b| b.title),
+                Some(bi) => ps.and_then(|s| s.books.get(bi)).map(|b| b.title.clone()),
+            };
+            if let Some(title) = title {
+                also.push(
+                    json!({"book_id": p.bid, "book_title": title, "line_index": p.li,
+                                 "url": p.src.url(p.bid, p.li)}),
+                );
+            }
+        }
+        m.insert("also_in".into(), Value::Array(also));
+        Ok(Some(m))
+    }
+
     fn base_official(
         &self,
         conn: &rusqlite::Connection,
-        hit: &VectorHit,
+        bid: i64,
+        li: i64,
+        win: u8,
     ) -> Result<Option<Map<String, Value>>> {
-        let Some((bid, li, win)) = official_book(hit) else {
-            return Ok(None);
-        };
         let Some(book) = self.catalog.book(bid) else {
             return Ok(None);
         };
@@ -850,32 +1130,6 @@ impl SemanticService {
         } else {
             book.title.clone()
         };
-        // the same text elsewhere: not an alias (a short neighbouring line that shares this
-        // line's vector, window 255) nor the line's own neighbours
-        let mut also = Vec::new();
-        let others = hit.records.iter().skip(1).filter(|r| {
-            r.window != 255
-                && !(r
-                    .book
-                    .strip_prefix("id:")
-                    .and_then(|x| x.parse::<i64>().ok())
-                    == Some(bid)
-                    && (r.hint as i64 - li).abs() <= 2)
-        });
-        for r in others.take(4) {
-            if let Some(bj) = r
-                .book
-                .strip_prefix("id:")
-                .and_then(|x| x.parse::<i64>().ok())
-            {
-                if let Some(b) = self.catalog.book(bj) {
-                    also.push(
-                        json!({"book_id": bj, "book_title": b.title, "line_index": r.hint,
-                                     "url": SourceKey::Official.url(bj, r.hint as i64)}),
-                    );
-                }
-            }
-        }
         let mut m = Map::new();
         m.insert("key".into(), json!(["o", bid]));
         m.insert("book_id".into(), json!(bid));
@@ -891,7 +1145,7 @@ impl SemanticService {
         m.insert("text".into(), json!(text));
         m.insert("snippet".into(), json!(snippet));
         m.insert("url".into(), json!(SourceKey::Official.url(bid, li)));
-        m.insert("also_in".into(), Value::Array(also));
+        m.insert("also_in".into(), json!([]));
         m.insert("window".into(), json!(win));
         m.insert("book_source".into(), json!("official"));
         m.insert("personal".into(), json!(false));
@@ -899,8 +1153,13 @@ impl SemanticService {
         Ok(Some(m))
     }
 
-    fn base_personal(&self, ps: &PersonalSet, slot: usize) -> Option<Map<String, Value>> {
-        let (bi, li) = ps.record(slot);
+    fn base_personal(
+        &self,
+        ps: &PersonalSet,
+        bi: usize,
+        li: i64,
+        win: u8,
+    ) -> Option<Map<String, Value>> {
         let b = ps.books.get(bi)?;
         let (lines, stale) = ps.lines_of(bi);
         let lines = lines?;
@@ -910,8 +1169,7 @@ impl SemanticService {
             return None;
         }
         let mut snippet = text.clone();
-        let win = ps.slot_window(slot);
-        if win > 0 {
+        if win > 0 && win != 255 {
             // a later window of a long line: the windows were cut from the line without nikud
             let t = line_text(raw);
             let (a, e) = window_span(&t, win as usize);
@@ -971,23 +1229,13 @@ impl SemanticService {
         Some(m)
     }
 
-    fn cand_location(&self, ps: Option<&PersonalSet>, c: &Cand) -> Option<(SourceKey, i64, i64)> {
-        match c {
-            Cand::Official(h) => official_book(h).map(|(b, l, _)| (SourceKey::Official, b, l)),
-            Cand::Personal(slot) => {
-                let ps = ps?;
-                let (bi, li) = ps.record(*slot);
-                ps.books.get(bi).map(|b| (b.source(), b.book_id, li))
-            }
-        }
-    }
-
     fn resolve(
         &self,
         cands: &[(f32, Cand, Vec<usize>)],
         opts: &Opts,
         windows: Option<&[String]>,
         ps: Option<&PersonalSet>,
+        scope: Option<&BookSet>,
     ) -> Result<Vec<Value>> {
         let k = opts.int("k", 20).max(1) as usize;
         // the query's length bucket: the query, or a note's windows on average
@@ -1035,22 +1283,33 @@ impl SemanticService {
         let mut per_book: HashMap<(SourceKey, i64), usize> = HashMap::new();
         let mut per_window: HashMap<usize, usize> = HashMap::new();
         let mut seen_text: HashMap<String, usize> = HashMap::new();
+        let mut covered = Covered::default();
         let mut out: Vec<Map<String, Value>> = Vec::new();
         let mut counted = 0; // flagged hits (cited / echoing the note) are shown but not counted
         for (score, cand, wins) in cands {
             if *score < min_score || counted >= k || out.len() >= 3 * k {
                 break;
             }
-            let Some((src, bid, li)) = self.cand_location(ps, cand) else {
+            let places = self.cand_places(ps, scope, cand);
+            let Some((src, bid, li)) = places.first().map(|p| (p.src.clone(), p.bid, p.li)) else {
                 continue;
             };
             let key = (src.clone(), bid);
-            if let Some(near) = kept.get(&key).and_then(|v| {
-                v.iter().find(|&&i| {
-                    (out[i]["line_index"].as_i64().unwrap_or(-99) - li).abs() <= merge_lines
-                })
-            }) {
-                let h = &mut out[*near];
+            // any of its places beside a line already shown — a result's own, or one of its
+            // `also_in` places: the same passage again, from either side
+            let near = places.iter().find_map(|p| {
+                let pk = (p.src.clone(), p.bid);
+                kept.get(&pk)
+                    .and_then(|v| {
+                        v.iter().copied().find(|&i| {
+                            (out[i]["line_index"].as_i64().unwrap_or(-99) - p.li).abs()
+                                <= merge_lines
+                        })
+                    })
+                    .or_else(|| covered.find(&pk, p.li, merge_lines))
+            });
+            if let Some(near) = near {
+                let h = &mut out[near];
                 let n = h
                     .get("also_matched_lines")
                     .and_then(Value::as_u64)
@@ -1062,11 +1321,9 @@ impl SemanticService {
             if !cited && per_book.get(&key).copied().unwrap_or(0) >= max_per_book {
                 continue;
             }
-            let base = match cand {
-                Cand::Official(h) => self.base_official(&conn, h)?,
-                Cand::Personal(slot) => ps.and_then(|p| self.base_personal(p, *slot)),
+            let Some(base) = self.base_at(&conn, ps, &places)? else {
+                continue;
             };
-            let Some(base) = base else { continue };
             let text = base["text"].as_str().unwrap_or("").to_string();
             let norm: String = strip_nikud(&text)
                 .chars()
@@ -1084,6 +1341,9 @@ impl SemanticService {
                             json!({"book_id": base["book_id"], "book_title": base["book_title"],
                                          "line_index": li, "url": base["url"]}),
                         );
+                    }
+                    for p in &places {
+                        covered.add(&p.src, p.bid, p.li, twin);
                     }
                     continue;
                 }
@@ -1123,6 +1383,9 @@ impl SemanticService {
             let idx = out.len();
             out.push(hit);
             kept.entry(key.clone()).or_default().push(idx);
+            for p in &places[1..] {
+                covered.add(&p.src, p.bid, p.li, idx);
+            }
             if char_len(&norm) >= 30 {
                 seen_text.insert(norm, idx);
             }
@@ -1434,10 +1697,15 @@ impl SemanticService {
         let conn = self.catalog.connect()?;
         let mut seen: HashSet<(SourceKey, i64, i64)> = HashSet::new();
         let mut results: Vec<(Map<String, Value>, SourceRank)> = Vec::new();
-        for (score, cand) in &cands {
-            let Some((src, bid, li)) = self.cand_location(ps, cand) else {
-                continue;
-            };
+        // every place of a candidate: the same text in several books is one vector of the set
+        let places = cands.iter().flat_map(|(score, cand)| {
+            self.cand_places(ps, run.scope.as_deref(), cand)
+                .into_iter()
+                .take(8)
+                .map(move |p| (score, p))
+        });
+        for (score, place) in places {
+            let (src, bid, li) = (place.src, place.bid, place.li);
             if src == SourceKey::Official && !self.catalog.has_book(bid) {
                 continue;
             }
@@ -1710,6 +1978,8 @@ impl SemanticService {
                "query_max_tokens": o.declared.model.query_max_tokens.unwrap_or(o.declared.model.max_tokens),
                "generation": o.declared.generation,
                "personal_searched": self.personal_searchable().is_some(),
+               "personal_vectors": self.personal_vectors(),
+               "personal_note": self.personal_note.lock().unwrap().clone(),
                "personal_model": ps.as_ref().and_then(|p| p.model().map(String::from)),
                "calibration": calibration,
                "uptime_s": self.started.elapsed().as_secs()})
@@ -1756,6 +2026,7 @@ impl SemanticService {
                "index_dir": self.cfg.personal_dir.to_string_lossy(),
                "builder": self.cfg.builder.as_ref().map(|b| b.to_string_lossy().into_owned()),
                "searched": self.personal_searchable().is_some(),
+               "vectors": self.personal_vectors(),
                "note": self.personal_note.lock().unwrap().clone()})
     }
 
@@ -1898,6 +2169,19 @@ pub struct BookRows {
     pub rows: Vec<(i64, Option<String>, Vec<String>, String)>,
 }
 
+/// A personal or database book's passage in `/parallels`.
+fn personal_parallel(
+    b: &super::personal::PersonalBook,
+    key: String,
+    line: i64,
+    window: u8,
+) -> Value {
+    let kind = if b.attached() { "attached" } else { "user" };
+    json!({"store": "personal", "key": key, "source": kind, "kind": kind,
+           "id": b.book_id, "bookUid": b.set_name(), "title": b.title, "line": line,
+           "window": window})
+}
+
 fn val_str(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
@@ -2009,4 +2293,80 @@ fn ensure(cond: bool, msg: &str) -> Result<()> {
         bail!("{msg}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(book: &str, hint: u32, window: u8) -> RecordRef {
+        RecordRef {
+            book: book.into(),
+            hint,
+            window,
+            anchor: None,
+        }
+    }
+
+    fn personal(name: &str) -> Option<(SourceKey, i64, usize)> {
+        match name {
+            "uid:7" => Some((SourceKey::User, 70, 0)), // renumbered by Otzaria since the index
+            "db:x:3" => Some((SourceKey::Attached("x".into()), 3, 1)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn places_put_the_library_first_and_keep_the_records_order() {
+        let records = [
+            rec("db:x:3", 11, 0),
+            rec("id:5", 40, 0),
+            rec("uid:7", 2, 1),
+            rec("id:9", 8, 255),
+            rec("uid:99", 1, 0), // no such book
+            rec("id:404", 1, 0), // not in the library
+        ];
+        let places = record_places(&records, None, |b| b != 404, personal);
+        let seen: Vec<(String, i64, i64, u8, Option<usize>)> = places
+            .iter()
+            .map(|p| (p.src.code(), p.bid, p.li, p.win, p.book))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("o".into(), 5, 40, 0, None),
+                ("o".into(), 9, 8, 255, None),
+                ("d:x".into(), 3, 11, 0, Some(1)),
+                ("u".into(), 70, 2, 1, Some(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn places_outside_the_scope_or_without_a_personal_set_are_left_out() {
+        let records = [rec("db:x:3", 11, 0), rec("id:5", 40, 0), rec("uid:7", 2, 0)];
+        let scope: BookSet = ["uid:7", "id:5"].into_iter().collect();
+        let places = record_places(&records, Some(&scope), |_| true, personal);
+        assert_eq!(
+            places.iter().map(|p| p.bid).collect::<Vec<_>>(),
+            vec![5, 70]
+        );
+        // --scan-personal-index: the set's records of books outside the library are ignored
+        let places = record_places(&records, None, |_| true, |_| None);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].src, SourceKey::Official);
+    }
+
+    #[test]
+    fn a_line_beside_an_also_in_place_is_covered() {
+        let mut covered = Covered::default();
+        covered.add(&SourceKey::User, 2492, 11, 0);
+        covered.add(&SourceKey::User, 2492, 40, 3);
+        let book = (SourceKey::User, 2492);
+        assert_eq!(covered.find(&book, 13, 2), Some(0));
+        assert_eq!(covered.find(&book, 14, 2), None);
+        assert_eq!(covered.find(&book, 39, 2), Some(3));
+        assert_eq!(covered.find(&book, 13, 0), None);
+        assert_eq!(covered.find(&(SourceKey::Official, 2492), 11, 2), None);
+    }
 }

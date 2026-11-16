@@ -1289,7 +1289,7 @@ impl OtzariaServer {
         name = "otzaria_search",
         description = "Semantic search over the whole Otzaria library (Tanakh, Shas, rishonim, acharonim, \
                        shu\"t, contemporary works), plus Philo's personal seforim and attached book databases \
-                       once their index is built with the library's model (marked by a source=user / \
+                       once their vectors are published into Otzaria's vector set (marked by a source=user / \
                        source=db:... url), with Otzaria's own Hebrew/Aramaic model. Best for locating a source \
                        from a paraphrase or loose citation (e.g. 'כמש\"כ התוס' שאין מוקצה אלא בטלטול', 'עי' \
                        בקצוה\"ח'), or a passage discussing a given sevara. Phrase the query in Hebrew/Aramaic \

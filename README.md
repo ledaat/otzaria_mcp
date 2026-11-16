@@ -182,9 +182,16 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
 - **ONNX Runtime** נטען בזמן ריצה: ברירת המחדל היא זה של אוצריא
   (`<תיקיית ההתקנה>\\onnxruntime\\onnxruntime.dll`), אחרת `--onnx-runtime` או
   `OTZARIA_ONNX_RUNTIME`.
-- **ספרים אישיים**: האינדקס של `build_personal_index.py` (`--personal-index`, ברירת מחדל
-  `%LOCALAPPDATA%\\otzaria-sources\\personal-index`) נסרק רק כשנבנה באותו מודל כמו הווקטורים
-  של אוצריא. `--builder <build_personal_index.py>` מאפשר ל-`/personal/status` לדווח מה השתנה.
+- **ספרים אישיים**: הווקטורים של ספרים אישיים ומסדים מצורפים נקראים כברירת מחדל **מסט
+  הווקטורים של אוצריא בלבד** — לשם מפרסם אותם `oxv_export.py` של otzaria-sources
+  (`build_personal_index.py --publish-oxv`) — כך שסריקה אחת מוצאת ספרייה, ספרים אישיים ומסדים.
+  האינדקס של `build_personal_index.py` (`--personal-index`, ברירת מחדל
+  `%LOCALAPPDATA%\\otzaria-sources\\personal-index`) משמש אז רק כרשימת הספרים (כותרת, קובץ,
+  טקסט, וזיהוי ספר שהשתנה מאז הבנייה); הווקטורים שלו אינם ממופים. כשהסט אינו מחזיק וקטורים
+  של ספרים אלה, הם נשארים מחוץ לחיפוש, והסיבה מדווחת ב-`/health` (`personal_note`).
+  `--scan-personal-index` (או `OTZARIA_SCAN_PERSONAL_INDEX=1`) מחזיר את ההתנהגות הקודמת:
+  וקטורי האינדקס האישי נסרקים לצד הסט (רק כשנבנה באותו מודל), ומה שהסט מחזיק מספרים שמחוץ
+  לספרייה אינו נקרא. `--builder <build_personal_index.py>` מאפשר ל-`/personal/status` לדווח מה השתנה.
 - **ברירות מחדל מכוילות**: השרת קורא את `defaults-<model>.json` שכותב
   `calibrate_semantic.py` של otzaria-sources — הקובץ של המודל שהווקטורים משתמשים בו
   (`otzaria/Meivin-Embed-QA491-native256` ← `defaults-otzaria-Meivin-Embed-QA491-native256.json`),
