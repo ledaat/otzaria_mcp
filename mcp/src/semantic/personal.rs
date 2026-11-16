@@ -69,6 +69,15 @@ impl PersonalBook {
         self.source().url(self.book_id, line)
     }
 
+    /// The book's name in Otzaria's search index and vector set (its `filePath` there).
+    pub fn set_name(&self) -> String {
+        if self.attached() {
+            format!("db:{}:{}", self.slug.as_deref().unwrap_or(""), self.book_id)
+        } else {
+            format!("uid:{}", self.book_id)
+        }
+    }
+
     /// The category path shown with a hit: the database's name first for an attached book.
     pub fn category_path(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -110,6 +119,10 @@ pub struct PersonalSet {
     slot_window: Option<Mmap>,
     pub books: Vec<PersonalBook>,
     pub by_key: HashMap<(SourceKey, i64), usize>,
+    /// Each book by the name Otzaria's search index and vector set know it by (`uid:<id>`,
+    /// `db:<slug>:<id>`), with the id it had when the index was built: the id
+    /// `oxv_export.py` wrote into Otzaria's set from this index.
+    pub by_set_name: HashMap<String, usize>,
     cache: Mutex<Vec<(usize, Cached)>>,
 }
 
@@ -125,7 +138,13 @@ impl PersonalSet {
         dir.join("index.json")
     }
 
-    pub fn open(dir: &Path, user_books_db: Option<&Path>) -> Result<PersonalSet> {
+    /// `map_vectors: false` opens the set for its books only (their titles, files and
+    /// text): nothing of its vectors is mapped, and [`Self::scan`] finds nothing.
+    pub fn open(
+        dir: &Path,
+        user_books_db: Option<&Path>,
+        map_vectors: bool,
+    ) -> Result<PersonalSet> {
         let ij = Self::index_json(dir);
         let mtime = std::fs::metadata(&ij).and_then(|m| m.modified()).ok();
         let info: serde_json::Value = serde_json::from_slice(&std::fs::read(&ij)?)?;
@@ -136,7 +155,7 @@ impl PersonalSet {
         );
         let n = info["slots"].as_u64().unwrap_or(0) as usize;
         let dim = info["dim"].as_u64().unwrap_or(256) as usize;
-        let (vectors, scales, slot_book, slot_line, slot_window) = if n > 0 {
+        let (vectors, scales, slot_book, slot_line, slot_window) = if n > 0 && map_vectors {
             let sw = set.join("slot_window.u8");
             (
                 Some(map(&set.join("vectors.i8"))?),
@@ -158,6 +177,11 @@ impl PersonalSet {
         }
         let mut books: Vec<PersonalBook> =
             serde_json::from_slice(&std::fs::read(set.join("books.json"))?)?;
+        let by_set_name = books
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.set_name(), i))
+            .collect();
         // Otzaria may renumber personal books; links follow the file
         if let Some(db) = user_books_db.filter(|p| p.exists()) {
             if let Ok(ids) = user_book_ids(db) {
@@ -188,12 +212,27 @@ impl PersonalSet {
             slot_window,
             books,
             by_key,
+            by_set_name,
             cache: Mutex::new(Vec::new()),
         })
     }
 
     pub fn model(&self) -> Option<&str> {
         self.info["model"].as_str()
+    }
+
+    /// Whether the set's vectors are mapped (see [`Self::open`]).
+    pub fn has_vectors(&self) -> bool {
+        self.vectors.is_some()
+    }
+
+    /// The names in Otzaria's vector set of the books a scope admits (`mask` as
+    /// [`Self::book_mask`] gives it; `None`: every book).
+    pub fn set_names<'a>(&'a self, mask: Option<&'a [bool]>) -> impl Iterator<Item = &'a str> {
+        self.by_set_name
+            .iter()
+            .filter(move |(_, &i)| mask.is_none_or(|m| m.get(i).copied().unwrap_or(false)))
+            .map(|(name, _)| name.as_str())
     }
 
     fn i32_at(m: &Option<Mmap>, slot: usize) -> i32 {
@@ -259,7 +298,7 @@ impl PersonalSet {
         books: Option<&[bool]>,
     ) -> Vec<Vec<(f32, usize)>> {
         let m = queries.len();
-        if self.n == 0 || m == 0 || kc == 0 {
+        if self.n == 0 || m == 0 || kc == 0 || self.vectors.is_none() {
             return vec![Vec::new(); m];
         }
         let dim = self.dim;
@@ -344,7 +383,7 @@ impl PersonalSet {
     /// The exact score of one slot against `q` (cosine, the long-window penalty taken off),
     /// as [`Self::scan`] rescores what it keeps.
     pub fn score(&self, q: &[f32], slot: usize) -> f32 {
-        if slot >= self.n {
+        if slot >= self.n || self.vectors.is_none() {
             return -1.0;
         }
         let dot: f32 = self

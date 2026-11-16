@@ -68,6 +68,12 @@ SEMANTIC SEARCH (Otzaria's own model and vectors, plus the personal-books index)
     --personal-index <dir>
                           The personal-books index of build_personal_index.py
                           [default: %LOCALAPPDATA%\\otzaria-sources\\personal-index]
+    --scan-personal-index Scan the personal index's own vectors beside Otzaria's set, and
+                          ignore what the set holds of books outside the library (the
+                          behaviour before 0.6). By default the vectors of personal and
+                          database books are read from Otzaria's set alone, where
+                          oxv_export.py publishes them, and the personal index only lists
+                          those books          [env: OTZARIA_SCAN_PERSONAL_INDEX=1]
     --builder <path>      build_personal_index.py, for /personal/status
     --python <cmd>        Python for the builder's check [default: python (Windows), python3]
     --plugin-data <path>  The Obsidian plugin's data.json (context defaults of the tools)
@@ -94,6 +100,7 @@ struct SemanticArgs {
     model_dir: Option<PathBuf>,
     onnx_runtime: Option<PathBuf>,
     personal_index: Option<PathBuf>,
+    scan_personal_index: bool,
     builder: Option<PathBuf>,
     python: Option<String>,
     plugin_data: Option<PathBuf>,
@@ -248,6 +255,9 @@ fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> 
             .unwrap_or_else(|| app.join("databases").join("user_books.db")),
         builder: sem.builder.clone(),
         calibration_dirs,
+        scan_personal_index: sem.scan_personal_index
+            || std::env::var("OTZARIA_SCAN_PERSONAL_INDEX")
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")),
         python: sem.python.clone().unwrap_or_else(|| {
             if cfg!(windows) {
                 "python".into()
@@ -257,11 +267,16 @@ fn run_http(paths: otzaria_mcp::paths::Paths, sem: SemanticArgs, addr: &str) -> 
         }),
     };
     eprintln!(
-        "otzaria-mcp {} --http {addr}: db={} vectors={} personal={} onnxruntime={}",
+        "otzaria-mcp {} --http {addr}: db={} vectors={} personal={} ({}) onnxruntime={}",
         env!("CARGO_PKG_VERSION"),
         cfg.db.display(),
         cfg.vectors_dir.display(),
         cfg.personal_dir.display(),
+        if cfg.scan_personal_index {
+            "its own vectors are scanned"
+        } else {
+            "book list; vectors from Otzaria's set"
+        },
         cfg.onnx_runtime
             .as_ref()
             .map_or("(sidecar default)".into(), |p| p.display().to_string())
@@ -432,6 +447,7 @@ fn parse_args() -> Result<Option<(PathArgs, SemanticArgs)>> {
             "--model-dir" => sem.model_dir = Some(path()),
             "--onnx-runtime" => sem.onnx_runtime = Some(path()),
             "--personal-index" => sem.personal_index = Some(path()),
+            "--scan-personal-index" => sem.scan_personal_index = true,
             "--builder" => sem.builder = Some(path()),
             "--python" => sem.python = value.clone(),
             "--plugin-data" => sem.plugin_data = Some(path()),
