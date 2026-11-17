@@ -1,0 +1,52 @@
+name: personal-vectors exe
+
+# OtzariaPersonalVectors.exe: tools/personal-vectors built into one Windows program, tested on
+# Windows first (the script, then the built program).
+on:
+  push:
+    paths: ["tools/personal-vectors/**", ".github/workflows/personal-vectors-exe.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tools/personal-vectors
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install numpy onnxruntime-directml tokenizers zstandard pyinstaller pillow
+      - name: Test the script on Windows (synthetic Otzaria folder)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/synth_e2e.py "$env:RUNNER_TEMP\e2e"
+      - name: Build
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name OtzariaPersonalVectors
+          --collect-binaries onnxruntime --hidden-import otzaria_personal_vectors gui.py
+      - name: Smoke test the program (imports, GPU providers, worker processes)
+        run: |
+          $p = Start-Process -FilePath dist\OtzariaPersonalVectors.exe -ArgumentList "--smoke","$env:RUNNER_TEMP\smoke.json" -Wait -PassThru
+          Get-Content "$env:RUNNER_TEMP\smoke.json"
+          if ($p.ExitCode -ne 0) { exit 1 }
+      - name: Screenshot of the window
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python tests/synth_e2e.py "$env:RUNNER_TEMP\shot" > $null
+          python -c "import json,hashlib,pathlib; v=pathlib.Path(r'$env:RUNNER_TEMP\shot\otzaria\vectors'); raw=(v/'gen-000003'/'set.json').read_bytes(); (v/'CURRENT').write_text(json.dumps({'generation':3,'set':'gen-000003/set.json','set_sha256':hashlib.sha256(raw).hexdigest()},separators=(',',':')))"
+          Remove-Item -Recurse -Force "$env:RUNNER_TEMP\shot\cache"
+          python tests/screenshot.py dist\OtzariaPersonalVectors.exe "$env:RUNNER_TEMP\shot" "$env:RUNNER_TEMP\screenshot.png"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OtzariaPersonalVectors
+          path: tools/personal-vectors/dist/OtzariaPersonalVectors.exe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot
+          path: ${{ runner.temp }}/screenshot.png
