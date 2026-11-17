@@ -100,53 +100,6 @@ pub fn norm_path(p: &str) -> String {
     }
 }
 
-/// A personal or database book's raw lines, with its headings indexed on first use.
-pub struct BookText {
-    pub lines: Vec<String>,
-    heads: OnceLock<HeadingIndex>,
-    bytes: usize,
-}
-
-impl BookText {
-    fn new(lines: Vec<String>) -> BookText {
-        let bytes = lines.iter().map(|l| l.len() + 24).sum::<usize>() + 64;
-        BookText {
-            lines,
-            heads: OnceLock::new(),
-            bytes,
-        }
-    }
-
-    /// The headings in force at line `upto`, outermost first ([`heading_path`] of the lines,
-    /// without rescanning the book).
-    ///
-    /// [`heading_path`]: super::textutil::heading_path
-    pub fn heading_path(&self, upto: usize) -> Vec<String> {
-        self.heads
-            .get_or_init(|| HeadingIndex::build(&self.lines))
-            .path(upto)
-    }
-}
-
-impl std::ops::Deref for BookText {
-    type Target = Vec<String>;
-    fn deref(&self) -> &Vec<String> {
-        &self.lines
-    }
-}
-
-/// The book text cache's budget: the books most recently read, up to this many bytes of text
-/// (and at least the one just read). A search that touches many large database books (a
-/// quotation checked at each of its places) no longer reads the same book again and again.
-const CACHE_BYTES: usize = 384 << 20;
-const CACHE_BOOKS: usize = 256;
-
-struct Cached {
-    sig: (u64, Option<SystemTime>),
-    text: Arc<BookText>,
-    stale: bool,
-}
-
 pub struct PersonalSet {
     pub dir: PathBuf,
     pub mtime: Option<SystemTime>,
@@ -164,24 +117,111 @@ pub struct PersonalSet {
     /// `db:<slug>:<id>`), with the id it had when the index was built: the id
     /// `oxv_export.py` wrote into Otzaria's set from this index.
     pub by_set_name: HashMap<String, usize>,
-    cache: Mutex<Vec<(usize, Cached)>>,
     /// Open handles of attached databases, by file: see [`DbPool`].
     dbs: Mutex<HashMap<String, DbPool>>,
-    /// Headings and staleness of attached-database books, by book: see [`BookMeta`].
+    /// What reading a book a few lines at a time needs, by book: see [`BookMeta`].
     metas: Mutex<HashMap<usize, (FileSig, Arc<BookMeta>)>>,
 }
 
 /// A file's size and mtime: a book or database read is valid while they stay.
 type FileSig = (u64, Option<SystemTime>);
 
-/// What showing a line of an attached-database book needs beyond its own lines: the
-/// headings in force at each line, and whether the book changed since it was indexed. Built
-/// from one read of the whole book and kept (it is small); the lines themselves are read a
-/// few at a time ([`PersonalSet::rows`]). Database books can be tens of megabytes of text each,
-/// and a search touches dozens: kept whole they did not fit any cache.
+/// What showing a few lines of a personal or database book needs, kept per book while its
+/// file keeps its size and mtime — never the book's text. Books can be tens of megabytes
+/// each and a search touches dozens: kept whole they fit no cache, and every request read
+/// them again.
+///
+/// - Lines: an attached book's are read by range from its database; a personal file's from
+///   the file, at the offsets of [`FileLines`] (a UTF-16 file, rare, is kept decoded).
+/// - The headings in force at each line, and whether the book changed since it was indexed:
+///   each built from one read of the whole book, the first time it is asked for.
 pub struct BookMeta {
-    heads: HeadingIndex,
-    pub stale: bool,
+    file: Option<FileLines>,
+    heads: OnceLock<HeadingIndex>,
+    stale: OnceLock<bool>,
+}
+
+/// Where each line of a personal file starts, and how the file is encoded.
+enum FileLines {
+    /// UTF-8 or windows-1255, decoded as [`decode_book`] decodes the whole file: one byte
+    /// per `\n` either way, so a line's bytes decode alone to what the whole file gives it.
+    Offsets {
+        path: String,
+        utf8: bool,
+        /// The byte where each line starts (after a BOM), and the file's length.
+        starts: Vec<u64>,
+        end: u64,
+    },
+    Decoded(Vec<String>),
+}
+
+impl FileLines {
+    fn of(path: &str) -> Result<FileLines> {
+        let data = std::fs::read(path)?;
+        let bom = if data.starts_with(b"\xef\xbb\xbf") {
+            3
+        } else {
+            0
+        };
+        let body = &data[bom..];
+        let utf8 = std::str::from_utf8(body).is_ok();
+        if !utf8 && (body.starts_with(b"\xff\xfe") || body.starts_with(b"\xfe\xff")) {
+            return Ok(FileLines::Decoded(
+                decode_book(&data).split('\n').map(String::from).collect(),
+            ));
+        }
+        let mut starts = vec![bom as u64];
+        starts.extend(
+            body.iter()
+                .enumerate()
+                .filter(|(_, &c)| c == b'\n')
+                .map(|(i, _)| (bom + i + 1) as u64),
+        );
+        Ok(FileLines::Offsets {
+            path: path.to_string(),
+            utf8,
+            starts,
+            end: data.len() as u64,
+        })
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            FileLines::Offsets { starts, .. } => starts.len(),
+            FileLines::Decoded(lines) => lines.len(),
+        }
+    }
+
+    /// Lines `lo..=hi` that exist.
+    fn rows(&self, lo: usize, hi: usize) -> Result<Vec<(usize, String)>> {
+        let hi = hi.min(self.len().saturating_sub(1));
+        if self.len() == 0 || lo > hi {
+            return Ok(Vec::new());
+        }
+        match self {
+            FileLines::Decoded(lines) => Ok((lo..=hi).map(|li| (li, lines[li].clone())).collect()),
+            FileLines::Offsets {
+                path,
+                utf8,
+                starts,
+                end,
+            } => {
+                use std::io::{Read, Seek, SeekFrom};
+                let from = starts[lo];
+                let to = starts.get(hi + 1).map_or(*end, |next| next - 1);
+                let mut bytes = vec![0u8; (to - from) as usize];
+                let mut f = std::fs::File::open(path)?;
+                f.seek(SeekFrom::Start(from))?;
+                f.read_exact(&mut bytes)?;
+                let text = if *utf8 {
+                    String::from_utf8(bytes).map_err(|e| anyhow!("{path}: {e}"))?
+                } else {
+                    encoding_rs::WINDOWS_1255.decode(&bytes).0.into_owned()
+                };
+                Ok((lo..).zip(text.split('\n').map(String::from)).collect())
+            }
+        }
+    }
 }
 
 /// An open attached database: its connection and its line decompressor (every zstd
@@ -291,7 +331,6 @@ impl PersonalSet {
             books,
             by_key,
             by_set_name,
-            cache: Mutex::new(Vec::new()),
             dbs: Mutex::new(HashMap::new()),
             metas: Mutex::new(HashMap::new()),
         })
@@ -480,83 +519,29 @@ impl PersonalSet {
         dot * self.scale(slot) - pen
     }
 
-    /// The raw lines of a book, and whether its text changed since indexing. Kept in a cache
-    /// of the books most recently used (see [`CACHE_BYTES`]).
-    pub fn lines_of(&self, bi: usize) -> (Option<Arc<BookText>>, bool) {
-        let Some(b) = self.books.get(bi) else {
-            return (None, true);
-        };
-        let sig = match signature(b) {
-            Some(s) => s,
-            None => return (None, true),
-        };
-        {
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(pos) = cache.iter().position(|(i, c)| *i == bi && c.sig == sig) {
-                // most recently used last
-                let e = cache.remove(pos);
-                let out = (Some(e.1.text.clone()), e.1.stale);
-                cache.push(e);
-                return out;
-            }
-        }
-        let lines = match self.read_book(b) {
-            Ok(l) => l,
-            Err(_) => return (None, true),
-        };
-        let stale = match &b.hash {
-            Some(h) => text_hash(&lines).0 != *h,
-            None => Some(sig.0) != b.size,
-        };
-        let text = Arc::new(BookText::new(lines));
-        let mut cache = self.cache.lock().unwrap();
-        cache.retain(|(i, _)| *i != bi);
-        cache.push((
-            bi,
-            Cached {
-                sig,
-                text: text.clone(),
-                stale,
-            },
-        ));
-        let mut total: usize = cache.iter().map(|(_, c)| c.text.bytes).sum();
-        while cache.len() > 1 && (total > CACHE_BYTES || cache.len() > CACHE_BOOKS) {
-            total -= cache.remove(0).1.text.bytes;
-        }
-        (Some(text), stale)
-    }
-
     /// Ready what showing lines of the books `bis` names will need, in parallel, so a request
-    /// that shows lines of many books reads them all at once instead of one after another:
-    /// a personal file's text, and with `headings`, an attached book's [`BookMeta`] (its lines
-    /// are read a few at a time anyway).
+    /// that shows lines of many books readies them all at once instead of one after another:
+    /// each book's [`BookMeta`], and with `headings` its headings and staleness.
     pub fn prefetch(&self, bis: impl IntoIterator<Item = usize>, headings: bool) {
         let mut want: Vec<usize> = bis
             .into_iter()
-            .filter(|&bi| {
-                self.books
-                    .get(bi)
-                    .is_some_and(|b| headings || !b.attached())
-            })
+            .filter(|&bi| bi < self.books.len())
             .collect();
         want.sort_unstable();
         want.dedup();
         {
-            let cache = self.cache.lock().unwrap();
             let metas = self.metas.lock().unwrap();
-            want.retain(|bi| {
-                if self.books[*bi].attached() {
-                    !metas.contains_key(bi)
-                } else {
-                    !cache.iter().any(|(i, _)| i == bi)
-                }
+            want.retain(|bi| match metas.get(bi) {
+                None => true,
+                Some((_, m)) => headings && (m.heads.get().is_none() || m.stale.get().is_none()),
             });
         }
         let ready = |bi: usize| {
-            if self.books[bi].attached() {
-                self.meta(bi);
-            } else {
-                self.lines_of(bi);
+            if let Some(m) = self.meta(bi) {
+                if headings {
+                    self.heads_of(bi, &m);
+                    self.stale_of(bi, &m);
+                }
             }
         };
         match want.len() {
@@ -567,44 +552,55 @@ impl PersonalSet {
     }
 
     /// Lines `lo..=hi` of a book that exist, with their indexes: an attached book's from its
-    /// database (only those lines), a personal file's from its cached text.
+    /// database, a personal file's from the file — only those lines either way.
     pub fn rows(&self, bi: usize, lo: usize, hi: usize) -> Option<Vec<(usize, String)>> {
         let b = self.books.get(bi)?;
-        if !b.attached() {
-            let (text, _) = self.lines_of(bi);
-            let text = text?;
-            let hi = hi.min(text.len().saturating_sub(1));
-            if text.is_empty() || lo > hi {
-                return Some(Vec::new());
-            }
-            return Some((lo..=hi).map(|li| (li, text[li].clone())).collect());
+        if b.attached() {
+            return self
+                .with_db(b, |h| read_attached_range(h, b.book_id, lo, hi))
+                .ok();
         }
-        self.with_db(b, |h| read_attached_range(h, b.book_id, lo, hi))
-            .ok()
+        self.meta(bi)?.file.as_ref()?.rows(lo, hi).ok()
     }
 
     /// The headings in force at line `li` of a book, outermost first.
     pub fn heading_path(&self, bi: usize, li: usize) -> Vec<String> {
-        match self.books.get(bi) {
-            Some(b) if b.attached() => self.meta(bi).map_or_else(Vec::new, |m| m.heads.path(li)),
-            Some(_) => self
-                .lines_of(bi)
-                .0
-                .map_or_else(Vec::new, |t| t.heading_path(li)),
-            None => Vec::new(),
-        }
+        self.meta(bi)
+            .map_or_else(Vec::new, |m| self.heads_of(bi, &m).path(li))
     }
 
     /// Whether a book's text changed since it was indexed (true when it cannot be read).
     pub fn stale(&self, bi: usize) -> bool {
-        match self.books.get(bi) {
-            Some(b) if b.attached() => self.meta(bi).is_none_or(|m| m.stale),
-            Some(_) => self.lines_of(bi).1,
-            None => true,
+        self.meta(bi).is_none_or(|m| self.stale_of(bi, &m))
+    }
+
+    fn heads_of<'m>(&self, bi: usize, m: &'m BookMeta) -> &'m HeadingIndex {
+        m.heads.get_or_init(|| match self.whole(bi, m) {
+            Some(lines) => HeadingIndex::build(&lines),
+            None => HeadingIndex::default(),
+        })
+    }
+
+    fn stale_of(&self, bi: usize, m: &BookMeta) -> bool {
+        *m.stale.get_or_init(|| {
+            let b = &self.books[bi];
+            match (self.whole(bi, m), &b.hash) {
+                (None, _) => true,
+                (Some(lines), Some(h)) => text_hash(&lines).0 != *h,
+                (Some(_), None) => signature(b).map(|s| s.0) != b.size,
+            }
+        })
+    }
+
+    /// A book's every line, read for its headings or its hash.
+    fn whole(&self, bi: usize, m: &BookMeta) -> Option<Vec<String>> {
+        match &m.file {
+            Some(FileLines::Decoded(lines)) => Some(lines.clone()),
+            _ => self.read_book(&self.books[bi]).ok(),
         }
     }
 
-    /// An attached book's [`BookMeta`], built from one read of the whole book.
+    /// A book's [`BookMeta`], while its file keeps its size and mtime.
     fn meta(&self, bi: usize) -> Option<Arc<BookMeta>> {
         let b = self.books.get(bi)?;
         let sig = signature(b)?;
@@ -613,14 +609,15 @@ impl PersonalSet {
                 return Some(m.clone());
             }
         }
-        let lines = self.read_book(b).ok()?;
-        let stale = match &b.hash {
-            Some(h) => text_hash(&lines).0 != *h,
-            None => Some(sig.0) != b.size,
+        let file = if b.attached() {
+            None
+        } else {
+            Some(FileLines::of(b.path.as_deref()?).ok()?)
         };
         let m = Arc::new(BookMeta {
-            heads: HeadingIndex::build(&lines),
-            stale,
+            file,
+            heads: OnceLock::new(),
+            stale: OnceLock::new(),
         });
         self.metas.lock().unwrap().insert(bi, (sig, m.clone()));
         Some(m)
@@ -924,11 +921,20 @@ mod tests {
         // without headings an attached book needs nothing ahead: its lines are read a few
         // at a time
         ps.prefetch([0, 1], false);
-        assert!(ps.metas.lock().unwrap().is_empty());
+        assert!(ps
+            .metas
+            .lock()
+            .unwrap()
+            .values()
+            .all(|(_, m)| m.heads.get().is_none()));
         ps.prefetch([0, 1, 1, 0, 5], true);
         assert_eq!(ps.metas.lock().unwrap().len(), 2);
-        // whole attached books are not kept: only their headings and staleness
-        assert!(ps.cache.lock().unwrap().is_empty());
+        assert!(ps
+            .metas
+            .lock()
+            .unwrap()
+            .values()
+            .all(|(_, m)| m.heads.get().is_some() && m.file.is_none()));
         // one handle back in the pool per parallel read at most, never more than DB_IDLE
         let idle = ps.dbs.lock().unwrap()[&*db.to_string_lossy()].idle.len();
         assert!((1..=2).contains(&idle), "{idle} idle handles");
@@ -954,5 +960,83 @@ mod tests {
             // no hash in books.json: stale when the database's size differs from `size` (none)
             assert!(ps.stale(bi));
         }
+    }
+
+    /// A personal file is read a few lines at a time from its offsets, and its lines,
+    /// headings and staleness are what a read of the whole file gives: UTF-8 with a BOM and
+    /// CRLF, windows-1255, UTF-16, a trailing newline or none.
+    #[test]
+    fn personal_files_are_read_by_line_offsets_as_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let text: Vec<String> = (0..30)
+            .map(|i| {
+                if i % 7 == 0 {
+                    format!("<h{}>סימן {i}</h{}>", 1 + i % 3, 1 + i % 3)
+                } else {
+                    format!("שורה {i} של הספר")
+                }
+            })
+            .collect();
+        let joined = text.join("\n");
+        let mut utf8_bom_crlf = b"\xef\xbb\xbf".to_vec();
+        utf8_bom_crlf.extend(text.join("\r\n").into_bytes());
+        let win1255 = encoding_rs::WINDOWS_1255.encode(&joined).0.into_owned();
+        let mut utf16 = vec![0xff, 0xfe];
+        for u in joined.encode_utf16() {
+            utf16.extend(u.to_le_bytes());
+        }
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("bom-crlf.txt", utf8_bom_crlf),
+            ("plain.txt", joined.clone().into_bytes()),
+            ("trailing.txt", format!("{joined}\n").into_bytes()),
+            ("hebrew.txt", win1255),
+            ("utf16.txt", utf16),
+        ];
+        let mut books = Vec::new();
+        for (i, (name, bytes)) in files.iter().enumerate() {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            books.push(
+                serde_json::json!({"kind": "user", "book_id": i, "title": name,
+                                          "path": path.to_string_lossy(), "size": bytes.len()}),
+            );
+        }
+        std::fs::create_dir(dir.path().join("set1")).unwrap();
+        std::fs::write(
+            dir.path().join("set1/books.json"),
+            serde_json::to_vec(&books).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            br#"{"set": "set1", "slots": 0}"#,
+        )
+        .unwrap();
+        let ps = PersonalSet::open(dir.path(), None, false).unwrap();
+        ps.prefetch(0..files.len(), false);
+        for (bi, (name, _)) in files.iter().enumerate() {
+            let whole = read_book(&ps.books[bi]).unwrap();
+            let n = whole.len();
+            for (lo, hi) in [(0, 0), (0, 4), (6, 9), (n - 3, n + 4), (n, n + 2), (5, 4)] {
+                let want: Vec<(usize, String)> = (lo..=hi.min(n - 1))
+                    .map(|li| (li, whole[li].clone()))
+                    .collect();
+                assert_eq!(ps.rows(bi, lo, hi).unwrap(), want, "{name} {lo}..={hi}");
+            }
+            for li in 0..n + 1 {
+                assert_eq!(
+                    ps.heading_path(bi, li),
+                    heading_path(&whole, li),
+                    "{name} {li}"
+                );
+            }
+            // books.json's size is the file's: not stale
+            assert!(!ps.stale(bi), "{name}");
+        }
+        // a file that changes is read anew
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, format!("חדש\n{joined}")).unwrap();
+        assert_eq!(ps.rows(1, 0, 0).unwrap(), vec![(0, "חדש".to_string())]);
+        assert!(ps.stale(1));
     }
 }
