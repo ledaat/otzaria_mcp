@@ -1420,6 +1420,66 @@ def live_vectors(live, keys):
     return out
 
 
+# ------------------------------------------------------------------ the personal segment in the set
+
+class OwnVectors:
+    """The live vectors of the personal segment already in Otzaria's set: published by an earlier
+    run of this script, or by otzaria-sources (build_personal_index.py --publish-oxv), whose
+    vectors this script's cache never saw. A passage whose key it holds is copied from it, not
+    embedded again."""
+
+    def __init__(self, live):
+        self.parts = []
+        for seg, h in zip(live.doc["segments"], live.headers):
+            if not live.is_ours(seg):
+                continue
+            p = live.dir / seg["file"]
+            s = next(x for x in h["sections"] if x["kind"] == SLOT_KEYS)
+            k = np.fromfile(p, ">u8", h["slots"], offset=s["off"]).astype(np.uint64)
+            ok = k != 0
+            if seg.get("del"):
+                ok &= ~live.dead(seg, h["slots"])
+            slots = np.flatnonzero(ok)
+            o = np.argsort(k[slots], kind="stable")
+            self.parts.append((p, h, k[slots][o], slots[o]))
+        self.keys = (np.unique(np.concatenate([x[2] for x in self.parts])) if self.parts
+                     else np.zeros(0, np.uint64))
+
+    def __len__(self):
+        return len(self.keys)
+
+    def fill(self, keys, rot, vec, scales, params):
+        """Fill the rows of `keys` the segment holds, coded with the set's parameters (`params`).
+        -> the rows filled."""
+        keys = np.asarray(keys, np.uint64)
+        have = np.zeros(len(keys), bool)
+        for p, h, sk, sl in self.parts:
+            need = np.flatnonzero(~have)
+            if not len(need):
+                break
+            ix = lookup_sorted(sk, keys[need])
+            m = ix >= 0
+            if not m.any():
+                continue
+            rows, slots = need[m], sl[ix[m]]
+            o = np.argsort(slots, kind="stable")  # read the file in order
+            rows, slots = rows[o], slots[o]
+            vs = next(x for x in h["sections"] if x["kind"] == VECTORS)
+            vmap = np.memmap(p, np.uint8, "r", vs["off"], (h["slots"], vs["elem"]))
+            smap = np.memmap(p, "<f4", "r", next(x for x in h["sections"] if x["kind"] == SCALES)["off"], (h["slots"],))
+            seg_params = section(p, h, CODEC_PARAMS)
+            step = 1 << 18
+            for i in range(0, len(slots), step):
+                c, sc = np.asarray(vmap[slots[i:i + step]]), np.asarray(smap[slots[i:i + step]])
+                if seg_params != params:  # coded with other parameters: decoded and coded again
+                    c, sc = rot.encode(Rot(seg_params).decode(c, sc))
+                vec[rows[i:i + step]] = c
+                scales[rows[i:i + step]] = sc
+            have[rows] = True
+            del vmap, smap
+        return have
+
+
 # ------------------------------------------------------------------ the vector cache
 
 class Cache:
@@ -1479,13 +1539,14 @@ class Cache:
         self.part_keys.append(k)
         self.pending = []
 
-    def fill(self, keys, rot, vec, scales):
-        """Write the vectors of `keys` (all in the cache) into vec / scales, row for row, coded
-        with the set's parameters. Each part of the cache is read once."""
+    def fill(self, keys, rot, vec, scales, have=None):
+        """Write the vectors of `keys` into vec / scales, row for row, coded with the set's
+        parameters: every row `have` does not mark already filled must be in the cache. Each part
+        of the cache is read once."""
         keys = np.asarray(keys, np.uint64)
         order = np.argsort(keys, kind="stable")
         sk = keys[order]
-        have = np.zeros(len(keys), bool)
+        have = np.zeros(len(keys), bool) if have is None else have
         for p, pk in zip(self.parts, self.part_keys):
             ix = lookup_sorted(sk, pk)
             hit = np.flatnonzero(ix >= 0)
@@ -1688,11 +1749,12 @@ def run(args):
 
     log("reading Otzaria's set ...")
     live_keys = live.live_keys(skip_ours=True)
+    own = OwnVectors(live)
     cache = Cache(args.cache_dir, family, params)
     work = Path(args.cache_dir) / "work"
     work.mkdir(parents=True, exist_ok=True)
     known_path = work / f"known-{os.getpid()}.npy"
-    np.save(known_path, np.union1d(live_keys, cache.keys))
+    np.save(known_path, np.union1d(np.union1d(live_keys, cache.keys), own.keys))
 
     order, names = [], {}
     cols = {k: [] for k in "KBHWA"}
@@ -1814,14 +1876,18 @@ def run(args):
     for k, dt in (("B", np.int64), ("H", np.int64), ("W", np.uint8), ("A", np.uint64)):
         rows[k] = np.concatenate(cols[k]).astype(dt) if cols[k] else np.zeros(0, dt)
     missing = len(queued)
-    to_publish = len(np.unique(rows["K"]))
+    uk = np.unique(rows["K"])
+    to_publish = len(uk)
+    from_own = int((lookup_sorted(own.keys, uk) >= 0).sum()) if len(own) else 0
     report = {"books": len(books), "passages": st["passages"], "in_set": st["in_set"], "to_publish": to_publish,
               "to_embed": missing if args.check else 0, "embedded": embedded, "errors": st["errors"],
+              "from_personal_segment": from_own,
               "published": False}
     emit("summary", **report)
     log(f"{len(books):,} books, {st['passages']:,} passages: {st['in_set']:,} already in Otzaria's set, "
         f"{to_publish:,} distinct passages to publish"
-        + (f" ({missing:,} of them still to embed)" if args.check else "")
+        + (f" ({', '.join(x for x in (f'{from_own:,} copied from the personal segment already in the set' if from_own else '', f'{missing:,} still to embed' if args.check else '') if x)})"
+           if from_own or args.check else "")
         + (f"; {st['errors']} books could not be read" if st["errors"] else ""))
     if args.check:
         if missing:
@@ -1841,7 +1907,9 @@ def run(args):
     guard(vdir, args.force)
 
     def fill(vec, scales):
-        cache.fill(plan["keys"].astype(np.uint64), rot, vec, scales)
+        keys = plan["keys"].astype(np.uint64)
+        have = own.fill(keys, rot, vec, scales, params)
+        cache.fill(keys, rot, vec, scales, have=have)
 
     lock = SetLock(vdir)
     try:

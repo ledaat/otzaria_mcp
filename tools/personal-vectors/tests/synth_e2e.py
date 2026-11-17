@@ -161,6 +161,53 @@ def main():
     assert hashlib.sha256((vdir / seg["file"]).read_bytes()).hexdigest() == seg["sha256"]
     assert V.self_test(vdir / seg["file"])
 
+    # ---- the cache gone (or the segment published by otzaria-sources, whose vectors this script's
+    # cache never saw): the personal segment in the set is the source, nothing is embedded again
+    print("== no cache: vectors from the personal segment in the set")
+    shutil.rmtree(root / "cache")
+    seen = []
+    real_emit = V.emit
+    V.emit = lambda kind, **kw: (seen.append((kind, kw)), real_emit(kind, **kw))
+    FakeEmbedder.calls = 0
+    assert run("--check") == 0
+    rep = next(kw for kind, kw in seen if kind == "summary")
+    assert rep["to_embed"] == 0 and rep["from_personal_segment"] == 976, rep
+    old_bytes = (vdir / seg["file"]).read_bytes()
+    seg_id = seg["id"]
+    # a second segment id must not hide a wrong copy: force a republish under a new name
+    assert run("--group", "100") == 0 and FakeEmbedder.calls == 0, FakeEmbedder.calls
+    V.emit = real_emit
+    cur = json.loads((vdir / "CURRENT").read_text())
+    st = json.loads((vdir / cur["set"]).read_text())
+    seg = st["segments"][-1]
+    assert seg["id"] == seg_id and (vdir / seg["file"]).read_bytes() == old_bytes
+    # a new book (still no cache): only its passages are embedded, every other vector is copied
+    # from the old segment byte for byte
+    def seg_vectors(path):
+        h = V.read_header(path)
+        k = np.fromfile(path, ">u8", h["slots"], offset=next(x for x in h["sections"] if x["kind"] == V.SLOT_KEYS)["off"])
+        vs = next(x for x in h["sections"] if x["kind"] == V.VECTORS)
+        v = np.fromfile(path, np.uint8, h["slots"] * vs["elem"], offset=vs["off"]).reshape(h["slots"], vs["elem"])
+        sc = np.fromfile(path, "<f4", h["slots"], offset=next(x for x in h["sections"] if x["kind"] == V.SCALES)["off"])
+        return {int(a): (b.tobytes(), float(c)) for a, b, c in zip(k.astype(np.uint64), v, sc)}
+    before = seg_vectors(vdir / seg["file"])
+    nb_lines = book(40)
+    p = folder / "ספר 2600.txt"; p.write_text("\n".join(nb_lines), encoding="utf-8")
+    con = sqlite3.connect(otz / "databases" / "user_books.db")
+    con.execute("insert into book values (2600, 'ספר 2600', ?, 'txt', 1)", (str(p),)); con.commit(); con.close()
+    shutil.rmtree(root / "cache")
+    FakeEmbedder.calls = 0
+    assert run("--group", "100") == 0
+    new_keys = set(V.passage_keys([t for _i, t, _w in V.windowed_passages(nb_lines)]).tolist()) - set(before)
+    cur = json.loads((vdir / "CURRENT").read_text())
+    seg = json.loads((vdir / cur["set"]).read_text())["segments"][-1]
+    after = seg_vectors(vdir / seg["file"])
+    assert FakeEmbedder.calls == len(new_keys & set(after)), (FakeEmbedder.calls, len(new_keys))
+    assert all(after[k] == v for k, v in before.items()), "a copied vector differs"
+    print("copied", len(before), "vectors from the old segment, embedded", FakeEmbedder.calls)
+    con = sqlite3.connect(otz / "databases" / "user_books.db")
+    con.execute("delete from book where id = 2600"); con.commit(); con.close()   # the layouts below count 7
+
     # ---- Otzaria's reader: open, scrub, and scan for passages of each kind
     def q(texts): return fake_vec(texts).astype("<f4")
     def ptext(ls, li, w=0):
@@ -172,7 +219,7 @@ def main():
         out = subprocess.run([CHECK, str(vdir), str(root / "q.f32")], capture_output=True, text=True)
         print(out.stdout[-2500:], out.stderr[-1500:])
     print("== remove"); assert run("--remove") == 0
-    cur = json.loads((vdir / "CURRENT").read_text()); assert cur["generation"] == 3
+    cur = json.loads((vdir / "CURRENT").read_text()); assert cur["generation"] == 4
     assert len(json.loads((vdir / cur["set"]).read_text())["segments"]) == 1
     print("ALL OK")
     if CHECK:

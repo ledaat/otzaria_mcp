@@ -267,12 +267,19 @@ def main():
             set_status("לא נמצאו ספרים אישיים (txt) או מסדי ספרים מצורפים באוצריא.")
             return
         state["total"] = rep["to_embed"]
+        # passages the personal segment already in the set holds are searchable already
+        missing = rep["to_publish"] - rep.get("from_personal_segment", 0)
         if not rep["to_publish"]:
             set_status(f"נבדקו {rep['books']:,} ספרים: כל הקטעים שלהם כבר נמצאים בחיפוש לפי משמעות של אוצריא. "
                        f"אין צורך לעשות דבר.")
+        elif not missing and not rep["to_embed"]:
+            set_status(f"נבדקו {rep['books']:,} ספרים ({rep['passages']:,} קטעים): כל הקטעים שלהם כבר נמצאים "
+                       f"בחיפוש לפי משמעות של אוצריא, {rep['to_publish']:,} מהם במקטע האישי שכבר פורסם. "
+                       f"אין צורך לעשות דבר ('התחל' יפרסם אותם מחדש בלי לחשב דבר).")
+            start_b.configure(state="normal")
         else:
             msg = (f"נבדקו {rep['books']:,} ספרים ({rep['passages']:,} קטעים). "
-                   f"{rep['to_publish']:,} קטעים עדיין אינם בחיפוש לפי משמעות של אוצריא.")
+                   f"{missing:,} קטעים עדיין אינם בחיפוש לפי משמעות של אוצריא.")
             if rep["to_embed"]:
                 msg += (f"\nצריך לחשב {rep['to_embed']:,} מהם: במעבד רגיל {hours(rep['to_embed'], 50)}, "
                         f"בכרטיס גרפי מהר יותר. אפשר לעצור ולהמשיך אחר כך.")
