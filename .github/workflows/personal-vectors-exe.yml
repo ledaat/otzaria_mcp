@@ -41,6 +41,7 @@ jobs:
           python -c "import json,hashlib,pathlib; v=pathlib.Path(r'$env:RUNNER_TEMP\shot\otzaria\vectors'); raw=(v/'gen-000003'/'set.json').read_bytes(); (v/'CURRENT').write_text(json.dumps({'generation':3,'set':'gen-000003/set.json','set_sha256':hashlib.sha256(raw).hexdigest()},separators=(',',':')))"
           Remove-Item -Recurse -Force "$env:RUNNER_TEMP\shot\cache"
           python tests/screenshot.py dist\OtzariaPersonalVectors.exe "$env:RUNNER_TEMP\shot" "$env:RUNNER_TEMP\screenshot.png"
+          python -c "import base64,sys; from PIL import Image; im=Image.open(sys.argv[1]); w=im.getbbox(); im.convert('RGB').save(sys.argv[2], quality=70); print('SCREENSHOT-B64', base64.b64encode(open(sys.argv[2],'rb').read()).decode())" "$env:RUNNER_TEMP\screenshot.png" "$env:RUNNER_TEMP\screenshot.jpg"
       - uses: actions/upload-artifact@v4
         with:
           name: OtzariaPersonalVectors
