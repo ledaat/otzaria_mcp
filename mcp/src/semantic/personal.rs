@@ -165,7 +165,29 @@ pub struct PersonalSet {
     /// `oxv_export.py` wrote into Otzaria's set from this index.
     pub by_set_name: HashMap<String, usize>,
     cache: Mutex<Vec<(usize, Cached)>>,
+    /// Open handles of attached databases, by file: see [`DbPool`].
+    dbs: Mutex<HashMap<String, DbPool>>,
 }
+
+/// An open attached database: its connection and its line decompressor (every zstd
+/// dictionary loaded), kept between books. Opening one and loading its dictionaries for each
+/// book read was most of what a first read of a short database book cost.
+struct DbHandle {
+    conn: rusqlite::Connection,
+    codec: LineCodec,
+    compressed: bool,
+}
+
+/// The idle handles of one database file, valid while the file keeps its size and mtime.
+/// A handle is taken out for one read and put back, so books of one database can be read in
+/// parallel ([`PersonalSet::prefetch`]).
+struct DbPool {
+    sig: (u64, Option<SystemTime>),
+    idle: Vec<DbHandle>,
+}
+
+/// The most idle handles kept per database.
+const DB_IDLE: usize = 16;
 
 fn map(path: &Path) -> Result<Mmap> {
     let f = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
@@ -255,6 +277,7 @@ impl PersonalSet {
             by_key,
             by_set_name,
             cache: Mutex::new(Vec::new()),
+            dbs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -461,7 +484,7 @@ impl PersonalSet {
                 return out;
             }
         }
-        let lines = match read_book(b) {
+        let lines = match self.read_book(b) {
             Ok(l) => l,
             Err(_) => return (None, true),
         };
@@ -485,6 +508,70 @@ impl PersonalSet {
             total -= cache.remove(0).1.text.bytes;
         }
         (Some(text), stale)
+    }
+
+    /// Read the books `bis` names that are not cached yet, in parallel, so a request that will
+    /// show lines of many books reads them all at once instead of one after another.
+    pub fn prefetch(&self, bis: impl IntoIterator<Item = usize>) {
+        let mut want: Vec<usize> = bis
+            .into_iter()
+            .filter(|&bi| bi < self.books.len())
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        {
+            let cache = self.cache.lock().unwrap();
+            want.retain(|bi| !cache.iter().any(|(i, _)| i == bi));
+        }
+        match want.len() {
+            0 => {}
+            1 => {
+                self.lines_of(want[0]);
+            }
+            _ => want.par_iter().for_each(|&bi| {
+                self.lines_of(bi);
+            }),
+        }
+    }
+
+    /// A book's raw lines: a personal file, or an attached database's book through a pooled
+    /// handle of that database.
+    fn read_book(&self, b: &PersonalBook) -> Result<Vec<String>> {
+        if !b.attached() {
+            return read_book(b);
+        }
+        let db = b.db.as_deref().ok_or_else(|| anyhow!("no database path"))?;
+        let sig = {
+            let md = std::fs::metadata(db)?;
+            (md.len(), md.modified().ok())
+        };
+        let taken = {
+            let mut dbs = self.dbs.lock().unwrap();
+            let pool = dbs.entry(db.to_string()).or_insert_with(|| DbPool {
+                sig,
+                idle: Vec::new(),
+            });
+            if pool.sig != sig {
+                // the database changed: its handles may hold a stale schema or dictionaries
+                pool.sig = sig;
+                pool.idle.clear();
+            }
+            pool.idle.pop()
+        };
+        let mut h = match taken {
+            Some(h) => h,
+            None => open_attached(Path::new(db))?,
+        };
+        let out = read_attached(&mut h, b.book_id);
+        if out.is_ok() {
+            let mut dbs = self.dbs.lock().unwrap();
+            if let Some(pool) = dbs.get_mut(db) {
+                if pool.sig == sig && pool.idle.len() < DB_IDLE {
+                    pool.idle.push(h);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -562,6 +649,10 @@ pub fn read_book(b: &PersonalBook) -> Result<Vec<String>> {
 
 /// Every line of a book of an Otzaria-format database, by line index (gaps empty).
 pub fn attached_book_lines(db: &Path, book: i64) -> Result<Vec<String>> {
+    read_attached(&mut open_attached(db)?, book)
+}
+
+fn open_attached(db: &Path) -> Result<DbHandle> {
     let conn = match connect_ro(db, false) {
         Ok(c)
             if c.query_row("SELECT count(*) FROM book", [], |_| Ok(()))
@@ -578,19 +669,27 @@ pub fn attached_book_lines(db: &Path, book: i64) -> Result<Vec<String>> {
             .collect::<rusqlite::Result<_>>()?;
         !cols.contains("content")
     };
-    let mut codec = LineCodec::load(&conn)?;
-    let sql = if compressed {
+    let codec = LineCodec::load(&conn)?;
+    Ok(DbHandle {
+        conn,
+        codec,
+        compressed,
+    })
+}
+
+fn read_attached(h: &mut DbHandle, book: i64) -> Result<Vec<String>> {
+    let sql = if h.compressed {
         "SELECT l.lineIndex, c.content FROM line l JOIN line_content c ON c.id = l.id WHERE l.bookId = ?1 ORDER BY l.lineIndex"
     } else {
         "SELECT l.lineIndex, l.content FROM line l WHERE l.bookId = ?1 ORDER BY l.lineIndex"
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = h.conn.prepare_cached(sql)?;
     let mut rows = stmt.query([book])?;
     let mut out: Vec<String> = Vec::new();
     while let Some(r) = rows.next()? {
         let li: i64 = r.get(0)?;
         let v: Value = r.get(1)?;
-        let text = codec.text_lossy(&v);
+        let text = h.codec.text_lossy(&v);
         let li = li.max(0) as usize;
         if li == out.len() {
             out.push(text);
@@ -634,4 +733,73 @@ fn user_book_ids(db: &Path) -> Result<HashMap<String, i64>> {
         out.insert(norm_path(&fp), id);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Books of an attached database are read through pooled handles, in parallel by
+    /// `prefetch`, and give the same lines and headings as a read of their own.
+    #[test]
+    fn attached_books_are_read_through_the_pool_and_prefetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("lib.db");
+        {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE book(id INTEGER PRIMARY KEY, title TEXT);
+                 CREATE TABLE line(id INTEGER PRIMARY KEY, bookId INTEGER, lineIndex INTEGER, content TEXT);",
+            )
+            .unwrap();
+            for (bid, n) in [(7i64, 40usize), (9, 25)] {
+                c.execute("INSERT INTO book VALUES (?1, 'b')", [bid])
+                    .unwrap();
+                for li in 0..n {
+                    let content = if li % 10 == 0 {
+                        format!("<h2>פרק {}</h2>", li / 10)
+                    } else {
+                        format!("שורה {bid}-{li}")
+                    };
+                    c.execute(
+                        "INSERT INTO line(bookId, lineIndex, content) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![bid, li as i64, content],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        std::fs::create_dir(dir.path().join("set1")).unwrap();
+        let books: Vec<serde_json::Value> = [7, 9]
+            .iter()
+            .map(|id| {
+                serde_json::json!({"kind": "attached", "book_id": id, "title": format!("b{id}"),
+                                   "slug": "lib", "db": db.to_string_lossy()})
+            })
+            .collect();
+        std::fs::write(
+            dir.path().join("set1/books.json"),
+            serde_json::to_vec(&books).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            br#"{"set": "set1", "slots": 0}"#,
+        )
+        .unwrap();
+        let ps = PersonalSet::open(dir.path(), None, false).unwrap();
+        ps.prefetch([0, 1, 1, 0, 5]);
+        assert_eq!(ps.cache.lock().unwrap().len(), 2);
+        // one handle back in the pool per parallel read at most, never more than DB_IDLE
+        let idle = ps.dbs.lock().unwrap()[&*db.to_string_lossy()].idle.len();
+        assert!((1..=2).contains(&idle), "{idle} idle handles");
+        for (bi, bid, n) in [(0usize, 7i64, 40usize), (1, 9, 25)] {
+            let (text, _) = ps.lines_of(bi);
+            let text = text.unwrap();
+            assert_eq!(text.lines, attached_book_lines(&db, bid).unwrap());
+            assert_eq!(text.len(), n);
+            assert_eq!(text[3], format!("שורה {bid}-3"));
+            assert_eq!(text.heading_path(23), vec!["פרק 2".to_string()]);
+        }
+    }
 }

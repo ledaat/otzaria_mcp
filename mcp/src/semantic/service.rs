@@ -532,18 +532,51 @@ impl SemanticService {
         let weak = Arc::downgrade(self);
         std::thread::Builder::new()
             .name("semantic-refresh".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(30));
-                match weak.upgrade() {
-                    Some(s) => {
-                        if s.last_refresh.lock().unwrap().elapsed() >= Duration::from_secs(25) {
-                            s.refresh();
+            .spawn(move || {
+                let mut warmed = None;
+                loop {
+                    // the vectors of a generation not scanned yet: read them once now, so the
+                    // first search does not wait for them to come from disk
+                    match weak.upgrade() {
+                        Some(s) => {
+                            let generation = s.official.read().unwrap().declared.generation;
+                            if warmed != Some(generation) {
+                                s.warm();
+                                warmed = Some(generation);
+                            }
                         }
+                        None => break,
                     }
-                    None => break,
+                    std::thread::sleep(Duration::from_secs(30));
+                    match weak.upgrade() {
+                        Some(s) => {
+                            if s.last_refresh.lock().unwrap().elapsed() >= Duration::from_secs(25) {
+                                s.refresh();
+                            }
+                        }
+                        None => break,
+                    }
                 }
             })
             .ok();
+    }
+
+    /// One full scan of Otzaria's set, its result thrown away: the operating system reads the
+    /// set's vectors (gigabytes) into memory now, not during the first search after a start
+    /// or a new generation. Searches that come meanwhile run beside it.
+    fn warm(&self) {
+        let t = Instant::now();
+        let o = self.official.read().unwrap();
+        let mut probe = vec![0f32; (o.declared.model.embedding_dim as usize).max(1)];
+        probe[0] = 1.0;
+        match o.scan(&probe, 1, None) {
+            Ok(_) => eprintln!(
+                "otzaria-mcp: vectors of generation {} read into memory in {:.1}s",
+                o.declared.generation,
+                t.elapsed().as_secs_f64()
+            ),
+            Err(e) => eprintln!("otzaria-mcp: warming the vectors failed: {e:#}"),
+        }
     }
 
     // ── scopes ──────────────────────────────────────────────────────────────
@@ -1289,6 +1322,18 @@ impl SemanticService {
         let mut covered = Covered::default();
         let mut out: Vec<Map<String, Value>> = Vec::new();
         let mut counted = 0; // flagged hits (cited / echoing the note) are shown but not counted
+                             // the personal and database books the first results will be shown from, read at once
+        if let Some(ps) = ps {
+            ps.prefetch(
+                cands
+                    .iter()
+                    .take_while(|(score, _, _)| *score >= min_score)
+                    .take(3 * k)
+                    .filter_map(|(_, cand, _)| {
+                        self.cand_places(Some(ps), scope, cand).first()?.book
+                    }),
+            );
+        }
         for (score, cand, wins) in cands {
             if *score < min_score || counted >= k || out.len() >= 3 * k {
                 break;
@@ -1707,12 +1752,19 @@ impl SemanticService {
         let mut seen: HashSet<(SourceKey, i64, i64)> = HashSet::new();
         let mut results: Vec<(Map<String, Value>, SourceRank)> = Vec::new();
         // every place of a candidate: the same text in several books is one vector of the set
-        let places = cands.iter().flat_map(|(score, cand)| {
-            self.cand_places(ps, run.scope.as_deref(), cand)
-                .into_iter()
-                .take(8)
-                .map(move |p| (score, p))
-        });
+        let places: Vec<(&f32, Place)> = cands
+            .iter()
+            .flat_map(|(score, cand)| {
+                self.cand_places(ps, run.scope.as_deref(), cand)
+                    .into_iter()
+                    .take(8)
+                    .map(move |p| (score, p))
+            })
+            .collect();
+        // the personal and database books among them, read at once
+        if let Some(ps) = ps {
+            ps.prefetch(places.iter().filter_map(|(_, p)| p.book));
+        }
         for (score, place) in places {
             let (src, bid, li) = (place.src, place.bid, place.li);
             if src == SourceKey::Official && !self.catalog.has_book(bid) {
