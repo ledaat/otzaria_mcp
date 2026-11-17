@@ -18,8 +18,6 @@ pub const MIN_MEANINGFUL: usize = 20;
 /// default: a calibration file can set another, see [`super::calibration::window_penalty`]).
 pub const WINDOW_PENALTY: f32 = 0.04;
 
-static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
-static BR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<br\s*/?>").unwrap());
 static WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 /// personal_index.NIKUD_RE: nikud and teamim, keeping maqaf (05BE), paseq (05C0),
 /// sof pasuq (05C3) and nun hafukha (05C6).
@@ -31,19 +29,354 @@ static MARKS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new("[\u{0591}-\u{05C
 static HEADING_RE: LazyLock<FRegex> =
     LazyLock::new(|| FRegex::new(r"(?is)^\s*<h([1-6])\b[^>]*>(.*?)</h\1>").unwrap());
 
-/// `strip_html`: tags removed, entities decoded, whitespace collapsed.
+/// `strip_html`: a line for display — tags removed as Otzaria's indexer removes them (`<br>`,
+/// the block tags and `<sup>`/`<sub>` separate words, so a footnote marker is not glued to the
+/// word before it), entities decoded, whitespace collapsed; nikud kept.
 pub fn strip_html(s: &str) -> String {
-    let no_tags = TAG_RE.replace_all(s, "");
-    let text = htmlize::unescape(no_tags.as_ref());
+    let no_tags = strip_tags(s);
+    let text = htmlize::unescape(no_tags.as_str());
     WS_RE.replace_all(&text, " ").trim().to_string()
 }
 
-/// `personal_index.line_text`: a line as Otzaria's index stores it.
+/// `personal_index.line_text`: a line as Otzaria's index stores it — the engine's own
+/// `normalize_text_for_indexing` (line_text_version 4), the text every semantic key is cut from.
 pub fn line_text(raw: &str) -> String {
-    let t = BR_RE.replace_all(raw, " ");
-    let t = TAG_RE.replace_all(&t, "");
-    let t = NIKUD_RE.replace_all(&t, "");
-    WS_RE.replace_all(&t, " ").trim().to_string()
+    search_engine::api::search_engine::normalize_text_for_indexing(raw.to_string())
+}
+
+/// `personal_index.strip_data_uris`: the app's `stripDataUrisForIndex` — every `data:` followed
+/// by 64 or more payload characters is removed with them before a book is indexed.
+pub fn strip_data_uris(text: &str) -> std::borrow::Cow<'_, str> {
+    const SCHEME: &str = "data:";
+    let is_payload = |b: u8| b.is_ascii_alphanumeric() || b"+/;,=.-".contains(&b);
+    let bytes = text.as_bytes();
+    let Some(mut start) = text.find(SCHEME) else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let (mut out, mut copied) = (String::new(), 0);
+    loop {
+        let mut end = start + SCHEME.len();
+        while end < bytes.len() && is_payload(bytes[end]) {
+            end += 1;
+        }
+        if end - start - SCHEME.len() >= 64 {
+            out.push_str(&text[copied..start]);
+            copied = end;
+        }
+        match text[end..].find(SCHEME) {
+            Some(next) => start = end + next,
+            None => break,
+        }
+    }
+    if copied == 0 {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    out.push_str(&text[copied..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Tags removed as `strip_html_for_indexing` removes them, entities left as they are.
+fn strip_tags(text: &str) -> String {
+    if !text.contains('<') {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let (mut out, mut copied, mut i) = (String::with_capacity(text.len()), 0, 0);
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let Some(close) = bytes[i + 1..].iter().position(|&b| b == b'>') else {
+            i += 1; // unterminated: kept
+            continue;
+        };
+        out.push_str(&text[copied..i]);
+        if tags::tag_breaks_word(text, i, i + 1 + close) {
+            out.push(' ');
+        }
+        i += close + 2;
+        copied = i;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Which tags separate words: verbatim from otzaria_search_engine's `rust/src/hebrew_query.rs`
+/// (MIT, Copyright (c) 2026 otzaria), private there, so copied rather than called.
+mod tags {
+    const CGJ: char = '\u{034F}';
+
+    fn is_attached_mark(c: char) -> bool {
+        matches!(c, '\u{0591}'..='\u{05C7}')
+            && !matches!(c, '\u{05BE}' | '\u{05C0}' | '\u{05C3}' | '\u{05C6}')
+    }
+
+    fn is_general_combining_mark(c: char) -> bool {
+        matches!(c, '\u{0300}'..='\u{036F}')
+    }
+
+    fn is_word_mark(c: char) -> bool {
+        is_attached_mark(c) || is_general_combining_mark(c) || c == '\u{FB1E}'
+    }
+
+    fn is_invisible_char(c: char) -> bool {
+        matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+        )
+    }
+
+    fn fold_presentation_form(c: char) -> Option<&'static str> {
+        Some(match c {
+            '\u{FB1D}' => "\u{05D9}\u{05B4}",
+            '\u{FB1E}' => "", // varika — סימן צמוד ללא פירוק, מושמט
+            '\u{FB1F}' => "\u{05F2}\u{05B7}",
+            '\u{FB20}' => "\u{05E2}",
+            '\u{FB21}' => "\u{05D0}",
+            '\u{FB22}' => "\u{05D3}",
+            '\u{FB23}' => "\u{05D4}",
+            '\u{FB24}' => "\u{05DB}",
+            '\u{FB25}' => "\u{05DC}",
+            '\u{FB26}' => "\u{05DD}",
+            '\u{FB27}' => "\u{05E8}",
+            '\u{FB28}' => "\u{05EA}",
+            '\u{FB2A}' => "\u{05E9}\u{05C1}",
+            '\u{FB2B}' => "\u{05E9}\u{05C2}",
+            '\u{FB2C}' => "\u{05E9}\u{05BC}\u{05C1}",
+            '\u{FB2D}' => "\u{05E9}\u{05BC}\u{05C2}",
+            '\u{FB2E}' => "\u{05D0}\u{05B7}",
+            '\u{FB2F}' => "\u{05D0}\u{05B8}",
+            '\u{FB30}' => "\u{05D0}\u{05BC}",
+            '\u{FB31}' => "\u{05D1}\u{05BC}",
+            '\u{FB32}' => "\u{05D2}\u{05BC}",
+            '\u{FB33}' => "\u{05D3}\u{05BC}",
+            '\u{FB34}' => "\u{05D4}\u{05BC}",
+            '\u{FB35}' => "\u{05D5}\u{05BC}",
+            '\u{FB36}' => "\u{05D6}\u{05BC}",
+            '\u{FB38}' => "\u{05D8}\u{05BC}",
+            '\u{FB39}' => "\u{05D9}\u{05BC}",
+            '\u{FB3A}' => "\u{05DA}\u{05BC}",
+            '\u{FB3B}' => "\u{05DB}\u{05BC}",
+            '\u{FB3C}' => "\u{05DC}\u{05BC}",
+            '\u{FB3E}' => "\u{05DE}\u{05BC}",
+            '\u{FB40}' => "\u{05E0}\u{05BC}",
+            '\u{FB41}' => "\u{05E1}\u{05BC}",
+            '\u{FB43}' => "\u{05E3}\u{05BC}",
+            '\u{FB44}' => "\u{05E4}\u{05BC}",
+            '\u{FB46}' => "\u{05E6}\u{05BC}",
+            '\u{FB47}' => "\u{05E7}\u{05BC}",
+            '\u{FB48}' => "\u{05E8}\u{05BC}",
+            '\u{FB49}' => "\u{05E9}\u{05BC}",
+            '\u{FB4A}' => "\u{05EA}\u{05BC}",
+            '\u{FB4B}' => "\u{05D5}\u{05B9}",
+            '\u{FB4C}' => "\u{05D1}\u{05BF}",
+            '\u{FB4D}' => "\u{05DB}\u{05BF}",
+            '\u{FB4E}' => "\u{05E4}\u{05BF}",
+            '\u{FB4F}' => "\u{05D0}\u{05DC}",
+            _ => return None,
+        })
+    }
+
+    const BREAKING_TAG_NAMES: &[&str] = &[
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "caption",
+        "center",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    ];
+
+    const SCRIPT_TAG_NAMES: &[&str] = &["sub", "sup"];
+
+    fn tag_name(body: &str) -> Option<(bool, &str)> {
+        let (closing, name) = match body.strip_prefix('/') {
+            Some(name) => (true, name),
+            None => (false, body),
+        };
+        let len = name.bytes().take_while(u8::is_ascii_alphanumeric).count();
+        (1..=10).contains(&len).then(|| (closing, &name[..len]))
+    }
+
+    fn is_listed(names: &[&str], name: &str) -> bool {
+        names.iter().any(|listed| listed.eq_ignore_ascii_case(name))
+    }
+
+    fn is_hebrew_letter(c: char) -> bool {
+        matches!(c, '\u{05D0}'..='\u{05EA}')
+    }
+
+    fn is_script_letter(c: char) -> bool {
+        match fold_presentation_form(c) {
+            Some(folded) => {
+                let mut folded = folded.chars();
+                folded.next().is_some_and(is_hebrew_letter) && folded.all(is_attached_mark)
+            }
+            None => is_hebrew_letter(c),
+        }
+    }
+
+    pub(super) fn tag_breaks_word(source: &str, lt: usize, gt: usize) -> bool {
+        let Some((closing, name)) = tag_name(&source[lt + 1..gt]) else {
+            return false;
+        };
+        if is_listed(BREAKING_TAG_NAMES, name) {
+            return true;
+        }
+        if !is_listed(SCRIPT_TAG_NAMES, name) {
+            return false;
+        }
+        let open = if closing {
+            script_open_before(source, lt)
+        } else {
+            Some((lt, gt))
+        };
+        !open.is_some_and(|(lt, gt)| is_word_internal_script(source, lt, gt))
+    }
+
+    fn script_open_before(source: &str, lt: usize) -> Option<(usize, usize)> {
+        let mut before = trim_script_context_end(&source[..lt]).chars();
+        before.next_back().filter(|&c| is_script_letter(c))?;
+        let gt = trim_script_formatting_end(before.as_str())
+            .len()
+            .checked_sub(1)?;
+        if source.as_bytes()[gt] != b'>' {
+            return None;
+        }
+        let lt = source[..gt].rfind('<')?;
+        (!source[lt + 1..gt].contains('>')).then_some((lt, gt))
+    }
+
+    fn is_inline_tag(body: &str) -> bool {
+        !tag_name(body).is_some_and(|(_, name)| {
+            is_listed(BREAKING_TAG_NAMES, name) || is_listed(SCRIPT_TAG_NAMES, name)
+        })
+    }
+
+    fn is_script_invisible(c: char) -> bool {
+        is_invisible_char(c) || c == CGJ || c == '\u{FB1E}'
+    }
+
+    fn trim_script_formatting_start(mut source: &str) -> &str {
+        loop {
+            source = source.trim_start_matches(is_script_invisible);
+            let Some(body) = source.strip_prefix('<') else {
+                break;
+            };
+            let Some(gt) = body.find('>') else { break };
+            if !is_inline_tag(&body[..gt]) {
+                break;
+            }
+            source = &body[gt + 1..];
+        }
+        source
+    }
+
+    fn trim_script_formatting_end(mut source: &str) -> &str {
+        loop {
+            source = source.trim_end_matches(is_script_invisible);
+            let Some(body) = source.strip_suffix('>') else {
+                break;
+            };
+            let Some(lt) = body.rfind('<') else { break };
+            if body[lt + 1..].contains('>') || !is_inline_tag(&body[lt + 1..]) {
+                break;
+            }
+            source = &body[..lt];
+        }
+        source
+    }
+
+    fn trim_script_context_end(mut source: &str) -> &str {
+        loop {
+            let trimmed = trim_script_formatting_end(source).trim_end_matches(is_word_mark);
+            if trimmed.len() == source.len() {
+                return source;
+            }
+            source = trimmed;
+        }
+    }
+
+    fn trim_script_context_start(mut source: &str) -> &str {
+        loop {
+            let trimmed = trim_script_formatting_start(source).trim_start_matches(is_word_mark);
+            if trimmed.len() == source.len() {
+                return source;
+            }
+            source = trimmed;
+        }
+    }
+
+    fn marks_footnote(attributes: &str) -> bool {
+        let lower = attributes.to_ascii_lowercase();
+        let word = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        lower.match_indices("footnote-marker").any(|(i, found)| {
+            !word(lower.as_bytes()[..i].last()) && !word(lower.as_bytes().get(i + found.len()))
+        })
+    }
+
+    fn is_word_internal_script(source: &str, lt: usize, gt: usize) -> bool {
+        let Some((false, name)) = tag_name(&source[lt + 1..gt]) else {
+            return false;
+        };
+        if marks_footnote(&source[lt + 1..gt]) {
+            return false;
+        }
+        if !trim_script_context_end(&source[..lt])
+            .chars()
+            .next_back()
+            .is_some_and(is_script_letter)
+        {
+            return false;
+        }
+        let mut content = trim_script_formatting_start(&source[gt + 1..]).chars();
+        if !content.next().is_some_and(is_script_letter) {
+            return false;
+        }
+        let rest = trim_script_context_start(content.as_str());
+        let Some(close) = rest.strip_prefix('<') else {
+            return false;
+        };
+        let Some(close_gt) = close.find('>') else {
+            return false;
+        };
+        matches!(tag_name(&close[..close_gt]), Some((true, closing)) if closing.eq_ignore_ascii_case(name))
+            && trim_script_context_start(&close[close_gt + 1..])
+                .chars()
+                .next()
+                .is_some_and(is_script_letter)
+    }
 }
 
 pub fn strip_nikud(s: &str) -> String {

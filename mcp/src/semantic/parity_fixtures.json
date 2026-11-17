@@ -967,7 +967,7 @@
 {
 "s": "a&amp;b &lt;c&gt; &quot;d&quot; &#1488;&#x5d1; &nbsp;x",
 "strip_html": "a&b <c> \"d\" אב x",
-"line_text": "a&amp;b &lt;c&gt; &quot;d&quot; &#1488;&#x5d1; &nbsp;x",
+"line_text": "ab c d x",
 "norm_words": [
 "aampb",
 "ltcgt",
@@ -978,7 +978,7 @@
 },
 {
 "s": "  רב   הונא\tאמר<br/>שלום  ",
-"strip_html": "רב הונא אמרשלום",
+"strip_html": "רב הונא אמר שלום",
 "line_text": "רב הונא אמר שלום",
 "norm_words": [
 "רב",
@@ -997,7 +997,7 @@
 },
 {
 "s": "<span class=\"x\">ט</span><br>ק",
-"strip_html": "טק",
+"strip_html": "ט ק",
 "line_text": "ט ק",
 "norm_words": [
 "span",
@@ -1022,6 +1022,154 @@
 "line_text": "׆נ׀",
 "norm_words": [
 "נ"
+]
+},
+{
+"s": "ועוד תירץ התורה<sup>רלז</sup>. ואהבה רבה<sup>נא</sup>",
+"strip_html": "ועוד תירץ התורה רלז . ואהבה רבה נא",
+"line_text": "ועוד תירץ התורה רלז . ואהבה רבה נא",
+"norm_words": [
+"ועוד",
+"תירץ",
+"התורהsupרלזsup",
+"ואהבה",
+"רבהsupנאsup"
+]
+},
+{
+"s": "תורה<sup class=\"x\">30</sup>המשך",
+"strip_html": "תורה 30 המשך",
+"line_text": "תורה 30 המשך",
+"norm_words": [
+"תורהsup",
+"classx30supהמשך"
+]
+},
+{
+"s": "גוף<sup class=\"footnote-marker\">א</sup><i class=\"footnote\">הרי זה</i> סוף",
+"strip_html": "גוף א הרי זה סוף",
+"line_text": "גוף א הרי זה סוף",
+"norm_words": [
+"גוףsup",
+"classfootnotemarkerאsupi",
+"classfootnoteהרי",
+"זהi",
+"סוף"
+]
+},
+{
+"s": "מְ<sup>נַ</sup>שֶּׁה",
+"strip_html": "מְנַשֶּׁה",
+"line_text": "מנשה",
+"norm_words": [
+"מsupנsupשה"
+]
+},
+{
+"s": "מ<b><sup>נ</sup></b>שה",
+"strip_html": "מנשה",
+"line_text": "מנשה",
+"norm_words": [
+"מbsupנsupbשה"
+]
+},
+{
+"s": "מ<b><sup>נש</sup></b>ה",
+"strip_html": "מ נש ה",
+"line_text": "מ נש ה",
+"norm_words": [
+"מbsupנשsupbה"
+]
+},
+{
+"s": "א</p><p>ב",
+"strip_html": "א ב",
+"line_text": "א ב",
+"norm_words": [
+"אppב"
+]
+},
+{
+"s": "<td>א</td><td>ב</td>",
+"strip_html": "א ב",
+"line_text": "א ב",
+"norm_words": [
+"tdאtdtdבtd"
+]
+},
+{
+"s": "מי<b>לה</b> א<supx>ב",
+"strip_html": "מילה אב",
+"line_text": "מילה אב",
+"norm_words": [
+"מיbלהb",
+"אsupxב"
+]
+},
+{
+"s": "לאמר&nbsp;&nbsp;שירה &amp; a&quot;b",
+"strip_html": "לאמר שירה & a\"b",
+"line_text": "לאמר שירה ab",
+"norm_words": [
+"לאמרnbspnbspשירה",
+"amp",
+"aquotb"
+]
+},
+{
+"s": "שׁלום ﭏ יִ",
+"strip_html": "שׁלום ﭏ יִ",
+"line_text": "שלום אל י",
+"norm_words": [
+"שׁלום",
+"ﭏ",
+"יִ"
+]
+},
+{
+"s": "a < b",
+"strip_html": "a < b",
+"line_text": "a < b",
+"norm_words": [
+"a",
+"",
+"b"
+]
+},
+{
+"s": "x &a&nbsp;b; y",
+"strip_html": "x &a b; y",
+"line_text": "x y",
+"norm_words": [
+"x",
+"anbspb",
+"y"
+]
+},
+{
+"s": "תורה&nbsp;<sup>30</sup>&nbsp;המשך",
+"strip_html": "תורה 30 המשך",
+"line_text": "תורה 30 המשך",
+"norm_words": [
+"תורהnbspsup30supnbspהמשך"
+]
+},
+{
+"s": "מ‏<sup>נ</sup>שה",
+"strip_html": "מ‏נשה",
+"line_text": "מ‏נשה",
+"norm_words": [
+"מsupנsupשה"
+]
+},
+{
+"s": "img data:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA x",
+"strip_html": "img data:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA x",
+"line_text": "img data:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA x",
+"norm_words": [
+"img",
+"dataAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+"x"
 ]
 }
 ],

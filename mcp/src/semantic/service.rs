@@ -19,8 +19,8 @@ use super::official::{Official, OfficialConfig};
 use super::personal::PersonalSet;
 use super::textutil::{
     char_len, char_prefix, char_slice, clean_markdown, heading_path, line_text, norm_word,
-    note_windows, parse_book_url, round_to, strip_html, strip_nikud, window_span, EchoReference,
-    SourceKey,
+    note_windows, parse_book_url, round_to, strip_data_uris, strip_html, strip_nikud, window_span,
+    EchoReference, SourceKey,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1089,13 +1089,15 @@ impl SemanticService {
         let text = strip_html(&rows[0].content);
         let mut snippet = text.clone();
         if win != 0 && win != 255 {
-            // the vector is a later window of a long line: show that part of the line
-            let t = text.trim();
-            let (a, b) = window_span(t, win as usize);
+            // the vector is a later window of a long line: show that part of the line, cut from
+            // the line as the index stores it (no nikud), as the window was (a line whose
+            // footnotes the indexer put back can still be shifted a little)
+            let t = line_text(&rows[0].content);
+            let (a, b) = window_span(&t, win as usize);
             snippet = format!(
                 "… {}{}",
-                char_slice(t, a, b),
-                if b < char_len(t) { " …" } else { "" }
+                char_slice(&t, a, b),
+                if b < char_len(&t) { " …" } else { "" }
             );
         }
         for r in &rows[1..] {
@@ -1170,8 +1172,9 @@ impl SemanticService {
         }
         let mut snippet = text.clone();
         if win > 0 && win != 255 {
-            // a later window of a long line: the windows were cut from the line without nikud
-            let t = line_text(raw);
+            // a later window of a long line: the windows were cut from the line as Otzaria's
+            // index stores it
+            let t = line_text(&strip_data_uris(raw));
             let (a, e) = window_span(&t, win as usize);
             snippet = format!(
                 "… {}{}",
