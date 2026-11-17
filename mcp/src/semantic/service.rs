@@ -676,15 +676,16 @@ impl SemanticService {
         let embed_ms = t0.elapsed().as_millis();
         let t1 = Instant::now();
         let (personal, scope) = self.request_scope(opts, &include, &exclude);
-        let mut per_query: Vec<Vec<(f32, Cand)>> = Vec::with_capacity(vectors.len());
-        for v in &vectors {
-            let hits = official.scan(v, kc, scope.as_deref())?;
-            per_query.push(
+        // every query in one pass over the set: a note's windows, a quotation and its passage form
+        let mut per_query: Vec<Vec<(f32, Cand)>> = official
+            .scan_many(&vectors, kc, scope.as_deref())?
+            .into_iter()
+            .map(|hits| {
                 hits.into_iter()
                     .map(|h| (h.score, Cand::Official(Arc::new(h))))
-                    .collect(),
-            );
-        }
+                    .collect()
+            })
+            .collect();
         drop(official);
         if let Some(ps) = personal.as_ref().filter(|_| self.cfg.scan_personal_index) {
             let mask = ps.book_mask(&include, &exclude);
@@ -813,8 +814,12 @@ impl SemanticService {
                 *e = (score, wi, c);
             }
         };
-        for (wi, v) in vectors.iter().enumerate() {
-            for h in official.scan(v, k, scope.as_deref())? {
+        for (wi, hits) in official
+            .scan_many(&vectors, k, scope.as_deref())?
+            .into_iter()
+            .enumerate()
+        {
+            for h in hits {
                 keep(h.score, wi, Cand::Official(Arc::new(h)));
             }
         }
