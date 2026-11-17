@@ -29,15 +29,20 @@ def smoke(path):
         json.dump(out, f)
 
 
-RLM = "\u200f"
-LRE, PDF = "\u202a", "\u202c"   # a left-to-right stretch (a path) inside right-to-left text
+RLE, LRE, PDF = "\u202b", "\u202a", "\u202c"   # right-to-left / left-to-right embedding, and its end
 
 
-def R(text):
-    """Right-to-left text for Tk and Windows message boxes, which lay a line out left to right:
-    a right-to-left mark at both ends of every line keeps punctuation and numbers at the edges
-    in their places (a sentence's final period on the left)."""
-    return "\n".join(RLM + line + RLM if line else line for line in str(text).split("\n"))
+def R(text, width=88):
+    """Right-to-left text for Tk and Windows message boxes, which lay out every displayed line on
+    its own, left to right: the text is wrapped here (so Tk never wraps it again) and every line
+    is put in a right-to-left embedding, which keeps words, Latin names and punctuation in their
+    order. A path inside is given as LRE + path + PDF."""
+    import textwrap
+    out = []
+    for line in str(text).split("\n"):
+        parts = textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False) or [""]
+        out += [RLE + p + PDF if p else p for p in parts]
+    return "\n".join(out)
 
 
 def hours(n_passages, rate):
@@ -73,12 +78,12 @@ def main():
 
     for name in ("askokcancel", "askyesno", "showinfo", "showerror"):
         orig = getattr(messagebox, name)
-        setattr(messagebox, name, lambda title, msg, orig=orig: orig(R(title), R(msg)))
+        setattr(messagebox, name, lambda title, msg, orig=orig: orig(R(title, 200), R(msg, 60)))
 
     root = tk.Tk()
     root.title("חיפוש לפי משמעות בספרים אישיים – אוצריא")
-    root.geometry("720x520")
-    root.minsize(560, 420)
+    root.geometry("760x540")
+    root.minsize(760, 420)
     font = ("Segoe UI", 11)
     big = ("Segoe UI", 13, "bold")
     style = ttk.Style()
@@ -112,10 +117,10 @@ def main():
             pass
         root.after(100, pump)
 
-    head = tk.Label(root, text=R("חיפוש לפי משמעות בספרים האישיים ובמסדי הספרים המצורפים"), font=big, anchor="e",
+    head = tk.Label(root, text=R("חיפוש לפי משמעות בספרים האישיים ובמסדי הספרים המצורפים", 200), font=big, anchor="e",
                     justify="right")
     head.pack(fill="x", padx=16, pady=(14, 6))
-    status = tk.Label(root, text=R("בודק מה יש במחשב…"), font=font, anchor="ne", justify="right", wraplength=680)
+    status = tk.Label(root, text=R("בודק מה יש במחשב…"), font=font, anchor="ne", justify="right", wraplength=2000)
     status.pack(fill="x", padx=16, pady=6)
     bar = ttk.Progressbar(root, mode="indeterminate", length=680)
     bar.pack(fill="x", padx=16, pady=(6, 2))
@@ -129,7 +134,7 @@ def main():
     stop_b = ttk.Button(buttons, text="עצור", state="disabled")
     remove_b = ttk.Button(buttons, text="הסר מאוצריא", state="disabled")
     details_b = ttk.Button(buttons, text="פרטים")
-    choose_b = ttk.Button(buttons, text=R("בחר תיקיית אוצריא…"))
+    choose_b = ttk.Button(buttons, text=R("בחר תיקיית אוצריא…", 200))
     for b in (start_b, stop_b, remove_b):
         b.pack(side="right", padx=4)
     details_b.pack(side="left", padx=4)
@@ -189,7 +194,7 @@ def main():
     # ---- hooks (called from the worker thread)
     def on_event(kind, **d):
         if kind == "locations":
-            on_ui(where.configure, {"text": R(f"תיקיית אוצריא: {LRE}{d['library']}{PDF}")})
+            on_ui(where.configure, {"text": R(f"תיקיית אוצריא: {LRE}{d['library']}{PDF}", 200)})
         elif kind == "books":
             on_ui(set_status, f"נמצאו {d['personal']:,} ספרים אישיים (txt) ו-{d['attached']:,} ספרים במסדים מצורפים. "
                               f"קורא את הספרים…")
