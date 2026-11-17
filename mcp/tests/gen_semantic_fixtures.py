@@ -96,7 +96,15 @@ for n in [0, 5, 100, 511, 512, 513, 600, 900, 1024, 1500, 2048, 2600, 3500]:
 fx["window_spans"] = spans
 
 samples = BASE + ["<h2>פרק <i>א</i></h2>", "a&amp;b &lt;c&gt; &quot;d&quot; &#1488;&#x5d1; &nbsp;x", "  רב   הונא\tאמר<br/>שלום  ",
-                  "שִׁמְעוֹן׀ הַצַּדִּיק־הָיָה׃", "<span class=\"x\">ט</span><br>ק", "", "   ", "׆נ׀"]
+                  "שִׁמְעוֹן׀ הַצַּדִּיק־הָיָה׃", "<span class=\"x\">ט</span><br>ק", "", "   ", "׆נ׀",
+                  # Otzaria's line text (hebrew_query.rs): sup/sub and block tags separate words,
+                  # a raised letter inside a word does not, entities and presentation forms
+                  "ועוד תירץ התורה<sup>רלז</sup>. ואהבה רבה<sup>נא</sup>", "תורה<sup class=\"x\">30</sup>המשך",
+                  "גוף<sup class=\"footnote-marker\">א</sup><i class=\"footnote\">הרי זה</i> סוף",
+                  "מְ<sup>נַ</sup>שֶּׁה", "מ<b><sup>נ</sup></b>שה", "מ<b><sup>נש</sup></b>ה", "א</p><p>ב",
+                  "<td>א</td><td>ב</td>", "מי<b>לה</b> א<supx>ב", "לאמר&nbsp;&nbsp;שירה &amp; a&quot;b",
+                  "\ufb2aלום \ufb4f \ufb1d", "a < b", "x &a&nbsp;b; y", "תורה&nbsp;<sup>30</sup>&nbsp;המשך",
+                  "מ\u200f<sup>נ</sup>שה", "img data:" + "A" * 70 + " x"]
 fx["text"] = [{"s": s, "strip_html": S.strip_html(s), "line_text": P.line_text(s),
                "norm_words": [S.norm_word(w) for w in s.split()]} for s in samples]
 

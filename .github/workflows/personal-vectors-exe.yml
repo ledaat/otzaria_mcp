@@ -20,6 +20,10 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: python -m pip install numpy onnxruntime-directml tokenizers zstandard pyinstaller pillow
+      - name: Passage recipe matches Otzaria's engine
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_line_text.py
       - name: Test the script on Windows (synthetic Otzaria folder)
         env:
           PYTHONIOENCODING: utf-8

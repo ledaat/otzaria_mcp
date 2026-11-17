@@ -77,11 +77,6 @@ MIN_MEANINGFUL, CONTEXT, MAX_CHARS, MIN_EMBEDDABLE = 20, 2, 512, 5
 CHUNKING_VERSION, TEXT_VERSION, NORMALIZATION_VERSION = 2, 2, 1
 WINDOW_CHARS, WINDOW_OVERLAP, MAX_WINDOWS = 512, 128, 6
 
-BR_RE = re.compile(r"<br\s*/?>", re.I)
-TAG_RE = re.compile(r"<[^>]+>")
-NIKUD_RE = re.compile(r"[֑-ׇֽֿׁׂׅׄ]")
-WS_RE = re.compile(r"\s+")
-HEADING_RE = re.compile(r"^\s*<h([1-6])\b[^>]*>(.*?)</h\1>", re.I | re.S)
 SLUG_RE = re.compile(r"^[\w.\-]{1,64}$")
 
 # ------------------------------------------------------------------ the .oxv format
@@ -151,15 +146,320 @@ def recipe_identity(windows=True):
     return struct.unpack("<Q", d[:8])[0]
 
 
-# ------------------------------------------------------------------ text and passages
+# ------------------------------------------------------------------ Otzaria's line text
+# An exact port of the line recipe Otzaria's index stores and keys every semantic vector from
+# (otzaria_search_engine, rust/src/hebrew_query.rs normalize_text_for_indexing; the index
+# metadata's line_text_version 4), and of how the app hands a book's text to the indexer
+# (lib/indexing/repository/indexing_repository.dart). The same block is in personal_index.py
+# and otzaria_personal_vectors.py; test_line_text.py holds both to the engine's own output.
+#   - tags: removed; the HTML block tags and <br> become a space; <sup>/<sub> separate words
+#     (תורה<sup>30</sup> -> "תורה 30"), except one raised letter inside a word (מְ<sup>נַ</sup>שֶּׁה)
+#   - entities: &nbsp; &thinsp; &ensp; &emsp; become a space, any other &...; is removed
+#   - Hebrew presentation forms (U+FB1D-FB4F) decomposed, attached nikud/teamim removed
+#     (maqaf, paseq, sof pasuq and nun hafukha kept), whitespace collapsed and trimmed
+#   - a line starting with "<h" opens a new section (what a short line's context stays inside)
+#   - before the book is split into lines, embedded data: URIs of 64+ characters are removed
+
+LINE_TEXT_VERSION = 4
+
+_BREAKING_TAGS = frozenset((
+    "address", "article", "aside", "blockquote", "br", "caption", "center", "dd", "div", "dl", "dt",
+    "figcaption", "figure", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main",
+    "nav", "ol", "p", "pre", "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul"))
+_SCRIPT_TAGS = frozenset(("sub", "sup"))
+_SPACE_ENTITIES = ("&nbsp;", "&thinsp;", "&ensp;", "&emsp;")
+_CGJ = "͏"
+_PRESENTATION = {
+    0xFB1D: "יִ", 0xFB1E: "", 0xFB1F: "ײַ", 0xFB20: "ע", 0xFB21: "א",
+    0xFB22: "ד", 0xFB23: "ה", 0xFB24: "כ", 0xFB25: "ל", 0xFB26: "ם",
+    0xFB27: "ר", 0xFB28: "ת", 0xFB2A: "שׁ", 0xFB2B: "שׂ",
+    0xFB2C: "שּׁ", 0xFB2D: "שּׂ", 0xFB2E: "אַ",
+    0xFB2F: "אָ", 0xFB30: "אּ", 0xFB31: "בּ", 0xFB32: "גּ",
+    0xFB33: "דּ", 0xFB34: "הּ", 0xFB35: "וּ", 0xFB36: "זּ",
+    0xFB38: "טּ", 0xFB39: "יּ", 0xFB3A: "ךּ", 0xFB3B: "כּ",
+    0xFB3C: "לּ", 0xFB3E: "מּ", 0xFB40: "נּ", 0xFB41: "סּ",
+    0xFB43: "ףּ", 0xFB44: "פּ", 0xFB46: "צּ", 0xFB47: "קּ",
+    0xFB48: "רּ", 0xFB49: "שּ", 0xFB4A: "תּ", 0xFB4B: "וֹ",
+    0xFB4C: "בֿ", 0xFB4D: "כֿ", 0xFB4E: "פֿ", 0xFB4F: "אל"}
+# Rust's char::is_whitespace (Unicode White_Space), which Python's str.isspace() is not
+_WS = "\t\n\x0b\x0c\r \x85\xa0           " \
+      "     　"
+_WS_RUN_RE = re.compile("[" + _WS + "]+")
+
+
+def _attached_mark(c):
+    return "֑" <= c <= "ׇ" and c not in "־׀׃׆"
+
+
+def _word_mark(c):
+    return _attached_mark(c) or "̀" <= c <= "ͯ" or c == "ﬞ"
+
+
+def _invisible(c):
+    return ("​" <= c <= "‏" or "‪" <= c <= "‮" or "⁦" <= c <= "⁩"
+            or c == "﻿")
+
+
+def _script_invisible(c):
+    return _invisible(c) or c == _CGJ or c == "ﬞ"
+
+
+def _hebrew_letter(c):
+    return "א" <= c <= "ת"
+
+
+def _script_letter(c):
+    """A Hebrew letter, or a presentation form that folds to one letter and its marks."""
+    f = _PRESENTATION.get(ord(c))
+    if f is None:
+        return _hebrew_letter(c)
+    return bool(f) and _hebrew_letter(f[0]) and all(_attached_mark(m) for m in f[1:])
+
+
+def _tag_name(body):
+    """(closing, name) of a tag body (the text between < and >), or None."""
+    closing = body.startswith("/")
+    name = body[1:] if closing else body
+    n = 0
+    while n < len(name) and name[n].isascii() and name[n].isalnum():
+        n += 1
+    return (closing, name[:n]) if 1 <= n <= 10 else None
+
+
+def _inline_tag(body):
+    t = _tag_name(body)
+    return not (t and (t[1].lower() in _BREAKING_TAGS or t[1].lower() in _SCRIPT_TAGS))
+
+
+def _lstrip_if(s, pred):
+    i = 0
+    while i < len(s) and pred(s[i]):
+        i += 1
+    return s[i:]
+
+
+def _rstrip_if(s, pred):
+    j = len(s)
+    while j > 0 and pred(s[j - 1]):
+        j -= 1
+    return s[:j]
+
+
+def _trim_formatting_start(s):
+    while True:
+        s = _lstrip_if(s, _script_invisible)
+        if not s.startswith("<"):
+            return s
+        gt = s.find(">", 1)
+        if gt < 0 or not _inline_tag(s[1:gt]):
+            return s
+        s = s[gt + 1:]
+
+
+def _trim_formatting_end(s):
+    while True:
+        s = _rstrip_if(s, _script_invisible)
+        if not s.endswith(">"):
+            return s
+        body = s[:-1]
+        lt = body.rfind("<")
+        if lt < 0 or ">" in body[lt + 1:] or not _inline_tag(body[lt + 1:]):
+            return s
+        s = body[:lt]
+
+
+def _trim_context_end(s):
+    while True:
+        t = _rstrip_if(_trim_formatting_end(s), _word_mark)
+        if len(t) == len(s):
+            return s
+        s = t
+
+
+def _trim_context_start(s):
+    while True:
+        t = _lstrip_if(_trim_formatting_start(s), _word_mark)
+        if len(t) == len(s):
+            return s
+        s = t
+
+
+def _marks_footnote(attributes):
+    low = "".join(c.lower() if c.isascii() else c for c in attributes)
+
+    def word(c):
+        return c is not None and c.isascii() and (c.isalnum() or c == "_")
+    i = low.find("footnote-marker")
+    while i >= 0:
+        end = i + len("footnote-marker")
+        if not word(low[i - 1] if i else None) and not word(low[end] if end < len(low) else None):
+            return True
+        i = low.find("footnote-marker", i + 1)
+    return False
+
+
+def _word_internal_script(src, lt, gt):
+    """Whether the open tag src[lt..gt] wraps one letter (with marks) between letters."""
+    t = _tag_name(src[lt + 1:gt])
+    if not t or t[0]:
+        return False
+    if _marks_footnote(src[lt + 1:gt]):
+        return False
+    before = _trim_context_end(src[:lt])
+    if not before or not _script_letter(before[-1]):
+        return False
+    content = _trim_formatting_start(src[gt + 1:])
+    if not content or not _script_letter(content[0]):
+        return False
+    rest = _trim_context_start(content[1:])
+    if not rest.startswith("<"):
+        return False
+    close_gt = rest.find(">", 1)
+    if close_gt < 0:
+        return False
+    c = _tag_name(rest[1:close_gt])
+    if not (c and c[0] and c[1].lower() == t[1].lower()):
+        return False
+    after = _trim_context_start(rest[close_gt + 1:])
+    return bool(after) and _script_letter(after[0])
+
+
+def _script_open_before(src, lt):
+    before = _trim_context_end(src[:lt])
+    if not before or not _script_letter(before[-1]):
+        return None
+    gt = len(_trim_formatting_end(before[:-1])) - 1
+    if gt < 0 or src[gt] != ">":
+        return None
+    lt2 = src.rfind("<", 0, gt)
+    if lt2 < 0 or ">" in src[lt2 + 1:gt]:
+        return None
+    return lt2, gt
+
+
+def _tag_breaks_word(src, lt, gt):
+    t = _tag_name(src[lt + 1:gt])
+    if not t:
+        return False
+    name = t[1].lower()
+    if name in _BREAKING_TAGS:
+        return True
+    if name not in _SCRIPT_TAGS:
+        return False
+    opening = _script_open_before(src, lt) if t[0] else (lt, gt)
+    return not (opening is not None and _word_internal_script(src, *opening))
+
+
+def strip_html_for_indexing(text, entities=True):
+    """Tags and entities removed as Otzaria's indexer removes them (nikud kept). entities=False:
+    only the tags (for display, where the entities are decoded instead)."""
+    if "<" not in text and ("&" not in text or not entities):
+        return text
+    out, i, copied, n = [], 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "<":
+            close = text.find(">", i + 1)
+            if close >= 0:
+                rep, nxt = (" " if _tag_breaks_word(text, i, close) else ""), close + 1
+            else:
+                rep, nxt = "<", i + 1
+        elif ch == "&" and entities:
+            ent = next((e for e in _SPACE_ENTITIES if text.startswith(e, i)), None)
+            if ent:
+                rep, nxt = " ", i + len(ent)
+            else:
+                j, semi = i + 1, -1
+                while j < n:
+                    if text[j] == ";":
+                        semi = j
+                        break
+                    if text[j] == "&":
+                        e = next((e for e in _SPACE_ENTITIES if text.startswith(e, j)), None)
+                        j += len(e) if e else 1
+                    else:
+                        j += 1
+                if semi > i + 1:
+                    rep, nxt = "", semi + 1
+                else:
+                    rep, nxt = "&", i + 1
+        else:
+            i += 1
+            continue
+        if copied < i:
+            out.append(text[copied:i])
+        out.append(rep)
+        i = copied = nxt
+    out.append(text[copied:])
+    return "".join(out)
+
+
+# presentation forms folded, then attached marks dropped, in one translate
+_FOLD_STRIP = {cp: "".join(c for c in f if not _attached_mark(c)) for cp, f in _PRESENTATION.items()}
+_FOLD_STRIP.update({cp: None for cp in range(0x0591, 0x05C8) if _attached_mark(chr(cp))})
+
+
+def rust_trim(s):
+    return s.strip(_WS)
+
 
 def line_text(raw):
-    """A line as Otzaria's index stores it."""
-    t = BR_RE.sub(" ", raw or "")
-    t = TAG_RE.sub("", t)
-    t = NIKUD_RE.sub("", t)
-    return WS_RE.sub(" ", t).strip()
+    """A line as Otzaria's index stores it (normalize_text_for_indexing)."""
+    t = strip_html_for_indexing(raw or "").translate(_FOLD_STRIP)
+    return _WS_RUN_RE.sub(" ", t).strip(" ")
 
+
+def is_section_start(raw):
+    """A line that opens a new section in Otzaria's index (and so bounds a short line's context)."""
+    return (raw or "").startswith("<h")
+
+
+def _data_uri_char(c):
+    return c.isascii() and (c.isalnum() or c in "+/;,=.-")
+
+
+def strip_data_uris(text):
+    """The app's stripDataUrisForIndex: every data: followed by 64+ payload characters goes."""
+    m = text.find("data:")
+    if m < 0:
+        return text
+    out, copied, n = [], 0, len(text)
+    while m >= 0:
+        end = m + 5
+        while end < n and _data_uri_char(text[end]):
+            end += 1
+        if end - m - 5 >= 64:
+            out.append(text[copied:m])
+            copied = end
+        m = text.find("data:", end)
+    if copied == 0:
+        return text
+    out.append(text[copied:])
+    return "".join(out)
+
+
+def book_text_lines(text, from_db=False):
+    """A book's lines as the app hands them to the indexer: data: URIs removed, split on \\n.
+    from_db: the text is a database's rows joined by \\n. The app passes those bytes on as they
+    are, a leading BOM included, unless "data:" occurs anywhere in them: then it decodes them to
+    clean them, and the decoder drops the BOM."""
+    if from_db and text.startswith("﻿") and "data:" in text:
+        text = text[1:]
+    return strip_data_uris(text).split("\n")
+
+
+def index_lines(raw_lines, from_db=False):
+    """A book's lines as Otzaria's indexer receives them (book_text_lines of the joined text, line
+    by line: a data: URI never spans a line)."""
+    if not raw_lines:
+        return raw_lines
+    out = [strip_data_uris(x or "") for x in raw_lines]
+    if from_db and out[0].startswith("\ufeff") and any("data:" in x for x in raw_lines):
+        out[0] = out[0][1:]
+    return out
+
+
+# ------------------------------------------------------------------ passages
 
 def decode_book(data):
     """Otzaria reads personal .txt as UTF-8 when valid, otherwise by detection."""
@@ -196,13 +496,14 @@ def window_spans(text):
     return spans
 
 
-def windowed_passages(raw_lines, extra_only=False):
+def windowed_passages(raw_lines, from_db=False):
     """(line_index, passage_text, window) for every passage the recipe embeds, a line's windows
-    in order after its first passage. extra_only: just the windows (what a recipe-1 shard lacks)."""
-    texts = [line_text(x) for x in raw_lines]
+    in order after its first passage. from_db: the lines are an attached database's rows."""
+    lines = index_lines(raw_lines, from_db)
+    texts = [line_text(x) for x in lines]
     section, sec = [], 0
-    for x in raw_lines:
-        if HEADING_RE.match(x or ""):
+    for x in lines:
+        if is_section_start(x):
             sec += 1
         section.append(sec)
     out = []
@@ -224,15 +525,15 @@ def windowed_passages(raw_lines, extra_only=False):
             body = " ".join(texts[lo:hi + 1])
         else:
             body = t
-        body = body.strip()[:MAX_CHARS].strip()
-        if body and not extra_only:
+        body = rust_trim(rust_trim(body)[:MAX_CHARS])
+        if body:
             out.append((i, "[PASSAGE] " + body, 0))
         if len(t) >= MIN_MEANINGFUL and len(t) > MAX_CHARS:
             seen = {body}
             for w, (a, b) in enumerate(window_spans(t)):
                 if w == 0:
                     continue
-                piece = t[a:b].strip()
+                piece = rust_trim(t[a:b])
                 if piece and piece not in seen:
                     seen.add(piece)
                     out.append((i, "[PASSAGE] " + piece, w))
@@ -479,26 +780,23 @@ class BookDB:
                 con.execute("select id, title, categoryId from book")}
 
     def _rows(self, con, book_id=None):
+        # the rows of a book in Otzaria's order (line_source.rs book_sql)
         if self.compressed:
-            q = ("select l.bookId, l.lineIndex, c.content from line l join line_content c on c.id = l.id")
+            q = ("select l.bookId, l.lineIndex, c.content from line l left join line_content c on c.id = l.id")
         else:
             q = "select l.bookId, l.lineIndex, l.content from line l"
         if book_id is None:
-            return con.execute(q + " order by l.bookId, l.lineIndex")
-        return con.execute(q + " where l.bookId = ? order by l.lineIndex", (book_id,))
+            return con.execute(q + " order by l.bookId, l.lineIndex, l.id")
+        return con.execute(q + " where l.bookId = ? order by l.lineIndex, l.id", (book_id,))
 
     @staticmethod
     def _assemble(pairs):
-        out = []
-        for li, text in pairs:
-            if li == len(out):
-                out.append(text)
-            elif li > len(out):
-                out.extend([""] * (li - len(out)))
-                out.append(text)
-            else:
-                out[li] = text
-        return out
+        """The book's lines as Otzaria indexes them: its rows joined by \\n, then split on \\n
+        (so a row holding a line break is two lines, and a gap in lineIndex is no line)."""
+        rows = [text for _li, text in pairs]
+        if any("\n" in t for t in rows):
+            return "\n".join(rows).split("\n")
+        return rows
 
     def book_lines(self, con, book_id):
         self._prepare(con)
@@ -602,7 +900,7 @@ def _prepare(book):
         lines = read_lines(book, _W["dbs"])
     except Exception as e:
         return {"book": book, "error": str(e)}
-    ps = windowed_passages(lines)
+    ps = windowed_passages(lines, from_db="db" in book)
     keys = passage_keys([t for _i, t, _w in ps])
     line = np.array([i for i, _t, _w in ps], np.int64)
     win = np.array([w for _i, _t, w in ps], np.uint8)
@@ -1351,6 +1649,10 @@ def run(args):
     if (model.get("embedding_text_version"), model.get("normalization_version")) != (TEXT_VERSION, NORMALIZATION_VERSION):
         raise RuntimeError(f"the set's model embeds text recipe {model.get('embedding_text_version')} / normalization "
                            f"{model.get('normalization_version')}; this script writes {TEXT_VERSION} / {NORMALIZATION_VERSION}")
+    line_version = (doc["identity"].get("text") or {}).get("line_text_version")
+    if line_version is not None and int(line_version) != LINE_TEXT_VERSION:
+        raise RuntimeError(f"Otzaria's index stores its lines by line recipe {line_version}; this script cuts them by "
+                           f"recipe {LINE_TEXT_VERSION}: a newer version of the script is needed")
     if int(model.get("chunking_identity", 0)) != recipe_identity():
         raise RuntimeError(f"the set's passages are cut by recipe {model.get('chunking_identity')}, not by the one this "
                            f"script knows ({recipe_identity()}): a newer version of the script is needed")
