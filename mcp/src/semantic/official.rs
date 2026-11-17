@@ -230,6 +230,31 @@ impl Official {
             .map_err(|e| anyhow!("the vector scan failed: {e}"))
     }
 
+    /// [`Self::scan`] for several vectors in one pass over the set: for each, exactly the hits
+    /// `scan` returns for it alone. The scan is bound by memory bandwidth, so a note's windows
+    /// cost little more than one query (vendored `scan_many`, see VENDORED.md).
+    pub fn scan_many(
+        &self,
+        vectors: &[Vec<f32>],
+        k: usize,
+        books: Option<&BookSet>,
+    ) -> Result<Vec<Vec<VectorHit>>> {
+        if vectors.len() == 1 {
+            return Ok(vec![self.scan(&vectors[0], k, books)?]);
+        }
+        let views: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let cancel = CancellationToken::new();
+        self.index
+            .search_hits_many(
+                &views,
+                k,
+                books,
+                super::calibration::window_penalty(),
+                &cancel,
+            )
+            .map_err(|e| anyhow!("the vector scan failed: {e}"))
+    }
+
     /// The exact score of each of `slots` (of this generation) against `vector`, as the scan
     /// scores them (the long-window penalty included): a scan that admits no book and weighs
     /// these slots besides. A slot no longer live, or holding another text, is left out.

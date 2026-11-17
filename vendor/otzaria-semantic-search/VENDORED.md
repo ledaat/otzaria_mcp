@@ -7,7 +7,7 @@ git dependency on it here (the MCP's own; the search core's is optional and off)
 `onnx-backend` feature: the query is embedded and the installed vector set scanned by Otzaria's
 own code, and ONNX Runtime is loaded at run time (`--onnx-runtime`).
 
-Two local changes, in `src/semantic/official_index.rs`:
+Two local changes of its own, in `src/semantic/official_index.rs`:
 
 - **`OfficialSemanticIndex::open_read_only(config)`**: [`open`] with a `read_only` flag kept on
   the index, so the first open and every `reload_vectors` go through
@@ -16,6 +16,15 @@ Two local changes, in `src/semantic/official_index.rs`:
   application must never do either, nor make an install wait for the lock.
 - **`OfficialSemanticIndex::embed_query`** is `pub` (upstream `pub(crate)`): the MCP scans its
   personal books' vectors, built with the same model, with the same query vector.
+
+A third, from an open upstream PR (Otzaria/otzaria-semantic-search, branch
+`ledaat:scan-many`) until it is merged:
+
+- **`scan_many`**: several query vectors in one pass over the set (`oxv::scan::scan_many`,
+  `scan_segments_many`, `SegmentSet::scan_many`, `OfficialSemanticIndex::search_hits_many`),
+  with its tests and the benchmark's `--batch`. For each query exactly the hits of a scan of its
+  own; the MCP's `related`, `parallels` and `check_quote` scan their windows / query and passage
+  with it. Once merged upstream, upgrading to a revision with it replaces this.
 
 ## Upgrading
 A family with a newer text recipe (Pardes-QA491: embedding text 3, normalization 2, added to the

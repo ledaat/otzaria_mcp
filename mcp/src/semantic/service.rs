@@ -18,9 +18,9 @@ use super::feedback::Outbox;
 use super::official::{Official, OfficialConfig};
 use super::personal::PersonalSet;
 use super::textutil::{
-    char_len, char_prefix, char_slice, clean_markdown, heading_path, line_text, norm_word,
-    note_windows, parse_book_url, round_to, strip_data_uris, strip_html, strip_nikud, window_span,
-    EchoReference, SourceKey,
+    char_len, char_prefix, char_slice, clean_markdown, line_text, norm_word, note_windows,
+    parse_book_url, round_to, strip_data_uris, strip_html, strip_nikud, window_span, EchoReference,
+    SourceKey,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -532,18 +532,51 @@ impl SemanticService {
         let weak = Arc::downgrade(self);
         std::thread::Builder::new()
             .name("semantic-refresh".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(30));
-                match weak.upgrade() {
-                    Some(s) => {
-                        if s.last_refresh.lock().unwrap().elapsed() >= Duration::from_secs(25) {
-                            s.refresh();
+            .spawn(move || {
+                let mut warmed = None;
+                loop {
+                    // the vectors of a generation not scanned yet: read them once now, so the
+                    // first search does not wait for them to come from disk
+                    match weak.upgrade() {
+                        Some(s) => {
+                            let generation = s.official.read().unwrap().declared.generation;
+                            if warmed != Some(generation) {
+                                s.warm();
+                                warmed = Some(generation);
+                            }
                         }
+                        None => break,
                     }
-                    None => break,
+                    std::thread::sleep(Duration::from_secs(30));
+                    match weak.upgrade() {
+                        Some(s) => {
+                            if s.last_refresh.lock().unwrap().elapsed() >= Duration::from_secs(25) {
+                                s.refresh();
+                            }
+                        }
+                        None => break,
+                    }
                 }
             })
             .ok();
+    }
+
+    /// One full scan of Otzaria's set, its result thrown away: the operating system reads the
+    /// set's vectors (gigabytes) into memory now, not during the first search after a start
+    /// or a new generation. Searches that come meanwhile run beside it.
+    fn warm(&self) {
+        let t = Instant::now();
+        let o = self.official.read().unwrap();
+        let mut probe = vec![0f32; (o.declared.model.embedding_dim as usize).max(1)];
+        probe[0] = 1.0;
+        match o.scan(&probe, 1, None) {
+            Ok(_) => eprintln!(
+                "otzaria-mcp: vectors of generation {} read into memory in {:.1}s",
+                o.declared.generation,
+                t.elapsed().as_secs_f64()
+            ),
+            Err(e) => eprintln!("otzaria-mcp: warming the vectors failed: {e:#}"),
+        }
     }
 
     // ── scopes ──────────────────────────────────────────────────────────────
@@ -643,15 +676,16 @@ impl SemanticService {
         let embed_ms = t0.elapsed().as_millis();
         let t1 = Instant::now();
         let (personal, scope) = self.request_scope(opts, &include, &exclude);
-        let mut per_query: Vec<Vec<(f32, Cand)>> = Vec::with_capacity(vectors.len());
-        for v in &vectors {
-            let hits = official.scan(v, kc, scope.as_deref())?;
-            per_query.push(
+        // every query in one pass over the set: a note's windows, a quotation and its passage form
+        let mut per_query: Vec<Vec<(f32, Cand)>> = official
+            .scan_many(&vectors, kc, scope.as_deref())?
+            .into_iter()
+            .map(|hits| {
                 hits.into_iter()
                     .map(|h| (h.score, Cand::Official(Arc::new(h))))
-                    .collect(),
-            );
-        }
+                    .collect()
+            })
+            .collect();
         drop(official);
         if let Some(ps) = personal.as_ref().filter(|_| self.cfg.scan_personal_index) {
             let mask = ps.book_mask(&include, &exclude);
@@ -780,8 +814,12 @@ impl SemanticService {
                 *e = (score, wi, c);
             }
         };
-        for (wi, v) in vectors.iter().enumerate() {
-            for h in official.scan(v, k, scope.as_deref())? {
+        for (wi, hits) in official
+            .scan_many(&vectors, k, scope.as_deref())?
+            .into_iter()
+            .enumerate()
+        {
+            for h in hits {
                 keep(h.score, wi, Cand::Official(Arc::new(h)));
             }
         }
@@ -1163,9 +1201,9 @@ impl SemanticService {
         win: u8,
     ) -> Option<Map<String, Value>> {
         let b = ps.books.get(bi)?;
-        let (lines, stale) = ps.lines_of(bi);
-        let lines = lines?;
-        let raw = lines.get(li as usize)?;
+        let li_u = li.max(0) as usize;
+        let rows: HashMap<usize, String> = ps.rows(bi, li_u, li_u + 3)?.into_iter().collect();
+        let raw = rows.get(&li_u)?;
         let text = strip_html(raw);
         if text.is_empty() {
             return None;
@@ -1182,14 +1220,17 @@ impl SemanticService {
                 if e < char_len(&t) { " …" } else { "" }
             );
         }
-        let mut j = li as usize + 1;
-        while char_len(&snippet) < 40 && j < lines.len() && j <= li as usize + 3 {
-            snippet = format!("{} {}", snippet, strip_html(&lines[j]))
+        for j in li_u + 1..=li_u + 3 {
+            if char_len(&snippet) >= 40 {
+                break;
+            }
+            let Some(next) = rows.get(&j) else { continue };
+            snippet = format!("{} {}", snippet, strip_html(next))
                 .trim()
                 .to_string();
-            j += 1;
         }
-        let mut hp = heading_path(&lines, li as usize);
+        let stale = ps.stale(bi);
+        let mut hp = ps.heading_path(bi, li_u);
         if hp
             .first()
             .is_some_and(|h| h.replace('"', "") == b.title.replace('"', ""))
@@ -1289,6 +1330,20 @@ impl SemanticService {
         let mut covered = Covered::default();
         let mut out: Vec<Map<String, Value>> = Vec::new();
         let mut counted = 0; // flagged hits (cited / echoing the note) are shown but not counted
+
+        // the personal and database books the first results will be shown from, readied at once
+        if let Some(ps) = ps {
+            ps.prefetch(
+                cands
+                    .iter()
+                    .take_while(|(score, _, _)| *score >= min_score)
+                    .take(3 * k)
+                    .filter_map(|(_, cand, _)| {
+                        self.cand_places(Some(ps), scope, cand).first()?.book
+                    }),
+                true,
+            );
+        }
         for (score, cand, wins) in cands {
             if *score < min_score || counted >= k || out.len() >= 3 * k {
                 break;
@@ -1573,20 +1628,29 @@ impl SemanticService {
             ))
         })?;
         let b = &ps.books[bi];
-        let (lines, _stale) = ps.lines_of(bi);
-        let lines = lines.ok_or_else(|| anyhow!("cannot read {} right now", b.title))?;
+        let (lo, hi) = (lo.max(0) as usize, hi.max(0) as usize);
+        let got = ps
+            .rows(bi, lo, hi)
+            .ok_or_else(|| anyhow!("cannot read {} right now", b.title))?;
+        // a line index the book skips reads as an empty line, as in a read of the whole book
+        let last = got.last().map(|r| r.0);
+        let mut got = got.into_iter().peekable();
         let mut rows = Vec::new();
-        let (lo, hi) = (
-            lo.max(0) as usize,
-            (hi.max(0) as usize).min(lines.len().saturating_sub(1)),
-        );
-        if !lines.is_empty() {
-            for li in lo..=hi {
-                if li >= lines.len() {
-                    break;
-                }
-                rows.push((li as i64, None, heading_path(&lines, li), lines[li].clone()));
+        for li in lo..=last.unwrap_or(0).min(hi) {
+            if last.is_none() {
+                break;
             }
+            let content = match got.peek() {
+                Some((i, _)) if *i == li => got.next().unwrap().1,
+                _ => String::new(),
+            };
+            // the headings only when asked for: they need the whole book read once
+            let toc = if with_toc {
+                ps.heading_path(bi, li)
+            } else {
+                Vec::new()
+            };
+            rows.push((li as i64, None, toc, content));
         }
         Ok(BookRows {
             title: b.title.clone(),
@@ -1701,12 +1765,19 @@ impl SemanticService {
         let mut seen: HashSet<(SourceKey, i64, i64)> = HashSet::new();
         let mut results: Vec<(Map<String, Value>, SourceRank)> = Vec::new();
         // every place of a candidate: the same text in several books is one vector of the set
-        let places = cands.iter().flat_map(|(score, cand)| {
-            self.cand_places(ps, run.scope.as_deref(), cand)
-                .into_iter()
-                .take(8)
-                .map(move |p| (score, p))
-        });
+        let places: Vec<(&f32, Place)> = cands
+            .iter()
+            .flat_map(|(score, cand)| {
+                self.cand_places(ps, run.scope.as_deref(), cand)
+                    .into_iter()
+                    .take(8)
+                    .map(move |p| (score, p))
+            })
+            .collect();
+        // the personal and database books among them, read at once
+        if let Some(ps) = ps {
+            ps.prefetch(places.iter().filter_map(|(_, p)| p.book), false);
+        }
         for (score, place) in places {
             let (src, bid, li) = (place.src, place.bid, place.li);
             if src == SourceKey::Official && !self.catalog.has_book(bid) {

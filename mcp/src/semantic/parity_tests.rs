@@ -210,10 +210,9 @@ fn urls_headings_and_small_helpers_match_python() {
     }
     for case in fx["headings"].as_array().unwrap() {
         let lines = strs(&case["lines"]);
-        assert_eq!(
-            heading_path(&lines, case["upto"].as_u64().unwrap() as usize),
-            strs(&case["path"])
-        );
+        let upto = case["upto"].as_u64().unwrap() as usize;
+        assert_eq!(heading_path(&lines, upto), strs(&case["path"]));
+        assert_eq!(HeadingIndex::build(&lines).path(upto), strs(&case["path"]));
     }
     for case in fx["trunc16"].as_array().unwrap() {
         assert_eq!(
@@ -228,5 +227,33 @@ fn urls_headings_and_small_helpers_match_python() {
         let (h, n) = text_hash(&strs(&case["lines"]));
         assert_eq!(h, case["hash"][0].as_str().unwrap());
         assert_eq!(n as u64, case["hash"][1].as_u64().unwrap());
+    }
+}
+
+/// The heading index answers as `heading_path` does, at every line of a book whose headings
+/// rise, fall and skip levels.
+#[test]
+fn heading_index_matches_heading_path_at_every_line() {
+    let raw = [
+        "intro",
+        "<h1>ספר</h1>",
+        "a",
+        "<h3>סימן א</h3>",
+        "b",
+        "<h2>חלק ב</h2>",
+        "c",
+        "<h3>סימן ב</h3>",
+        "<H4 class=x>סעיף</H4>",
+        "d",
+        "<h2>חלק ג</h2>",
+        "<h1>ספר ב</h1>",
+        "e",
+        "  <h5>deep</h5>",
+        "f",
+    ];
+    let lines: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
+    let index = HeadingIndex::build(&lines);
+    for upto in 0..lines.len() + 3 {
+        assert_eq!(index.path(upto), heading_path(&lines, upto), "line {upto}");
     }
 }
