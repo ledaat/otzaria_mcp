@@ -167,6 +167,21 @@ pub struct PersonalSet {
     cache: Mutex<Vec<(usize, Cached)>>,
     /// Open handles of attached databases, by file: see [`DbPool`].
     dbs: Mutex<HashMap<String, DbPool>>,
+    /// Headings and staleness of attached-database books, by book: see [`BookMeta`].
+    metas: Mutex<HashMap<usize, (FileSig, Arc<BookMeta>)>>,
+}
+
+/// A file's size and mtime: a book or database read is valid while they stay.
+type FileSig = (u64, Option<SystemTime>);
+
+/// What showing a line of an attached-database book needs beyond its own lines: the
+/// headings in force at each line, and whether the book changed since it was indexed. Built
+/// from one read of the whole book and kept (it is small); the lines themselves are read a
+/// few at a time ([`PersonalSet::rows`]). Database books can be tens of megabytes of text each,
+/// and a search touches dozens: kept whole they did not fit any cache.
+pub struct BookMeta {
+    heads: HeadingIndex,
+    pub stale: bool,
 }
 
 /// An open attached database: its connection and its line decompressor (every zstd
@@ -278,6 +293,7 @@ impl PersonalSet {
             by_set_name,
             cache: Mutex::new(Vec::new()),
             dbs: Mutex::new(HashMap::new()),
+            metas: Mutex::new(HashMap::new()),
         })
     }
 
@@ -510,28 +526,104 @@ impl PersonalSet {
         (Some(text), stale)
     }
 
-    /// Read the books `bis` names that are not cached yet, in parallel, so a request that will
-    /// show lines of many books reads them all at once instead of one after another.
-    pub fn prefetch(&self, bis: impl IntoIterator<Item = usize>) {
+    /// Ready what showing lines of the books `bis` names will need, in parallel, so a request
+    /// that shows lines of many books reads them all at once instead of one after another:
+    /// a personal file's text, and with `headings`, an attached book's [`BookMeta`] (its lines
+    /// are read a few at a time anyway).
+    pub fn prefetch(&self, bis: impl IntoIterator<Item = usize>, headings: bool) {
         let mut want: Vec<usize> = bis
             .into_iter()
-            .filter(|&bi| bi < self.books.len())
+            .filter(|&bi| {
+                self.books
+                    .get(bi)
+                    .is_some_and(|b| headings || !b.attached())
+            })
             .collect();
         want.sort_unstable();
         want.dedup();
         {
             let cache = self.cache.lock().unwrap();
-            want.retain(|bi| !cache.iter().any(|(i, _)| i == bi));
+            let metas = self.metas.lock().unwrap();
+            want.retain(|bi| {
+                if self.books[*bi].attached() {
+                    !metas.contains_key(bi)
+                } else {
+                    !cache.iter().any(|(i, _)| i == bi)
+                }
+            });
         }
+        let ready = |bi: usize| {
+            if self.books[bi].attached() {
+                self.meta(bi);
+            } else {
+                self.lines_of(bi);
+            }
+        };
         match want.len() {
             0 => {}
-            1 => {
-                self.lines_of(want[0]);
-            }
-            _ => want.par_iter().for_each(|&bi| {
-                self.lines_of(bi);
-            }),
+            1 => ready(want[0]),
+            _ => want.par_iter().for_each(|&bi| ready(bi)),
         }
+    }
+
+    /// Lines `lo..=hi` of a book that exist, with their indexes: an attached book's from its
+    /// database (only those lines), a personal file's from its cached text.
+    pub fn rows(&self, bi: usize, lo: usize, hi: usize) -> Option<Vec<(usize, String)>> {
+        let b = self.books.get(bi)?;
+        if !b.attached() {
+            let (text, _) = self.lines_of(bi);
+            let text = text?;
+            let hi = hi.min(text.len().saturating_sub(1));
+            if text.is_empty() || lo > hi {
+                return Some(Vec::new());
+            }
+            return Some((lo..=hi).map(|li| (li, text[li].clone())).collect());
+        }
+        self.with_db(b, |h| read_attached_range(h, b.book_id, lo, hi))
+            .ok()
+    }
+
+    /// The headings in force at line `li` of a book, outermost first.
+    pub fn heading_path(&self, bi: usize, li: usize) -> Vec<String> {
+        match self.books.get(bi) {
+            Some(b) if b.attached() => self.meta(bi).map_or_else(Vec::new, |m| m.heads.path(li)),
+            Some(_) => self
+                .lines_of(bi)
+                .0
+                .map_or_else(Vec::new, |t| t.heading_path(li)),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether a book's text changed since it was indexed (true when it cannot be read).
+    pub fn stale(&self, bi: usize) -> bool {
+        match self.books.get(bi) {
+            Some(b) if b.attached() => self.meta(bi).is_none_or(|m| m.stale),
+            Some(_) => self.lines_of(bi).1,
+            None => true,
+        }
+    }
+
+    /// An attached book's [`BookMeta`], built from one read of the whole book.
+    fn meta(&self, bi: usize) -> Option<Arc<BookMeta>> {
+        let b = self.books.get(bi)?;
+        let sig = signature(b)?;
+        if let Some((s, m)) = self.metas.lock().unwrap().get(&bi) {
+            if *s == sig {
+                return Some(m.clone());
+            }
+        }
+        let lines = self.read_book(b).ok()?;
+        let stale = match &b.hash {
+            Some(h) => text_hash(&lines).0 != *h,
+            None => Some(sig.0) != b.size,
+        };
+        let m = Arc::new(BookMeta {
+            heads: HeadingIndex::build(&lines),
+            stale,
+        });
+        self.metas.lock().unwrap().insert(bi, (sig, m.clone()));
+        Some(m)
     }
 
     /// A book's raw lines: a personal file, or an attached database's book through a pooled
@@ -540,6 +632,15 @@ impl PersonalSet {
         if !b.attached() {
             return read_book(b);
         }
+        self.with_db(b, |h| read_attached(h, b.book_id))
+    }
+
+    /// Run `f` with a pooled handle of an attached book's database.
+    fn with_db<T>(
+        &self,
+        b: &PersonalBook,
+        f: impl FnOnce(&mut DbHandle) -> Result<T>,
+    ) -> Result<T> {
         let db = b.db.as_deref().ok_or_else(|| anyhow!("no database path"))?;
         let sig = {
             let md = std::fs::metadata(db)?;
@@ -562,7 +663,7 @@ impl PersonalSet {
             Some(h) => h,
             None => open_attached(Path::new(db))?,
         };
-        let out = read_attached(&mut h, b.book_id);
+        let out = f(&mut h);
         if out.is_ok() {
             let mut dbs = self.dbs.lock().unwrap();
             if let Some(pool) = dbs.get_mut(db) {
@@ -677,6 +778,37 @@ fn open_attached(db: &Path) -> Result<DbHandle> {
     })
 }
 
+/// Lines `lo..=hi` of an attached book that exist, with their indexes.
+fn read_attached_range(
+    h: &mut DbHandle,
+    book: i64,
+    lo: usize,
+    hi: usize,
+) -> Result<Vec<(usize, String)>> {
+    if lo > hi {
+        return Ok(Vec::new());
+    }
+    let sql = if h.compressed {
+        "SELECT l.lineIndex, c.content FROM line l JOIN line_content c ON c.id = l.id WHERE l.bookId = ?1 AND l.lineIndex BETWEEN ?2 AND ?3 ORDER BY l.lineIndex"
+    } else {
+        "SELECT l.lineIndex, l.content FROM line l WHERE l.bookId = ?1 AND l.lineIndex BETWEEN ?2 AND ?3 ORDER BY l.lineIndex"
+    };
+    let mut stmt = h.conn.prepare_cached(sql)?;
+    let mut rows = stmt.query(rusqlite::params![book, lo as i64, hi as i64])?;
+    let mut out: Vec<(usize, String)> = Vec::new();
+    while let Some(r) = rows.next()? {
+        let li = r.get::<_, i64>(0)?.max(0) as usize;
+        let v: Value = r.get(1)?;
+        let text = h.codec.text_lossy(&v);
+        // a line index given twice: the later row, as a read of the whole book keeps it
+        match out.last_mut() {
+            Some(last) if last.0 == li => last.1 = text,
+            _ => out.push((li, text)),
+        }
+    }
+    Ok(out)
+}
+
 fn read_attached(h: &mut DbHandle, book: i64) -> Result<Vec<String>> {
     let sql = if h.compressed {
         "SELECT l.lineIndex, c.content FROM line l JOIN line_content c ON c.id = l.id WHERE l.bookId = ?1 ORDER BY l.lineIndex"
@@ -738,6 +870,7 @@ fn user_book_ids(db: &Path) -> Result<HashMap<String, i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::textutil::heading_path;
 
     /// Books of an attached database are read through pooled handles, in parallel by
     /// `prefetch`, and give the same lines and headings as a read of their own.
@@ -788,18 +921,38 @@ mod tests {
         )
         .unwrap();
         let ps = PersonalSet::open(dir.path(), None, false).unwrap();
-        ps.prefetch([0, 1, 1, 0, 5]);
-        assert_eq!(ps.cache.lock().unwrap().len(), 2);
+        // without headings an attached book needs nothing ahead: its lines are read a few
+        // at a time
+        ps.prefetch([0, 1], false);
+        assert!(ps.metas.lock().unwrap().is_empty());
+        ps.prefetch([0, 1, 1, 0, 5], true);
+        assert_eq!(ps.metas.lock().unwrap().len(), 2);
+        // whole attached books are not kept: only their headings and staleness
+        assert!(ps.cache.lock().unwrap().is_empty());
         // one handle back in the pool per parallel read at most, never more than DB_IDLE
         let idle = ps.dbs.lock().unwrap()[&*db.to_string_lossy()].idle.len();
         assert!((1..=2).contains(&idle), "{idle} idle handles");
         for (bi, bid, n) in [(0usize, 7i64, 40usize), (1, 9, 25)] {
-            let (text, _) = ps.lines_of(bi);
-            let text = text.unwrap();
-            assert_eq!(text.lines, attached_book_lines(&db, bid).unwrap());
-            assert_eq!(text.len(), n);
-            assert_eq!(text[3], format!("שורה {bid}-3"));
-            assert_eq!(text.heading_path(23), vec!["פרק 2".to_string()]);
+            let whole = attached_book_lines(&db, bid).unwrap();
+            assert_eq!(whole.len(), n);
+            let rows = ps.rows(bi, 18, 22).unwrap();
+            assert_eq!(
+                rows,
+                (18..=22).map(|i| (i, whole[i].clone())).collect::<Vec<_>>()
+            );
+            // past the end: the lines that exist
+            assert_eq!(ps.rows(bi, n - 2, n + 5).unwrap().len(), 2);
+            assert!(ps.rows(bi, n + 1, n + 5).unwrap().is_empty());
+            assert_eq!(ps.rows(bi, 3, 3).unwrap()[0].1, format!("שורה {bid}-3"));
+            for li in 0..n + 2 {
+                assert_eq!(
+                    ps.heading_path(bi, li),
+                    heading_path(&whole, li),
+                    "line {li}"
+                );
+            }
+            // no hash in books.json: stale when the database's size differs from `size` (none)
+            assert!(ps.stale(bi));
         }
     }
 }

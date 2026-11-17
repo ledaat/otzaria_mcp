@@ -1196,9 +1196,9 @@ impl SemanticService {
         win: u8,
     ) -> Option<Map<String, Value>> {
         let b = ps.books.get(bi)?;
-        let (lines, stale) = ps.lines_of(bi);
-        let lines = lines?;
-        let raw = lines.get(li as usize)?;
+        let li_u = li.max(0) as usize;
+        let rows: HashMap<usize, String> = ps.rows(bi, li_u, li_u + 3)?.into_iter().collect();
+        let raw = rows.get(&li_u)?;
         let text = strip_html(raw);
         if text.is_empty() {
             return None;
@@ -1215,14 +1215,17 @@ impl SemanticService {
                 if e < char_len(&t) { " …" } else { "" }
             );
         }
-        let mut j = li as usize + 1;
-        while char_len(&snippet) < 40 && j < lines.len() && j <= li as usize + 3 {
-            snippet = format!("{} {}", snippet, strip_html(&lines[j]))
+        for j in li_u + 1..=li_u + 3 {
+            if char_len(&snippet) >= 40 {
+                break;
+            }
+            let Some(next) = rows.get(&j) else { continue };
+            snippet = format!("{} {}", snippet, strip_html(next))
                 .trim()
                 .to_string();
-            j += 1;
         }
-        let mut hp = lines.heading_path(li as usize);
+        let stale = ps.stale(bi);
+        let mut hp = ps.heading_path(bi, li_u);
         if hp
             .first()
             .is_some_and(|h| h.replace('"', "") == b.title.replace('"', ""))
@@ -1322,7 +1325,8 @@ impl SemanticService {
         let mut covered = Covered::default();
         let mut out: Vec<Map<String, Value>> = Vec::new();
         let mut counted = 0; // flagged hits (cited / echoing the note) are shown but not counted
-                             // the personal and database books the first results will be shown from, read at once
+
+        // the personal and database books the first results will be shown from, readied at once
         if let Some(ps) = ps {
             ps.prefetch(
                 cands
@@ -1332,6 +1336,7 @@ impl SemanticService {
                     .filter_map(|(_, cand, _)| {
                         self.cand_places(Some(ps), scope, cand).first()?.book
                     }),
+                true,
             );
         }
         for (score, cand, wins) in cands {
@@ -1618,26 +1623,29 @@ impl SemanticService {
             ))
         })?;
         let b = &ps.books[bi];
-        let (lines, _stale) = ps.lines_of(bi);
-        let lines = lines.ok_or_else(|| anyhow!("cannot read {} right now", b.title))?;
+        let (lo, hi) = (lo.max(0) as usize, hi.max(0) as usize);
+        let got = ps
+            .rows(bi, lo, hi)
+            .ok_or_else(|| anyhow!("cannot read {} right now", b.title))?;
+        // a line index the book skips reads as an empty line, as in a read of the whole book
+        let last = got.last().map(|r| r.0);
+        let mut got = got.into_iter().peekable();
         let mut rows = Vec::new();
-        let (lo, hi) = (
-            lo.max(0) as usize,
-            (hi.max(0) as usize).min(lines.len().saturating_sub(1)),
-        );
-        if !lines.is_empty() {
-            for li in lo..=hi {
-                if li >= lines.len() {
-                    break;
-                }
-                // the headings only when asked for: a deep line of a large book is costly
-                let toc = if with_toc {
-                    lines.heading_path(li)
-                } else {
-                    Vec::new()
-                };
-                rows.push((li as i64, None, toc, lines[li].clone()));
+        for li in lo..=last.unwrap_or(0).min(hi) {
+            if last.is_none() {
+                break;
             }
+            let content = match got.peek() {
+                Some((i, _)) if *i == li => got.next().unwrap().1,
+                _ => String::new(),
+            };
+            // the headings only when asked for: they need the whole book read once
+            let toc = if with_toc {
+                ps.heading_path(bi, li)
+            } else {
+                Vec::new()
+            };
+            rows.push((li as i64, None, toc, content));
         }
         Ok(BookRows {
             title: b.title.clone(),
@@ -1763,7 +1771,7 @@ impl SemanticService {
             .collect();
         // the personal and database books among them, read at once
         if let Some(ps) = ps {
-            ps.prefetch(places.iter().filter_map(|(_, p)| p.book));
+            ps.prefetch(places.iter().filter_map(|(_, p)| p.book), false);
         }
         for (score, place) in places {
             let (src, bid, li) = (place.src, place.bid, place.li);
