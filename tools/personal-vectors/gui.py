@@ -29,6 +29,16 @@ def smoke(path):
         json.dump(out, f)
 
 
+RLM = "\u200f"
+
+
+def R(text):
+    """Right-to-left text for Tk and Windows message boxes, which lay a line out left to right:
+    a right-to-left mark at both ends of every line keeps punctuation and numbers at the edges
+    in their places (a sentence's final period on the left)."""
+    return "\n".join(RLM + line + RLM if line else line for line in str(text).split("\n"))
+
+
 def hours(n_passages, rate):
     secs = n_passages / max(rate, 1e-6)
     if secs < 90:
@@ -57,6 +67,10 @@ def main():
 
     import otzaria_personal_vectors as V
 
+    for name in ("askokcancel", "askyesno", "showinfo", "showerror"):
+        orig = getattr(messagebox, name)
+        setattr(messagebox, name, lambda title, msg, orig=orig: orig(R(title), R(msg)))
+
     root = tk.Tk()
     root.title("חיפוש לפי משמעות בספרים אישיים – אוצריא")
     root.geometry("720x520")
@@ -81,10 +95,10 @@ def main():
             pass
         root.after(100, pump)
 
-    head = tk.Label(root, text="חיפוש לפי משמעות בספרים האישיים ובמסדי הספרים המצורפים", font=big, anchor="e",
+    head = tk.Label(root, text=R("חיפוש לפי משמעות בספרים האישיים ובמסדי הספרים המצורפים"), font=big, anchor="e",
                     justify="right")
     head.pack(fill="x", padx=16, pady=(14, 6))
-    status = tk.Label(root, text="בודק מה יש במחשב…", font=font, anchor="ne", justify="right", wraplength=680)
+    status = tk.Label(root, text=R("בודק מה יש במחשב…"), font=font, anchor="ne", justify="right", wraplength=680)
     status.pack(fill="x", padx=16, pady=6)
     bar = ttk.Progressbar(root, mode="indeterminate", length=680)
     bar.pack(fill="x", padx=16, pady=(6, 2))
@@ -125,7 +139,10 @@ def main():
         log_text.configure(state="disabled")
 
     def set_status(text):
-        status.configure(text=text)
+        status.configure(text=R(text))
+
+    def set_prog(text):
+        progress.configure(text=R(text) if text else "")
 
     def set_progress(done, rate):
         total = max(state["total"], done)
@@ -134,7 +151,7 @@ def main():
             bar.configure(mode="determinate", maximum=max(total, 1))
         bar.configure(maximum=max(total, 1), value=done)
         left = max(total - done, 0)
-        progress.configure(text=f"חושבו {done:,} מתוך {total:,} קטעים ({rate:,.0f} בשנייה) – נותרו {hours(left, rate)}")
+        set_prog(f"חושבו {done:,} מתוך {total:,} קטעים ({rate:,.0f} בשנייה) – נותרו {hours(left, rate)}")
 
     def busy(on, indeterminate=True):
         state["busy"] = on
@@ -153,7 +170,7 @@ def main():
             on_ui(set_status, f"נמצאו {d['personal']:,} ספרים אישיים (txt) ו-{d['attached']:,} ספרים במסדים מצורפים. "
                               f"קורא את הספרים…")
         elif kind == "reading":
-            on_ui(progress.configure, {"text": f"נקראו {d['done']:,} מתוך {d['total']:,} ספרים"})
+            on_ui(set_prog, f"נקראו {d['done']:,} מתוך {d['total']:,} ספרים")
         elif kind == "model":
             where = "בכרטיס הגרפי" if d["device"] != "CPU" else "במעבד"
             on_ui(set_status, f"מחשב את הקטעים החסרים {where}. אפשר לעצור בכל רגע ולהמשיך אחר כך: מה שחושב נשמר.")
@@ -215,7 +232,7 @@ def main():
         busy(False)
         state["check"] = rep
         bar.configure(mode="determinate", value=0)
-        progress.configure(text="")
+        set_prog("")
         if rep is None:
             set_status("לא נמצאו ספרים אישיים (txt) או מסדי ספרים מצורפים באוצריא.")
             return
@@ -239,7 +256,7 @@ def main():
         bar.configure(mode="determinate", maximum=1, value=1)
         remove_b.configure(state="normal")
         if rep and rep.get("published"):
-            progress.configure(text="")
+            set_prog("")
             messagebox.showinfo("הסתיים", "הספרים נוספו לחיפוש לפי משמעות.\n\nפתחו את אוצריא ונסו.")
 
     def after_remove():
@@ -264,7 +281,7 @@ def main():
 
     def on_start():
         set_status("מתחיל…")
-        progress.configure(text="")
+        set_prog("")
         launch("start")
 
     def on_stop():
