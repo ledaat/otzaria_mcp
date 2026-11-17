@@ -36,12 +36,22 @@ jobs:
       - name: Screenshot of the window
         env:
           PYTHONIOENCODING: utf-8
+          SKIP_LAYOUTS: "1"
         run: |
           python tests/synth_e2e.py "$env:RUNNER_TEMP\shot" > $null
           python -c "import json,hashlib,pathlib; v=pathlib.Path(r'$env:RUNNER_TEMP\shot\otzaria\vectors'); raw=(v/'gen-000003'/'set.json').read_bytes(); (v/'CURRENT').write_text(json.dumps({'generation':3,'set':'gen-000003/set.json','set_sha256':hashlib.sha256(raw).hexdigest()},separators=(',',':')))"
           Remove-Item -Recurse -Force "$env:RUNNER_TEMP\shot\cache"
           python tests/screenshot.py dist\OtzariaPersonalVectors.exe "$env:RUNNER_TEMP\shot" "$env:RUNNER_TEMP\screenshot.png"
           python -c "import base64,sys; from PIL import Image; im=Image.open(sys.argv[1]).convert('RGB'); im.thumbnail((1280,1280)); im.save(sys.argv[2], quality=60); b=base64.b64encode(open(sys.argv[2],'rb').read()).decode(); [print('SHOT', b[i:i+3000]) for i in range(0, len(b), 3000)]" "$env:RUNNER_TEMP\screenshot.png" "$env:RUNNER_TEMP\screenshot.jpg"
+      - name: Screenshot of the window when Otzaria's folders are not found
+        env:
+          PYTHONIOENCODING: utf-8
+          WAIT: "20"
+          ProgramData: ${{ runner.temp }}\nothing
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\empty" > $null
+          python tests/screenshot.py dist\OtzariaPersonalVectors.exe "$env:RUNNER_TEMP\empty" "$env:RUNNER_TEMP\screenshot2.png"
+          python -c "import base64,sys; from PIL import Image; im=Image.open(sys.argv[1]).convert('RGB'); im.thumbnail((1280,1280)); im.save(sys.argv[2], quality=60); b=base64.b64encode(open(sys.argv[2],'rb').read()).decode(); [print('SHOT2', b[i:i+3000]) for i in range(0, len(b), 3000)]" "$env:RUNNER_TEMP\screenshot2.png" "$env:RUNNER_TEMP\screenshot2.jpg"
       - uses: actions/upload-artifact@v4
         with:
           name: OtzariaPersonalVectors

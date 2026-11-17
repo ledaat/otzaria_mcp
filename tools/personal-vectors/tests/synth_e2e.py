@@ -238,4 +238,5 @@ def layouts(root):
 if __name__ == "__main__":
     where = Path(sys.argv[1] if len(sys.argv) > 1 else "e2e").resolve()
     main()
-    layouts(where)
+    if not os.environ.get("SKIP_LAYOUTS"):
+        layouts(where)

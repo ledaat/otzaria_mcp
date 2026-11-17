@@ -30,6 +30,7 @@ def smoke(path):
 
 
 RLM = "\u200f"
+LRE, PDF = "\u202a", "\u202c"   # a left-to-right stretch (a path) inside right-to-left text
 
 
 def R(text):
@@ -49,10 +50,11 @@ def hours(n_passages, rate):
 
 
 HEBREW_ERRORS = [
-    ("no vector set", "לא נמצאו הווקטורים של החיפוש לפי משמעות של אוצריא.\n"
-                      "• אם הספרייה של אוצריא נמצאת בתיקייה אחרת (למשל C:\\ProgramData\\otzaria או כונן אחר), "
-                      "לחצו 'בחר תיקיית אוצריא…' ובחרו את התיקייה שבה נמצאת תיקיית books של אוצריא.\n"
-                      "• אחרת, פתחו את אוצריא, הפעילו פעם אחת חיפוש לפי משמעות וחכו שההורדה תסתיים, ואז נסו שוב."),
+    ("no vector set", "לא נמצאו הווקטורים של החיפוש לפי משמעות של אוצריא.\n\n"
+                      "אם הספרייה של אוצריא נמצאת בתיקייה אחרת, לחצו על 'בחר תיקיית אוצריא' ובחרו את התיקייה "
+                      "שבתוכה נמצאת התיקייה books. למשל:\n"
+                      + "\u202a" + "C:\\ProgramData\\otzaria" + "\u202c" + "\n\n"
+                      "אחרת, פתחו את אוצריא, הפעילו פעם אחת חיפוש לפי משמעות, חכו שההורדה תסתיים ונסו שוב."),
     ("no model folder", "לא נמצא מודל החיפוש לפי משמעות בתיקיית הספרים של אוצריא. פתחו את אוצריא, "
                         "הפעילו פעם אחת חיפוש לפי משמעות וחכו שההורדה תסתיים, ואז נסו שוב."),
     ("is locked", "אוצריא מעדכנת כעת את הווקטורים. חכו שהעדכון יסתיים ונסו שוב."),
@@ -127,7 +129,7 @@ def main():
     stop_b = ttk.Button(buttons, text="עצור", state="disabled")
     remove_b = ttk.Button(buttons, text="הסר מאוצריא", state="disabled")
     details_b = ttk.Button(buttons, text="פרטים")
-    choose_b = ttk.Button(buttons, text="בחר תיקיית אוצריא…")
+    choose_b = ttk.Button(buttons, text=R("בחר תיקיית אוצריא…"))
     for b in (start_b, stop_b, remove_b):
         b.pack(side="right", padx=4)
     details_b.pack(side="left", padx=4)
@@ -187,7 +189,7 @@ def main():
     # ---- hooks (called from the worker thread)
     def on_event(kind, **d):
         if kind == "locations":
-            on_ui(where.configure, {"text": R(f"אוצריא: {d['library']}")})
+            on_ui(where.configure, {"text": R(f"תיקיית אוצריא: {LRE}{d['library']}{PDF}")})
         elif kind == "books":
             on_ui(set_status, f"נמצאו {d['personal']:,} ספרים אישיים (txt) ו-{d['attached']:,} ספרים במסדים מצורפים. "
                               f"קורא את הספרים…")
@@ -296,6 +298,7 @@ def main():
 
     def after_error(heb, text):
         busy(False)
+        bar.configure(mode="determinate", value=0)
         set_status(heb or "אירעה שגיאה. לחצו 'פרטים' כדי לראות אותה.")
         if not heb:
             messagebox.showerror("שגיאה", text)
@@ -311,8 +314,8 @@ def main():
         folder = os.path.normpath(folder)
         loc = V.Locations(root=folder)
         if not (loc.vectors / "CURRENT").exists():
-            messagebox.showerror("לא נמצא", f"בתיקייה הזו אין את הווקטורים של אוצריא:\n{folder}\n\n"
-                                             f"בחרו את התיקייה שבה נמצאות התיקיות books ו-vectors.")
+            messagebox.showerror("לא נמצא", f"בתיקייה הזו אין את הווקטורים של אוצריא:\n{LRE}{folder}{PDF}\n\n"
+                                             f"בחרו את התיקייה שבתוכה נמצאות התיקיות books ו-vectors.")
             return
         prefs["library_dir"] = folder
         save_prefs(prefs)
