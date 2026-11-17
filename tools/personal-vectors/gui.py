@@ -49,8 +49,10 @@ def hours(n_passages, rate):
 
 
 HEBREW_ERRORS = [
-    ("no vector set", "לא נמצאו הווקטורים של אוצריא. פתחו את אוצריא, הפעילו פעם אחת חיפוש לפי משמעות "
-                      "וחכו שההורדה תסתיים, ואז נסו שוב."),
+    ("no vector set", "לא נמצאו הווקטורים של החיפוש לפי משמעות של אוצריא.\n"
+                      "• אם הספרייה של אוצריא נמצאת בתיקייה אחרת (למשל C:\\ProgramData\\otzaria או כונן אחר), "
+                      "לחצו 'בחר תיקיית אוצריא…' ובחרו את התיקייה שבה נמצאת תיקיית books של אוצריא.\n"
+                      "• אחרת, פתחו את אוצריא, הפעילו פעם אחת חיפוש לפי משמעות וחכו שההורדה תסתיים, ואז נסו שוב."),
     ("no model folder", "לא נמצא מודל החיפוש לפי משמעות בתיקיית הספרים של אוצריא. פתחו את אוצריא, "
                         "הפעילו פעם אחת חיפוש לפי משמעות וחכו שההורדה תסתיים, ואז נסו שוב."),
     ("is locked", "אוצריא מעדכנת כעת את הווקטורים. חכו שהעדכון יסתיים ונסו שוב."),
@@ -63,7 +65,7 @@ HEBREW_ERRORS = [
 
 def main():
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, ttk
 
     import otzaria_personal_vectors as V
 
@@ -80,6 +82,19 @@ def main():
     style = ttk.Style()
     style.configure("TButton", font=font, padding=6)
 
+    prefs_path = V.default_cache_dir() / "settings.json"
+
+    def load_prefs():
+        try:
+            return json.loads(prefs_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def save_prefs(d):
+        prefs_path.parent.mkdir(parents=True, exist_ok=True)
+        prefs_path.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+
+    prefs = load_prefs()
     ui = queue.Queue()            # (function, args) to run on the window's thread
     state = {"check": None, "busy": False, "total": 0, "details": False}
 
@@ -112,9 +127,13 @@ def main():
     stop_b = ttk.Button(buttons, text="עצור", state="disabled")
     remove_b = ttk.Button(buttons, text="הסר מאוצריא", state="disabled")
     details_b = ttk.Button(buttons, text="פרטים")
+    choose_b = ttk.Button(buttons, text="בחר תיקיית אוצריא…")
     for b in (start_b, stop_b, remove_b):
         b.pack(side="right", padx=4)
     details_b.pack(side="left", padx=4)
+    choose_b.pack(side="left", padx=4)
+    where = tk.Label(root, text="", font=("Segoe UI", 9), fg="#666", anchor="e", justify="right")
+    where.pack(fill="x", padx=16)
 
     log_frame = tk.Frame(root)
     log_text = tk.Text(log_frame, height=12, font=("Consolas", 9), wrap="word", state="disabled")
@@ -157,6 +176,7 @@ def main():
         state["busy"] = on
         start_b.configure(state="disabled")
         remove_b.configure(state="disabled")
+        choose_b.configure(state="disabled" if on else "normal")
         stop_b.configure(state="normal" if on else "disabled")
         if on and indeterminate:
             bar.configure(mode="indeterminate", value=0)
@@ -166,14 +186,16 @@ def main():
 
     # ---- hooks (called from the worker thread)
     def on_event(kind, **d):
-        if kind == "books":
+        if kind == "locations":
+            on_ui(where.configure, {"text": R(f"אוצריא: {d['library']}")})
+        elif kind == "books":
             on_ui(set_status, f"נמצאו {d['personal']:,} ספרים אישיים (txt) ו-{d['attached']:,} ספרים במסדים מצורפים. "
                               f"קורא את הספרים…")
         elif kind == "reading":
             on_ui(set_prog, f"נקראו {d['done']:,} מתוך {d['total']:,} ספרים")
         elif kind == "model":
-            where = "בכרטיס הגרפי" if d["device"] != "CPU" else "במעבד"
-            on_ui(set_status, f"מחשב את הקטעים החסרים {where}. אפשר לעצור בכל רגע ולהמשיך אחר כך: מה שחושב נשמר.")
+            dev = "בכרטיס הגרפי" if d["device"] != "CPU" else "במעבד"
+            on_ui(set_status, f"מחשב את הקטעים החסרים {dev}. אפשר לעצור בכל רגע ולהמשיך אחר כך: מה שחושב נשמר.")
         elif kind == "published":
             on_ui(set_status, "הסתיים. פתחו את אוצריא: החיפוש לפי משמעות מוצא עכשיו גם את הספרים האלה.")
         elif kind in ("nothing", "unchanged"):
@@ -199,7 +221,8 @@ def main():
 
     def args_for(check=False, remove=False):
         return argparse.Namespace(
-            check=check, remove=remove, gpu="auto", otzaria_dir=str(V.default_otzaria_dir()), vectors_dir="",
+            check=check, remove=remove, gpu="auto", otzaria_dir="", library_dir=prefs.get("library_dir", ""),
+            vectors_dir="",
             model_dir="", cache_dir=str(V.default_cache_dir()), threads=0,
             workers=max(1, min(4, (os.cpu_count() or 2) - 1)), group=20000, force=False, self_test=None)
 
@@ -279,6 +302,23 @@ def main():
         start_b.configure(state="normal" if (state["check"] or {}).get("to_publish") else "disabled")
         remove_b.configure(state="normal")
 
+    def on_choose():
+        folder = filedialog.askdirectory(
+            title="בחרו את התיקייה של אוצריא (זו שיש בה books ו-vectors)",
+            initialdir=prefs.get("library_dir") or os.environ.get("ProgramData") or "C:\\")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        loc = V.Locations(root=folder)
+        if not (loc.vectors / "CURRENT").exists():
+            messagebox.showerror("לא נמצא", f"בתיקייה הזו אין את הווקטורים של אוצריא:\n{folder}\n\n"
+                                             f"בחרו את התיקייה שבה נמצאות התיקיות books ו-vectors.")
+            return
+        prefs["library_dir"] = folder
+        save_prefs(prefs)
+        set_status("בודק מה יש במחשב…")
+        launch("check")
+
     def on_start():
         set_status("מתחיל…")
         set_prog("")
@@ -304,6 +344,7 @@ def main():
     start_b.configure(command=on_start)
     stop_b.configure(command=on_stop)
     remove_b.configure(command=on_remove)
+    choose_b.configure(command=on_choose)
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.after(100, pump)
     root.after(300, lambda: launch("check"))

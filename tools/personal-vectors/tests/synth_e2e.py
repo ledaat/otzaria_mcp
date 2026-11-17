@@ -179,5 +179,63 @@ def main():
         out = subprocess.run([CHECK, str(vdir)], capture_output=True, text=True); print(out.stdout[:400], out.stderr[-500:])
 
 
+def hive_frame(key, value):
+    k, v = key.encode(), value.encode()
+    f = bytes([1, len(k)]) + k + bytes([4]) + struct.pack("<I", len(v)) + v
+    return struct.pack("<I", len(f) + 8) + f + b"\0\0\0\0"
+
+
+def layouts(root):
+    """Otzaria's library elsewhere than its settings, as in an installation for all users
+    (C:\\ProgramData\\otzaria): found through the library-path setting, through %ProgramData%,
+    and through a folder the user names."""
+    otz = root / "otzaria"
+    pd = root / "programdata" / "otzaria"
+    shutil.rmtree(root / "programdata", ignore_errors=True)
+    pd.mkdir(parents=True)
+    for d in ("books", "vectors", "databases"):
+        shutil.move(str(otz / d), str(pd / d))
+    hive = (otz / "app_preferences.hive").read_bytes()
+
+    def check(label, *extra, env=None):
+        old = dict(os.environ)
+        os.environ.update(env or {})
+        try:
+            sys.argv = ["x", "--check", "--cache-dir", str(root / "cache"), "--workers", "2", *extra]
+            events = []
+            V.HOOKS["event"] = lambda kind, **d: events.append((kind, d))
+            try:
+                V.main()
+                rc = 0
+            except SystemExit as e:
+                rc = e.code
+        finally:
+            os.environ.clear(); os.environ.update(old)
+            V.HOOKS["event"] = None
+        loc = next((d for k, d in events if k == "locations"), {})
+        summ = next((d for k, d in events if k == "summary"), {})
+        print(f"== {label}: exit {rc}, vectors {loc.get('vectors')}, books {summ.get('books')}")
+        assert rc == 0 and loc.get("vectors") == str(pd / "vectors") and summ.get("books") == 7, (label, rc, loc, summ)
+
+    # 1. the setting key-library-path names the library (an installation for all users)
+    (otz / "app_preferences.hive").write_bytes(hive + hive_frame("key-library-path", str(pd / "books")))
+    check("library-path setting", "--otzaria-dir", str(otz))
+    # 2. no setting: %ProgramData%\\otzaria
+    (otz / "app_preferences.hive").write_bytes(hive)
+    check("ProgramData", "--otzaria-dir", str(otz), env={"ProgramData": str(root / "programdata")})
+    # 3. no setting, nothing standard: the folder the user picks
+    check("chosen folder", "--otzaria-dir", str(otz), "--library-dir", str(pd))
+    # and the user picks the folder holding the settings too (a portable copy: otzaria_data)
+    port = root / "portable"; shutil.rmtree(port, ignore_errors=True); (port / "otzaria_data").mkdir(parents=True)
+    shutil.copytree(otz, port / "otzaria_data", dirs_exist_ok=True)
+    (port / "otzaria_data" / "app_preferences.hive").write_bytes(hive + hive_frame("key-library-path", str(pd / "books")))
+    sys.argv = ["x"]
+    loc = V.Locations(root=port)
+    assert loc.data == port / "otzaria_data" and loc.vectors == pd / "vectors", (loc.data, loc.vectors)
+    print("LAYOUTS OK")
+
+
 if __name__ == "__main__":
+    where = Path(sys.argv[1] if len(sys.argv) > 1 else "e2e").resolve()
     main()
+    layouts(where)

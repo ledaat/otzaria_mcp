@@ -270,13 +270,79 @@ def default_cache_dir():
     return Path(base) / "otzaria-personal-vectors"
 
 
-def books_dir_of(otzaria_dir):
-    lp = Path(otzaria_dir) / "library_path.txt"
-    if lp.exists():
-        p = Path(lp.read_text(encoding="utf-8-sig").strip())
-        if p.exists():
-            return p
-    return Path(otzaria_dir) / "books"
+def _read_text(path):
+    try:
+        t = Path(path).read_text(encoding="utf-8-sig").strip()
+        return t or None
+    except OSError:
+        return None
+
+
+def program_data_root():
+    return Path(os.environ.get("ProgramData") or r"C:\ProgramData") / "otzaria"
+
+
+class Locations:
+    r"""Where Otzaria keeps what this script reads and writes, found as Otzaria finds it
+    (lib/core/app_paths.dart, semantic_paths.dart):
+
+    data      its settings (app_preferences.hive): %APPDATA%\otzaria, or otzaria_data beside
+              otzaria.exe for a portable copy;
+    library   the library folder (books): the setting key-library-path, else library_path.txt in
+              the data folder, else <data>\books, or C:\ProgramData\otzaria\books for an
+              installation for all users;
+    vectors   <the library's parent>\vectors;
+    db_dir    the folder of seforim.db (library_database_path.txt), with the model folder in it;
+    databases user_books.db: the setting key-databases-path, else <data>\databases when it
+              exists, else <the library's parent>\databases.
+
+    `data` / `root`: folders the user named; `root` is a folder holding vectors (and usually books),
+    such as C:\ProgramData\otzaria, or a portable copy's folder."""
+
+    def __init__(self, data=None, root=None, vectors=None):
+        root = Path(root) if root else None
+        if root is not None and data is None:
+            for cand in (root, root / "otzaria_data"):
+                if (cand / "app_preferences.hive").exists():
+                    data = cand
+                    break
+        self.data = Path(data) if data else default_otzaria_dir()
+        try:
+            self.prefs = read_hive_strings(self.data / "app_preferences.hive")
+        except OSError:
+            self.prefs = {}
+        lib = self.prefs.get("key-library-path") or _read_text(self.data / "library_path.txt")
+        candidates = []
+        if root is not None:
+            candidates += [root / "books", root]
+        if lib:
+            candidates.append(Path(lib))
+        candidates += [self.data / "books", program_data_root() / "books"]
+        # the library whose parent holds Otzaria's vector set
+        self.library = next((c for c in candidates if (c.parent / "vectors" / "CURRENT").exists()
+                             or (c / "vectors" / "CURRENT").exists() and c == root), None)
+        if self.library is None:
+            self.library = next((c for c in candidates if c.exists()), candidates[0])
+        if root is not None and (root / "vectors" / "CURRENT").exists():
+            self.vectors = root / "vectors"
+        else:
+            self.vectors = self.library.parent / "vectors"
+        if vectors:
+            self.vectors = Path(vectors)
+        dbd = _read_text(self.data / "library_database_path.txt")
+        self.db_dirs = [Path(dbd)] if dbd else []
+        self.db_dirs += [self.library, self.library.parent / "books"]
+        saved = self.prefs.get("key-databases-path")
+        if saved:
+            self.databases = Path(saved)
+        elif (self.data / "databases").exists():
+            self.databases = self.data / "databases"
+        else:
+            self.databases = self.library.parent / "databases"
+
+    def describe(self):
+        return (f"settings {self.data}; library {self.library}; vectors {self.vectors}; "
+                f"personal books list {self.databases / 'user_books.db'}")
 
 
 def ro_uri(path):
@@ -324,6 +390,7 @@ def read_hive_strings(path):
 
 
 def otzaria_settings(otzaria_dir):
+    """`otzaria_dir`: the data folder (where app_preferences.hive is)."""
     """What Otzaria itself is configured with: personal folders and attached databases."""
     otzaria_dir = Path(otzaria_dir)
     s = {"custom_folders": [], "attached": [], "attached_folders": [], "error": None}
@@ -451,9 +518,9 @@ class BookDB:
             yield cur, self._assemble(acc)
 
 
-def user_books(otzaria_dir):
+def user_books(databases_dir):
     """Personal .txt books: [(name, title, path)], and how many of another format were skipped."""
-    db = Path(otzaria_dir) / "databases" / "user_books.db"
+    db = Path(databases_dir) / "user_books.db"
     if not db.exists():
         return [], 0
     try:
@@ -1225,14 +1292,15 @@ class Embedder:
             self.batch_tokens = 1
 
 
-def find_model_dir(books_dir, family):
-    for mj in sorted(Path(books_dir).glob("*/model.json")):
+def find_model_dir(folders, family):
+    folders = [folders] if isinstance(folders, (str, Path)) else list(folders)
+    for mj in [m for f in folders for m in sorted(Path(f).glob("*/model.json"))]:
         try:
             if json.loads(mj.read_text(encoding="utf-8-sig")).get("family_id") == family:
                 return mj.parent
         except (OSError, ValueError):
             continue
-    raise RuntimeError(f"no model folder for {family} in {books_dir}: open Otzaria's semantic search once "
+    raise RuntimeError(f"no model folder for {family} in {folders[0]}: open Otzaria's semantic search once "
                        f"so it downloads the model, or pass --model-dir")
 
 
@@ -1243,8 +1311,15 @@ def is_ours(seg):
 
 
 def run(args):
-    otz = Path(args.otzaria_dir)
-    vdir = Path(args.vectors_dir) if args.vectors_dir else otz / "vectors"
+    loc = Locations(data=args.otzaria_dir or None, root=getattr(args, "library_dir", None) or None,
+                    vectors=args.vectors_dir or None)
+    log(f"Otzaria: {loc.describe()}")
+    emit("locations", data=str(loc.data), library=str(loc.library), vectors=str(loc.vectors))
+    otz = loc.data
+    vdir = loc.vectors
+    if not (vdir / "CURRENT").exists():
+        raise RuntimeError(f"no vector set in {vdir} (no CURRENT): has Otzaria downloaded its semantic search? "
+                           f"Otherwise name Otzaria's folder with --library-dir")
     live = LiveSet(vdir)
     doc = live.doc
     model = doc["identity"]["model"]
@@ -1286,7 +1361,7 @@ def run(args):
     if hashlib.sha256(params).hexdigest() != doc["codec_params_sha256"]:
         raise RuntimeError("the base segment's codec parameters are not the set's")
     rot = Rot(params)
-    model_dir = Path(args.model_dir) if args.model_dir else find_model_dir(books_dir_of(otz), family)
+    model_dir = Path(args.model_dir) if args.model_dir else find_model_dir(loc.db_dirs, family)
     mj = json.loads((model_dir / "model.json").read_text(encoding="utf-8-sig"))
     if mj.get("family_id") != family:
         raise RuntimeError(f"{model_dir} holds {mj.get('family_id')}, the set {family}")
@@ -1298,7 +1373,7 @@ def run(args):
     settings = otzaria_settings(otz)
     if settings.get("error"):
         log(f"  {settings['error']}: attached databases are left out")
-    ubooks, skipped = user_books(otz)
+    ubooks, skipped = user_books(loc.databases)
     abooks, db_report = attached_books(settings)
     log(f"personal books: {len(ubooks):,} .txt" + (f" ({skipped} of another format skipped)" if skipped else ""))
     emit("books", personal=len(ubooks), skipped=skipped, attached=len(abooks), databases=db_report)
@@ -1522,9 +1597,11 @@ def main():
     ap.add_argument("--gpu", action="store_true", help="embed on a GPU (onnxruntime-gpu / onnxruntime-directml)")
     ap.add_argument("--auto-gpu", dest="gpu", action="store_const", const="auto",
                     help="use a GPU when there is one that works, else the CPU")
-    ap.add_argument("--otzaria-dir", default=str(default_otzaria_dir()), help="Otzaria's data folder (default: %%APPDATA%%\\otzaria)")
-    ap.add_argument("--vectors-dir", default="", help="Otzaria's vector set (default: <otzaria-dir>\\vectors)")
-    ap.add_argument("--model-dir", default="", help="the model folder (default: found in Otzaria's books folder)")
+    ap.add_argument("--library-dir", default="", help="Otzaria's folder that holds books and vectors, when it is not "
+                    "found by itself (e.g. C:\\ProgramData\\otzaria, or a portable copy's folder)")
+    ap.add_argument("--otzaria-dir", default="", help="Otzaria's settings folder (default: %%APPDATA%%\\otzaria)")
+    ap.add_argument("--vectors-dir", default="", help="Otzaria's vector set (default: beside the library folder)")
+    ap.add_argument("--model-dir", default="", help="the model folder (default: found beside seforim.db)")
     ap.add_argument("--cache-dir", default=str(default_cache_dir()), help="the embedded vectors (default: %%LOCALAPPDATA%%\\otzaria-personal-vectors)")
     ap.add_argument("--threads", type=int, default=0, help="CPU threads for the model (default: all)")
     ap.add_argument("--workers", type=int, default=max(1, min(4, (os.cpu_count() or 2) - 1)), help="processes reading the books")
