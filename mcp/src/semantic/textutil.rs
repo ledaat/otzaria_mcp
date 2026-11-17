@@ -456,6 +456,51 @@ pub fn heading_path(raw_lines: &[String], upto: usize) -> Vec<String> {
     stack.into_iter().map(|(_, v)| v).collect()
 }
 
+/// [`heading_path`] for every line of a book at once: built in one pass over the book, then
+/// each line's path is a binary search. `heading_path(lines, upto)` rescans the book from its
+/// first line, which a deep line of a large book (tens of thousands of lines) pays for each
+/// time it is shown.
+#[derive(Debug, Default)]
+pub struct HeadingIndex {
+    /// The lines that are headings, in order.
+    at: Vec<usize>,
+    /// The path in force from each of them on (`heading_path` at that line).
+    paths: Vec<std::sync::Arc<[String]>>,
+}
+
+impl HeadingIndex {
+    pub fn build(raw_lines: &[String]) -> HeadingIndex {
+        let mut stack: Vec<(u8, String)> = Vec::new();
+        let mut out = HeadingIndex::default();
+        for (i, x) in raw_lines.iter().enumerate() {
+            if let Ok(Some(m)) = HEADING_RE.captures(x) {
+                let level: u8 = m[1].parse().unwrap_or(1);
+                stack.retain(|(k, _)| *k < level);
+                stack.push((level, line_text(&m[2])));
+                let mut sorted = stack.clone();
+                sorted.sort_by_key(|(k, _)| *k);
+                out.at.push(i);
+                out.paths.push(
+                    sorted
+                        .into_iter()
+                        .map(|(_, v)| v)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+        }
+        out
+    }
+
+    /// The headings in force at line `upto`, outermost first: `heading_path(lines, upto)`.
+    pub fn path(&self, upto: usize) -> Vec<String> {
+        match self.at.partition_point(|&i| i <= upto) {
+            0 => Vec::new(),
+            n => self.paths[n - 1].to_vec(),
+        }
+    }
+}
+
 pub fn is_heading(raw: &str) -> bool {
     matches!(HEADING_RE.is_match(raw), Ok(true))
 }

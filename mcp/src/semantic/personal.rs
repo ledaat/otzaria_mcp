@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
@@ -19,7 +19,7 @@ use crate::text::LineCodec;
 
 use super::calibration::window_penalty;
 use super::catalog::{connect_ro, has_table};
-use super::textutil::SourceKey;
+use super::textutil::{HeadingIndex, SourceKey};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonalBook {
@@ -100,9 +100,50 @@ pub fn norm_path(p: &str) -> String {
     }
 }
 
+/// A personal or database book's raw lines, with its headings indexed on first use.
+pub struct BookText {
+    pub lines: Vec<String>,
+    heads: OnceLock<HeadingIndex>,
+    bytes: usize,
+}
+
+impl BookText {
+    fn new(lines: Vec<String>) -> BookText {
+        let bytes = lines.iter().map(|l| l.len() + 24).sum::<usize>() + 64;
+        BookText {
+            lines,
+            heads: OnceLock::new(),
+            bytes,
+        }
+    }
+
+    /// The headings in force at line `upto`, outermost first ([`heading_path`] of the lines,
+    /// without rescanning the book).
+    ///
+    /// [`heading_path`]: super::textutil::heading_path
+    pub fn heading_path(&self, upto: usize) -> Vec<String> {
+        self.heads
+            .get_or_init(|| HeadingIndex::build(&self.lines))
+            .path(upto)
+    }
+}
+
+impl std::ops::Deref for BookText {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Vec<String> {
+        &self.lines
+    }
+}
+
+/// The book text cache's budget: the books most recently read, up to this many bytes of text
+/// (and at least the one just read). A search that touches many large database books (a
+/// quotation checked at each of its places) no longer reads the same book again and again.
+const CACHE_BYTES: usize = 384 << 20;
+const CACHE_BOOKS: usize = 256;
+
 struct Cached {
     sig: (u64, Option<SystemTime>),
-    lines: std::sync::Arc<Vec<String>>,
+    text: Arc<BookText>,
     stale: bool,
 }
 
@@ -400,8 +441,9 @@ impl PersonalSet {
         dot * self.scale(slot) - pen
     }
 
-    /// The raw lines of a book (a small cache), and whether its text changed since indexing.
-    pub fn lines_of(&self, bi: usize) -> (Option<std::sync::Arc<Vec<String>>>, bool) {
+    /// The raw lines of a book, and whether its text changed since indexing. Kept in a cache
+    /// of the books most recently used (see [`CACHE_BYTES`]).
+    pub fn lines_of(&self, bi: usize) -> (Option<Arc<BookText>>, bool) {
         let Some(b) = self.books.get(bi) else {
             return (None, true);
         };
@@ -410,33 +452,39 @@ impl PersonalSet {
             None => return (None, true),
         };
         {
-            let cache = self.cache.lock().unwrap();
-            if let Some((_, c)) = cache.iter().find(|(i, c)| *i == bi && c.sig == sig) {
-                return (Some(c.lines.clone()), c.stale);
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(pos) = cache.iter().position(|(i, c)| *i == bi && c.sig == sig) {
+                // most recently used last
+                let e = cache.remove(pos);
+                let out = (Some(e.1.text.clone()), e.1.stale);
+                cache.push(e);
+                return out;
             }
         }
         let lines = match read_book(b) {
-            Ok(l) => std::sync::Arc::new(l),
+            Ok(l) => l,
             Err(_) => return (None, true),
         };
         let stale = match &b.hash {
             Some(h) => text_hash(&lines).0 != *h,
             None => Some(sig.0) != b.size,
         };
+        let text = Arc::new(BookText::new(lines));
         let mut cache = self.cache.lock().unwrap();
         cache.retain(|(i, _)| *i != bi);
         cache.push((
             bi,
             Cached {
                 sig,
-                lines: lines.clone(),
+                text: text.clone(),
                 stale,
             },
         ));
-        if cache.len() > 24 {
-            cache.remove(0);
+        let mut total: usize = cache.iter().map(|(_, c)| c.text.bytes).sum();
+        while cache.len() > 1 && (total > CACHE_BYTES || cache.len() > CACHE_BOOKS) {
+            total -= cache.remove(0).1.text.bytes;
         }
-        (Some(lines), stale)
+        (Some(text), stale)
     }
 }
 

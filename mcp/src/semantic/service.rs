@@ -18,9 +18,9 @@ use super::feedback::Outbox;
 use super::official::{Official, OfficialConfig};
 use super::personal::PersonalSet;
 use super::textutil::{
-    char_len, char_prefix, char_slice, clean_markdown, heading_path, line_text, norm_word,
-    note_windows, parse_book_url, round_to, strip_data_uris, strip_html, strip_nikud, window_span,
-    EchoReference, SourceKey,
+    char_len, char_prefix, char_slice, clean_markdown, line_text, norm_word, note_windows,
+    parse_book_url, round_to, strip_data_uris, strip_html, strip_nikud, window_span, EchoReference,
+    SourceKey,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1189,7 +1189,7 @@ impl SemanticService {
                 .to_string();
             j += 1;
         }
-        let mut hp = heading_path(&lines, li as usize);
+        let mut hp = lines.heading_path(li as usize);
         if hp
             .first()
             .is_some_and(|h| h.replace('"', "") == b.title.replace('"', ""))
@@ -1585,7 +1585,13 @@ impl SemanticService {
                 if li >= lines.len() {
                     break;
                 }
-                rows.push((li as i64, None, heading_path(&lines, li), lines[li].clone()));
+                // the headings only when asked for: a deep line of a large book is costly
+                let toc = if with_toc {
+                    lines.heading_path(li)
+                } else {
+                    Vec::new()
+                };
+                rows.push((li as i64, None, toc, lines[li].clone()));
             }
         }
         Ok(BookRows {
